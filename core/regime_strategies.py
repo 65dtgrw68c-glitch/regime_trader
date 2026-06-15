@@ -247,7 +247,7 @@ class VolatilityRanker:
         if len(self._history) < 2:
             return 0.5
         arr  = np.array(self._history)
-        rank = float(np.sum(arr < current_vol) / len(arr))
+        rank = float(np.sum(arr < current_vol) / (len(arr) - 1))
         return rank
 
     def current_rank(self) -> float:
@@ -255,7 +255,7 @@ class VolatilityRanker:
         if len(self._history) < 2:
             return 0.5
         arr  = np.array(self._history)
-        return float(np.sum(arr < self._history[-1]) / len(arr))
+        return float(np.sum(arr < self._history[-1]) / (len(arr) - 1))
 
     @property
     def n_observations(self) -> int:

@@ -1,0 +1,358 @@
+"""
+Tests for core/backtester.py and core/performance.py.
+
+Run with:  pytest tests/test_backtester.py -v
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.backtester import Backtester, BacktestResult, WalkForwardSplit
+from core.performance import (
+    PerformanceAnalyser,
+    annualised_return,
+    max_drawdown,
+    sharpe_ratio,
+    total_return,
+    win_rate,
+    num_trades,
+    _trade_pnls,
+)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data
+# ---------------------------------------------------------------------------
+
+def _make_ohlcv(n: int = 700, seed: int = 7) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2019-01-01", periods=n)
+    vol = np.select(
+        [np.arange(n) < n // 3, np.arange(n) < 2 * n // 3],
+        [0.006, 0.018], default=0.012,
+    )
+    log_ret = rng.normal(0.0003, vol, n)
+    close = 100 * np.exp(np.cumsum(log_ret))
+    wig = rng.uniform(0.001, 0.004, n)
+    return pd.DataFrame({
+        "open":   close * (1 + rng.normal(0, 0.001, n)),
+        "high":   close * (1 + wig),
+        "low":    close * (1 - wig),
+        "close":  close,
+        "volume": rng.integers(1_000_000, 4_000_000, n).astype(float),
+    }, index=dates)
+
+
+@pytest.fixture
+def small_backtester() -> Backtester:
+    # Small windows so the test runs fast but still exercises >=2 splits.
+    return Backtester(
+        ticker="TEST",
+        train_window=120,
+        test_window=60,
+        random_seed=7,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. Walk-forward split correctness
+# ---------------------------------------------------------------------------
+
+class TestWalkForwardSplits:
+
+    def test_splits_have_correct_window_sizes(self, small_backtester):
+        splits = small_backtester.walk_forward_splits(600)
+        for s in splits:
+            assert s.train_end - s.train_start == 120
+            assert s.test_start == s.train_end          # OOS begins after train
+            assert s.test_end - s.test_start <= 60
+
+    def test_oos_windows_no_overlap_no_gap(self, small_backtester):
+        splits = small_backtester.walk_forward_splits(600)
+        # OOS windows should tile contiguously
+        for prev, nxt in zip(splits[:-1], splits[1:]):
+            assert nxt.test_start == prev.test_end, "gap or overlap between OOS windows"
+
+    def test_first_split_starts_after_training(self, small_backtester):
+        splits = small_backtester.walk_forward_splits(600)
+        assert splits[0].train_start == 0
+        assert splits[0].test_start == 120
+
+    def test_no_splits_when_insufficient_data(self, small_backtester):
+        # Fewer bars than one training window → no splits
+        assert small_backtester.walk_forward_splits(100) == []
+
+    def test_splits_cover_full_oos_range(self, small_backtester):
+        n = 600
+        splits = small_backtester.walk_forward_splits(n)
+        covered = set()
+        for s in splits:
+            covered.update(range(s.test_start, s.test_end))
+        # Everything from first test_start to the last bar is covered
+        expected = set(range(splits[0].test_start, splits[-1].test_end))
+        assert covered == expected
+
+
+# ---------------------------------------------------------------------------
+# 2. No look-ahead bias
+# ---------------------------------------------------------------------------
+
+class TestNoLookAhead:
+
+    def test_train_window_strictly_before_test(self, small_backtester):
+        """Every training window must end exactly at (or before) its OOS start."""
+        splits = small_backtester.walk_forward_splits(600)
+        for s in splits:
+            assert s.train_end <= s.test_start, "training data leaks into OOS window"
+
+    def test_future_data_does_not_change_past_oos_returns(self):
+        """
+        Corrupting bars AFTER a cutoff must not alter the OOS returns produced
+        for bars BEFORE that cutoff.  This is the core look-ahead guard.
+        """
+        data = _make_ohlcv(420, seed=3)
+        bt = Backtester(ticker="T", train_window=120, test_window=60, random_seed=3)
+
+        res_clean = bt.run(data)
+        cutoff = res_clean.returns.index[100]   # an early OOS timestamp
+
+        # Corrupt everything strictly AFTER the cutoff timestamp
+        corrupted = data.copy()
+        mask = corrupted.index > cutoff
+        corrupted.loc[mask, ["open", "high", "low", "close"]] *= 1.5
+
+        bt2 = Backtester(ticker="T", train_window=120, test_window=60, random_seed=3)
+        res_corrupt = bt2.run(corrupted)
+
+        # Compare the OOS returns up to and including the cutoff
+        clean_head   = res_clean.returns.loc[:cutoff]
+        corrupt_head = res_corrupt.returns.loc[:cutoff]
+        common = clean_head.index.intersection(corrupt_head.index)
+        np.testing.assert_allclose(
+            clean_head.loc[common].values,
+            corrupt_head.loc[common].values,
+            rtol=1e-9, atol=1e-9,
+            err_msg="Future data leaked into past OOS returns (look-ahead bias).",
+        )
+
+    def test_reproducibility(self):
+        data = _make_ohlcv(420, seed=11)
+        bt1 = Backtester(ticker="T", train_window=120, test_window=60, random_seed=5)
+        bt2 = Backtester(ticker="T", train_window=120, test_window=60, random_seed=5)
+        r1 = bt1.run(data).returns
+        r2 = bt2.run(data).returns
+        pd.testing.assert_series_equal(r1, r2)
+
+
+# ---------------------------------------------------------------------------
+# 3. Backtest run produces a coherent result
+# ---------------------------------------------------------------------------
+
+class TestBacktestRun:
+
+    def test_run_returns_result(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        assert isinstance(res, BacktestResult)
+
+    def test_returns_length_matches_oos_bars(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        total_oos = sum(s.test_end - s.test_start for s in res.splits)
+        assert len(res.returns) == total_oos
+
+    def test_equity_curve_aligned_with_returns(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        assert len(res.equity_curve) == len(res.returns)
+
+    def test_regime_and_confidence_series_aligned(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        assert len(res.regime_labels) == len(res.returns)
+        assert len(res.confidence) == len(res.returns)
+
+    def test_run_raises_on_too_little_data(self, small_backtester):
+        with pytest.raises(ValueError):
+            small_backtester.run(_make_ohlcv(100))
+
+
+# ---------------------------------------------------------------------------
+# 4. Performance metric calculations
+# ---------------------------------------------------------------------------
+
+class TestPerformanceMetrics:
+
+    def test_total_return_simple(self):
+        r = pd.Series([0.10, -0.05, 0.02])
+        expected = (1.10 * 0.95 * 1.02) - 1.0
+        assert total_return(r) == pytest.approx(expected)
+
+    def test_total_return_empty(self):
+        assert total_return(pd.Series([], dtype=float)) == 0.0
+
+    def test_sharpe_zero_for_constant(self):
+        r = pd.Series([0.001] * 50)        # zero variance
+        assert sharpe_ratio(r) == 0.0
+
+    def test_sharpe_positive_for_uptrend(self):
+        rng = np.random.default_rng(0)
+        r = pd.Series(rng.normal(0.001, 0.005, 252))
+        assert sharpe_ratio(r) > 0
+
+    def test_max_drawdown_known_path(self):
+        # +10% then -50% → equity 1.1 then 0.55; drawdown = (0.55-1.1)/1.1
+        r = pd.Series([0.10, -0.50])
+        assert max_drawdown(r) == pytest.approx((0.55 - 1.1) / 1.1)
+
+    def test_max_drawdown_monotonic_up_is_zero(self):
+        r = pd.Series([0.01, 0.01, 0.01])
+        assert max_drawdown(r) == pytest.approx(0.0)
+
+    def test_annualised_return_one_year(self):
+        # 252 bars each +0 → 0% annualised
+        r = pd.Series([0.0] * 252)
+        assert annualised_return(r) == pytest.approx(0.0)
+
+    def test_win_rate_from_pnl_column(self):
+        log = pd.DataFrame({"pnl": [10.0, -5.0, 3.0, -1.0]})
+        assert win_rate(log) == pytest.approx(0.5)
+
+    def test_win_rate_from_fifo_fills(self):
+        # Buy 10@100, sell 10@110 → +profit (1 winning trade)
+        log = pd.DataFrame({
+            "ticker":     ["X", "X"],
+            "side":       ["BUY", "SELL"],
+            "qty":        [10, 10],
+            "fill_price": [100.0, 110.0],
+        })
+        assert win_rate(log) == pytest.approx(1.0)
+
+    def test_num_trades_counts_fills(self):
+        log = pd.DataFrame({"pnl": [1.0, 2.0, 3.0]})
+        assert num_trades(log) == 3
+
+    def test_trade_pnls_fifo_pairing(self):
+        log = pd.DataFrame({
+            "ticker":     ["X", "X"],
+            "side":       ["BUY", "SELL"],
+            "qty":        [10, 10],
+            "fill_price": [100.0, 105.0],
+        })
+        pnls = _trade_pnls(log)
+        assert pnls == pytest.approx([50.0])   # (105-100)*10
+
+
+# ---------------------------------------------------------------------------
+# 5. Benchmark comparison logic
+# ---------------------------------------------------------------------------
+
+class TestBenchmarks:
+
+    def test_three_benchmarks_present(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        assert set(res.benchmark_returns.keys()) == {
+            "buy_and_hold", "sma_200", "random_entry"
+        }
+
+    def test_benchmarks_aligned_to_oos(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        for series in res.benchmark_returns.values():
+            assert len(series) == len(res.returns)
+
+    def test_buy_and_hold_matches_price_change(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        bh = res.benchmark_returns["buy_and_hold"]
+        oos_close = data["close"].loc[res.returns.index]
+        expected = oos_close.pct_change().fillna(0.0)
+        np.testing.assert_allclose(bh.values, expected.values, rtol=1e-9)
+
+    def test_vs_benchmark_table_has_strategy_and_benchmarks(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        pa = PerformanceAnalyser.from_backtest_result(res)
+        table = pa.vs_benchmark()
+        names = set(table["name"])
+        assert "strategy" in names
+        assert "buy_and_hold" in names
+
+
+# ---------------------------------------------------------------------------
+# 6. Regime breakdown & confidence buckets
+# ---------------------------------------------------------------------------
+
+class TestRegimeAndConfidence:
+
+    def test_regime_breakdown_runs(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        pa = PerformanceAnalyser.from_backtest_result(res)
+        table = pa.regime_breakdown()
+        assert "regime" in table.columns
+        assert "sharpe_ratio" in table.columns
+
+    def test_confidence_buckets_three_levels(self, small_backtester):
+        data = _make_ohlcv(420)
+        res = small_backtester.run(data)
+        pa = PerformanceAnalyser.from_backtest_result(res)
+        buckets = pa.confidence_buckets()
+        assert list(buckets["bucket"]) == ["low", "medium", "high"]
+
+
+# ---------------------------------------------------------------------------
+# 7. Stress injection logic
+# ---------------------------------------------------------------------------
+
+class TestStressInjection:
+
+    def test_injection_creates_price_drops(self, small_backtester):
+        data = _make_ohlcv(420, seed=1)
+        stressed = small_backtester.inject_stress_events(data, n_events=3)
+        assert "stress_bars" in stressed.attrs
+        assert len(stressed.attrs["stress_bars"]) == 3
+
+    def test_injected_drop_magnitude(self, small_backtester):
+        data = _make_ohlcv(420, seed=2)
+        stressed = small_backtester.inject_stress_events(
+            data, n_events=1, min_drop=0.10, max_drop=0.15
+        )
+        bar = stressed.attrs["stress_bars"][0]
+        # The single-bar return at the crash should be a large negative move
+        ret_at_crash = (stressed["close"].iloc[bar] / data["close"].iloc[bar]) - 1.0
+        # Persistent scaling: crash bar is 10–15% below the un-stressed price
+        assert -0.15 - 1e-6 <= ret_at_crash <= -0.10 + 1e-6
+
+    def test_injection_preserves_length(self, small_backtester):
+        data = _make_ohlcv(420)
+        stressed = small_backtester.inject_stress_events(data, n_events=3)
+        assert len(stressed) == len(data)
+
+    def test_backtest_runs_with_stress(self):
+        data = _make_ohlcv(420, seed=9)
+        bt = Backtester(ticker="T", train_window=120, test_window=60, random_seed=9)
+        res = bt.run(data, inject_stress=True)
+        assert res.metadata["stress_injected"] is True
+        assert len(res.returns) > 0
+
+    def test_stress_increases_drawdown(self):
+        """Injected crashes should not improve (reduce) max drawdown."""
+        data = _make_ohlcv(420, seed=4)
+        bt_clean  = Backtester(ticker="T", train_window=120, test_window=60, random_seed=4)
+        bt_stress = Backtester(ticker="T", train_window=120, test_window=60, random_seed=4)
+        clean  = bt_clean.run(data, inject_stress=False)
+        stress = bt_stress.run(data, inject_stress=True)
+        dd_clean  = max_drawdown(clean.returns)
+        dd_stress = max_drawdown(stress.returns)
+        # More negative (or equal) drawdown under stress
+        assert dd_stress <= dd_clean + 1e-9

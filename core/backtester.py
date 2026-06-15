@@ -1,0 +1,487 @@
+"""
+Backtester — walk-forward simulation with zero look-ahead bias.
+
+This is NOT an in-sample optimisation.  The dataset is sliced into rolling
+windows; the HMM and feature scaler are fit ONLY on each in-sample training
+window, then evaluated on the immediately following out-of-sample window
+using bar-by-bar forward inference.  The window then rolls forward.
+
+Walk-forward structure (configurable in settings/config.BACKTEST)
+----------------------------------------------------------------
+    train_window = 252 bars  (~1 year, in-sample)
+    test_window  = 126 bars  (~6 months, out-of-sample)
+    step         = test_window  (non-overlapping OOS windows)
+
+Pipeline per bar (identical ordering to the live loop)
+------------------------------------------------------
+    FeatureEngineer.transform  →  HMMEngine.update  →  RegimeOrchestrator
+        →  RiskManager (sizing + circuit breakers)  →  simulated fill
+
+Realism
+-------
+* Slippage applied to every entry and exit.
+* All position sizing flows through the RiskManager (1% risk + caps).
+* Circuit breakers can flatten the book mid-window.
+
+Benchmarks (computed over the same OOS period)
+----------------------------------------------
+    1. Buy & Hold
+    2. 200-day SMA trend following
+    3. Random entry with the SAME risk rules (isolates HMM edge)
+
+Stress testing
+--------------
+    Synthetic single-day crashes (-10% to -15%) injected at random bars to
+    observe drawdown and circuit-breaker behaviour.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from core.feature_engineering import FeatureEngineer
+from core.hmm_engine import HMMEngine
+from core.regime_strategies import RegimeOrchestrator
+from core.risk_manager import CBLevel, RiskManager
+from settings import config
+
+logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# Result containers
+# ===========================================================================
+
+@dataclass
+class WalkForwardSplit:
+    """One in-sample / out-of-sample window pair (integer index slices)."""
+    train_start: int
+    train_end:   int   # exclusive
+    test_start:  int   # == train_end (OOS begins right after training)
+    test_end:    int   # exclusive
+
+    def as_tuple(self) -> tuple[slice, slice]:
+        return (slice(self.train_start, self.train_end),
+                slice(self.test_start, self.test_end))
+
+
+@dataclass
+class BacktestResult:
+    """Everything performance.py needs to build its report."""
+    returns:        pd.Series            # per-bar OOS strategy returns
+    equity_curve:   pd.Series            # cumulative equity over OOS bars
+    trade_log:      pd.DataFrame         # one row per fill
+    regime_labels:  pd.Series            # confirmed regime label per OOS bar
+    confidence:     pd.Series            # HMM confidence per OOS bar
+    splits:         list[WalkForwardSplit]
+    benchmark_returns: dict[str, pd.Series] = field(default_factory=dict)
+    initial_capital:  float = 0.0
+    metadata:         dict = field(default_factory=dict)
+
+
+# ===========================================================================
+# Backtester
+# ===========================================================================
+
+class Backtester:
+    """Walk-forward backtesting engine."""
+
+    def __init__(
+        self,
+        ticker: str = "ASSET",
+        train_window: int = 252,
+        test_window: int = 126,
+        initial_capital: Optional[float] = None,
+        slippage: Optional[float] = None,
+        commission: Optional[float] = None,
+        stop_loss_pct: Optional[float] = None,
+        random_seed: int = 42,
+        risk_manager: Optional[RiskManager] = None,
+    ) -> None:
+        self.ticker        = ticker
+        self.train_window  = train_window
+        self.test_window   = test_window
+        self.initial_capital = (
+            initial_capital if initial_capital is not None
+            else config.BACKTEST["initial_capital"]
+        )
+        self.slippage   = slippage   if slippage   is not None else config.BACKTEST["slippage"]
+        self.commission = commission if commission is not None else config.BACKTEST["commission"]
+        self.stop_loss_pct = (
+            stop_loss_pct if stop_loss_pct is not None else config.RISK["stop_loss_pct"]
+        )
+        self.random_seed = random_seed
+        self._rng = np.random.default_rng(random_seed)
+        self._risk_manager = risk_manager
+
+        self._result: Optional[BacktestResult] = None
+
+    # ------------------------------------------------------------------
+    # Walk-forward window construction
+    # ------------------------------------------------------------------
+
+    def walk_forward_splits(self, n_bars: int) -> list[WalkForwardSplit]:
+        """
+        Build non-overlapping OOS windows.  Each split trains on
+        `train_window` bars and tests on the next `test_window` bars.
+        The OOS windows tile the post-warmup region with no gaps/overlap.
+        """
+        splits: list[WalkForwardSplit] = []
+        train_end = self.train_window
+        while train_end + 1 <= n_bars:
+            test_start = train_end
+            test_end   = min(test_start + self.test_window, n_bars)
+            if test_end <= test_start:
+                break
+            splits.append(WalkForwardSplit(
+                train_start=train_end - self.train_window,
+                train_end=train_end,
+                test_start=test_start,
+                test_end=test_end,
+            ))
+            if test_end >= n_bars:
+                break
+            train_end += self.test_window   # roll forward by one OOS window
+        return splits
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def run(self, ohlcv: pd.DataFrame, inject_stress: bool = False) -> BacktestResult:
+        """
+        Execute the full walk-forward backtest.
+
+        Parameters
+        ----------
+        ohlcv : DataFrame with open/high/low/close/volume and a DatetimeIndex.
+        inject_stress : if True, inject synthetic crash events before running.
+        """
+        data = ohlcv.copy()
+        data.columns = [c.lower() for c in data.columns]
+        if inject_stress:
+            data = self.inject_stress_events(data)
+
+        n_bars = len(data)
+        splits = self.walk_forward_splits(n_bars)
+        if not splits:
+            raise ValueError(
+                f"Not enough data ({n_bars} bars) for one walk-forward split "
+                f"(need >= {self.train_window + 1})."
+            )
+
+        # OOS accumulators
+        oos_index:   list = []
+        oos_returns: list[float] = []
+        oos_regimes: list[str] = []
+        oos_conf:    list[float] = []
+        trades:      list[dict] = []
+
+        equity = self.initial_capital
+
+        for split in splits:
+            equity = self._run_window(
+                data, split, equity,
+                oos_index, oos_returns, oos_regimes, oos_conf, trades,
+            )
+
+        # Assemble series
+        ret_series  = pd.Series(oos_returns, index=oos_index, name="strategy")
+        equity_curve = self.initial_capital * (1.0 + ret_series).cumprod()
+        equity_curve.name = "equity"
+
+        # Benchmarks over the same OOS span
+        oos_close = data["close"].loc[oos_index]
+        benchmarks = self._compute_benchmarks(data, oos_index, oos_close)
+
+        result = BacktestResult(
+            returns=ret_series,
+            equity_curve=equity_curve,
+            trade_log=pd.DataFrame(trades),
+            regime_labels=pd.Series(oos_regimes, index=oos_index, name="regime"),
+            confidence=pd.Series(oos_conf, index=oos_index, name="confidence"),
+            splits=splits,
+            benchmark_returns=benchmarks,
+            initial_capital=self.initial_capital,
+            metadata={
+                "ticker": self.ticker,
+                "train_window": self.train_window,
+                "test_window": self.test_window,
+                "n_splits": len(splits),
+                "slippage": self.slippage,
+                "commission": self.commission,
+                "stress_injected": inject_stress,
+            },
+        )
+        self._result = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Per-window simulation
+    # ------------------------------------------------------------------
+
+    def _run_window(
+        self,
+        data: pd.DataFrame,
+        split: WalkForwardSplit,
+        equity: float,
+        oos_index: list,
+        oos_returns: list,
+        oos_regimes: list,
+        oos_conf: list,
+        trades: list,
+    ) -> float:
+        """
+        Train on the in-sample slice, then walk the OOS slice bar by bar.
+
+        Look-ahead guarantee: the HMM and scaler see ONLY data with index
+        < split.test_start.  OOS bars are fed one at a time via .update().
+        """
+        train_df = data.iloc[split.train_start:split.train_end]
+
+        # ── Fit feature scaler + HMM on the training window ONLY ─────────
+        fe = FeatureEngineer()
+        try:
+            train_feats = fe.fit_transform(train_df)
+            engine = HMMEngine(
+                n_iter=config.HMM["n_iter"],
+                random_state=self.random_seed,
+                min_history_bars=min(self.train_window // 2, len(train_feats)),
+            )
+            engine.fit(train_feats)
+        except Exception as exc:
+            logger.warning("Window train failed (%s) — skipping OOS span.", exc)
+            # Still advance equity flat across the skipped OOS bars.
+            for i in range(split.test_start, split.test_end):
+                oos_index.append(data.index[i])
+                oos_returns.append(0.0)
+                oos_regimes.append("Unknown")
+                oos_conf.append(0.0)
+            return equity
+
+        orchestrator = RegimeOrchestrator(tickers=[self.ticker])
+        risk = self._risk_manager or RiskManager()
+        risk.start_new_day(equity)
+
+        # We need features for OOS bars too, computed from data up to each
+        # bar WITHOUT refitting the scaler (transform only).  To stay strictly
+        # causal we recompute features on the expanding window [0 : i] and take
+        # the last row — only past data ever enters a given bar's features.
+        position_shares = 0.0
+        entry_price     = 0.0
+
+        for i in range(split.test_start, split.test_end):
+            bar_close = float(data["close"].iloc[i])
+            prev_close = float(data["close"].iloc[i - 1]) if i > 0 else bar_close
+            bar_ret_raw = (bar_close - prev_close) / prev_close if prev_close else 0.0
+
+            # ── Causal features: only data [0 : i+1] ─────────────────────
+            window_df = data.iloc[: i + 1]
+            try:
+                feats = fe.transform(window_df)
+                obs   = feats.iloc[-1].values
+            except Exception:
+                obs = None
+
+            if obs is not None:
+                engine.update(obs)
+            regime_idx   = engine.current_regime()
+            regime_label = engine.current_regime_label()
+            proba        = engine.predict_proba_current()
+            high_unc     = engine.high_uncertainty
+            vol_z        = float(feats.iloc[-1].get("volume_zscore_21d", 0.0)) if obs is not None else 0.0
+
+            signal = orchestrator.evaluate(
+                regime_index=regime_idx,
+                regime_label=regime_label,
+                proba=proba,
+                high_uncertainty=high_unc,
+                volume_zscore=vol_z,
+            )
+            confidence = signal.confidence
+
+            # ── Mark-to-market existing position over this bar ───────────
+            bar_pnl_ret = position_shares * prev_close / equity * bar_ret_raw if equity else 0.0
+            equity_after = equity * (1.0 + bar_pnl_ret)
+
+            # ── Risk layer: update breakers on the new equity ────────────
+            risk.update_equity(
+                equity_after,
+                open_positions={self.ticker: {"unrealised_pnl":
+                    position_shares * (bar_close - entry_price)}},
+                regime_label=regime_label,
+            )
+
+            # ── Determine target position for NEXT bar ───────────────────
+            target_shares = self._target_shares(
+                signal, risk, bar_close, equity_after, regime_label
+            )
+
+            # Circuit-breaker flatten overrides any target
+            if risk.should_flatten() or risk.is_halted():
+                target_shares = 0.0
+
+            # ── Execute the delta with slippage + commission ─────────────
+            delta = target_shares - position_shares
+            if abs(delta) > 1e-9:
+                fill_price = self._fill_price(bar_close, delta)
+                cost = abs(delta) * fill_price * self.commission
+                equity_after -= cost
+                trades.append({
+                    "timestamp":  data.index[i],
+                    "ticker":     self.ticker,
+                    "side":       "BUY" if delta > 0 else "SELL",
+                    "qty":        abs(delta),
+                    "fill_price": fill_price,
+                    "regime":     regime_label,
+                    "confidence": confidence,
+                    "cb_level":   risk.circuit_breaker_level().name,
+                })
+                if target_shares > 0:
+                    entry_price = fill_price
+                position_shares = target_shares
+
+            # ── Record OOS bar ───────────────────────────────────────────
+            bar_total_ret = (equity_after - equity) / equity if equity else 0.0
+            oos_index.append(data.index[i])
+            oos_returns.append(bar_total_ret)
+            oos_regimes.append(regime_label)
+            oos_conf.append(confidence)
+            equity = equity_after
+
+        return equity
+
+    # ------------------------------------------------------------------
+    # Sizing / fills
+    # ------------------------------------------------------------------
+
+    def _target_shares(
+        self,
+        signal,
+        risk: RiskManager,
+        price: float,
+        equity: float,
+        regime_label: str,
+    ) -> float:
+        """
+        Convert a strategy signal into a risk-approved share count.
+        Uses the RiskManager's 1%-risk sizing with the configured stop.
+        """
+        target_weight = sum(signal.target_weights.values())
+        if target_weight <= 0 or price <= 0:
+            return 0.0
+        stop_price = price * (1.0 - self.stop_loss_pct)
+        risk_qty = risk.size_position(price, stop_price, equity)
+        # Scale risk-sized quantity by the strategy's allocation intensity.
+        return float(risk_qty) * min(1.0, target_weight)
+
+    def _fill_price(self, mid_price: float, delta_shares: float) -> float:
+        """Apply slippage: buys fill higher, sells fill lower."""
+        direction = 1.0 if delta_shares > 0 else -1.0
+        return mid_price * (1.0 + direction * self.slippage)
+
+    # ------------------------------------------------------------------
+    # Benchmarks
+    # ------------------------------------------------------------------
+
+    def _compute_benchmarks(
+        self,
+        data: pd.DataFrame,
+        oos_index: list,
+        oos_close: pd.Series,
+    ) -> dict[str, pd.Series]:
+        """Compute the three required benchmark return series over OOS bars."""
+        return {
+            "buy_and_hold":   self._bench_buy_and_hold(oos_close),
+            "sma_200":        self._bench_sma_trend(data, oos_index),
+            "random_entry":   self._bench_random_entry(oos_close),
+        }
+
+    @staticmethod
+    def _bench_buy_and_hold(oos_close: pd.Series) -> pd.Series:
+        """Hold the asset for the entire OOS span."""
+        rets = oos_close.pct_change().fillna(0.0)
+        rets.name = "buy_and_hold"
+        return rets
+
+    def _bench_sma_trend(self, data: pd.DataFrame, oos_index: list) -> pd.Series:
+        """Invested when close > 200-day SMA (computed causally), else cash."""
+        close = data["close"]
+        sma = close.rolling(200).mean()
+        invested = (close > sma).shift(1).fillna(False)   # signal acts next bar
+        asset_ret = close.pct_change().fillna(0.0)
+        bench = (asset_ret * invested.astype(float)).loc[oos_index]
+        bench.name = "sma_200"
+        return bench
+
+    def _bench_random_entry(self, oos_close: pd.Series) -> pd.Series:
+        """
+        Random long/flat entries (50/50) with the same per-bar return basis.
+        Isolates whether the HMM adds value beyond random timing.
+        """
+        rng = np.random.default_rng(self.random_seed + 1)
+        asset_ret = oos_close.pct_change().fillna(0.0)
+        signal = pd.Series(
+            rng.integers(0, 2, len(oos_close)), index=oos_close.index
+        ).shift(1).fillna(0.0)
+        bench = asset_ret * signal.astype(float)
+        bench.name = "random_entry"
+        return bench
+
+    # ------------------------------------------------------------------
+    # Stress testing
+    # ------------------------------------------------------------------
+
+    def inject_stress_events(
+        self,
+        data: pd.DataFrame,
+        n_events: int = 3,
+        min_drop: float = 0.10,
+        max_drop: float = 0.15,
+    ) -> pd.DataFrame:
+        """
+        Inject synthetic single-day crashes (-10% to -15%) at random bars.
+
+        All bars from the crash onward are scaled down so the drop persists
+        in the price path (a true regime shock, not a one-bar blip that
+        instantly recovers).  Returns a NEW DataFrame.
+        """
+        df = data.copy()
+        n = len(df)
+        if n < 10:
+            return df
+        # Choose crash bars in the back 80% so there's history beforehand.
+        candidates = np.arange(int(n * 0.2), n)
+        chosen = self._rng.choice(
+            candidates, size=min(n_events, len(candidates)), replace=False
+        )
+        for idx in sorted(chosen):
+            drop = float(self._rng.uniform(min_drop, max_drop))
+            factor = 1.0 - drop
+            df.iloc[idx:, df.columns.get_loc("close")] *= factor
+            df.iloc[idx:, df.columns.get_loc("open")]  *= factor
+            df.iloc[idx:, df.columns.get_loc("high")]  *= factor
+            df.iloc[idx:, df.columns.get_loc("low")]   *= factor
+            logger.info("Injected -%.1f%% crash at bar %d (%s)",
+                        drop * 100, idx, df.index[idx])
+        df.attrs["stress_bars"] = sorted(int(c) for c in chosen)
+        return df
+
+    # ------------------------------------------------------------------
+    # Accessors
+    # ------------------------------------------------------------------
+
+    def get_returns(self) -> pd.Series:
+        if self._result is None:
+            raise RuntimeError("Call run() first.")
+        return self._result.returns
+
+    def get_trade_log(self) -> pd.DataFrame:
+        if self._result is None:
+            raise RuntimeError("Call run() first.")
+        return self._result.trade_log

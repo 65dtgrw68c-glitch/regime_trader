@@ -89,7 +89,7 @@ class AlpacaClient:
             logger.error("Alpaca connection verification failed: %s", exc)
             return False
         status = acct.get("status", "")
-        ok = status.upper() == "ACTIVE"
+        ok = "ACTIVE" in status.upper()
         if not ok:
             logger.warning("Alpaca account status is '%s' (expected ACTIVE).", status)
         return ok

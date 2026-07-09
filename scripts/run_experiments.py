@@ -12,15 +12,22 @@ walk-forward windows, same seed.
 
 Data sources
 ------------
-1. Stooq (default): free daily OHLCV via CSV download, no API key.
-   Symbols use Stooq notation, e.g. "spy.us", "qqq.us", "^spx".
-2. --synthetic: offline regime-switching random walk.  ONLY useful as a
+1. --csv (recommended in sandboxed/cloud environments): a local OHLCV file
+   you downloaded yourself, e.g. from https://stooq.com/q/d/l/?s=spy.us&i=d
+   or a Yahoo Finance "Historical Data" export. Stooq blocks requests from
+   cloud-datacenter IPs (Codespaces included), so this is the reliable path
+   there — download the CSV in a normal browser, then point here.
+2. Stooq (default when --csv is omitted): free daily OHLCV via CSV download,
+   no API key. Symbols use Stooq notation, e.g. "spy.us", "qqq.us", "^spx".
+   Will fail with a 404 from most cloud IPs — use --csv instead in that case.
+3. --synthetic: offline regime-switching random walk.  ONLY useful as a
    smoke test — parameter choices tuned on synthetic noise mean nothing
    for real markets.
 
 Usage
 -----
-    python scripts/run_experiments.py                          # SPY, full grid
+    python scripts/run_experiments.py                          # SPY via Stooq, full grid
+    python scripts/run_experiments.py --csv spy_daily.csv       # local file, no network
     python scripts/run_experiments.py --ticker qqq.us --bars 1500
     python scripts/run_experiments.py --synthetic              # offline smoke run
     python scripts/run_experiments.py --out experiments_report.md
@@ -122,6 +129,30 @@ def fetch_stooq(symbol: str) -> pd.DataFrame:
     return out
 
 
+def load_csv(path: str) -> pd.DataFrame:
+    """Load a local OHLCV file (Stooq or Yahoo Finance export)."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"CSV file not found: {p.resolve()}")
+    df = pd.read_csv(p)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    required = {"date", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"'{path}' is missing columns {missing} — got {list(df.columns)}. "
+            f"Expected a Stooq or Yahoo Finance daily OHLCV export."
+        )
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    out = df[["open", "high", "low", "close", "volume"]].astype(float).dropna()
+    if len(out) < 400:
+        raise ValueError(f"Only {len(out)} usable bars in '{path}' — too few.")
+    print(f"Loaded {len(out)} daily bars from {path} "
+          f"({out.index[0].date()} … {out.index[-1].date()}).")
+    return out
+
+
 def synthetic_ohlcv(n: int = 2000, seed: int = 7) -> pd.DataFrame:
     """Regime-switching random walk (same shape the test suite uses)."""
     rng = np.random.default_rng(seed)
@@ -201,6 +232,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Stooq symbol, e.g. spy.us / qqq.us (default: spy.us)")
     ap.add_argument("--bars", type=int, default=2000,
                     help="Use only the most recent N bars (default: 2000 ≈ 8y)")
+    ap.add_argument("--csv", default=None,
+                    help="Path to a local OHLCV CSV (Stooq or Yahoo export). "
+                         "Use this in Codespaces/CI — Stooq blocks cloud IPs.")
     ap.add_argument("--synthetic", action="store_true",
                     help="Offline synthetic data (smoke test only)")
     ap.add_argument("--seed", type=int, default=42)
@@ -210,7 +244,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="Markdown report path (default: experiments_report.md)")
     args = ap.parse_args(argv)
 
-    if args.synthetic:
+    if args.csv:
+        data = load_csv(args.csv).iloc[-args.bars:]
+        source = f"{args.csv} (local file)"
+    elif args.synthetic:
         data = synthetic_ohlcv(args.bars, seed=args.seed)
         source = f"synthetic (seed={args.seed})"
     else:

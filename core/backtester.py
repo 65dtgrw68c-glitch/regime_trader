@@ -46,7 +46,11 @@ import pandas as pd
 
 from core.feature_engineering import FeatureEngineer
 from core.hmm_engine import HMMEngine
-from core.regime_strategies import RegimeOrchestrator
+from core.regime_strategies import (
+    RegimeOrchestrator,
+    is_trend_confirmed,
+    realised_vol_from_close,
+)
 from core.risk_manager import CBLevel, RiskManager
 from settings import config
 
@@ -102,7 +106,18 @@ class Backtester:
         stop_loss_pct: Optional[float] = None,
         random_seed: int = 42,
         risk_manager: Optional[RiskManager] = None,
+        use_trend_filter: bool = True,
+        strategy_overrides: Optional[dict] = None,
     ) -> None:
+        """
+        use_trend_filter   : feed is_trend_confirmed() into the orchestrator
+                             (tiers with require_trend_confirmation go to
+                             cash below the SMA).  False = filter off.
+        strategy_overrides : extra kwargs forwarded to RegimeOrchestrator
+                             (e.g. {"vol_target": 0.10,
+                                    "rebalance_max_bars": 5}) — the hook
+                             scripts/run_experiments.py uses for A/B runs.
+        """
         self.ticker        = ticker
         self.train_window  = train_window
         self.test_window   = test_window
@@ -118,6 +133,8 @@ class Backtester:
         self.random_seed = random_seed
         self._rng = np.random.default_rng(random_seed)
         self._risk_manager = risk_manager
+        self.use_trend_filter = use_trend_filter
+        self.strategy_overrides = dict(strategy_overrides or {})
 
         self._result: Optional[BacktestResult] = None
 
@@ -216,6 +233,8 @@ class Backtester:
                 "slippage": self.slippage,
                 "commission": self.commission,
                 "stress_injected": inject_stress,
+                "trend_filter": self.use_trend_filter,
+                "strategy_overrides": dict(self.strategy_overrides),
             },
         )
         self._result = result
@@ -264,7 +283,9 @@ class Backtester:
                 oos_conf.append(0.0)
             return equity
 
-        orchestrator = RegimeOrchestrator(tickers=[self.ticker])
+        orchestrator = RegimeOrchestrator(
+            tickers=[self.ticker], **self.strategy_overrides
+        )
         risk = self._risk_manager or RiskManager()
         risk.start_new_day(equity)
 
@@ -296,12 +317,28 @@ class Backtester:
             high_unc     = engine.high_uncertainty
             vol_z        = float(feats.iloc[-1].get("volume_zscore_21d", 0.0)) if obs is not None else 0.0
 
+            # Causal strategy inputs from closes up to and including bar i:
+            # trend state, raw realised vol, and the live portfolio weight
+            # (all mirror what main.py feeds the orchestrator in live mode).
+            closes_so_far = window_df["close"]
+            trend_ok = (
+                is_trend_confirmed(closes_so_far)
+                if self.use_trend_filter else None
+            )
+            current_vol = realised_vol_from_close(closes_so_far)
+            current_weight = (
+                position_shares * prev_close / equity if equity > 0 else 0.0
+            )
+
             signal = orchestrator.evaluate(
                 regime_index=regime_idx,
                 regime_label=regime_label,
                 proba=proba,
                 high_uncertainty=high_unc,
                 volume_zscore=vol_z,
+                current_weights={self.ticker: current_weight},
+                current_vol=current_vol,
+                trend_confirmed=trend_ok,
             )
             confidence = signal.confidence
 
@@ -322,13 +359,18 @@ class Backtester:
                 signal, risk, bar_close, equity_after, regime_label
             )
 
-            # Circuit-breaker flatten overrides any target
+            # Trade only when the strategy calls for a rebalance — this is
+            # what keeps turnover (and thus slippage + commission) low.
+            execute_trade = signal.should_rebalance
+
+            # Circuit-breaker flatten overrides any target AND the gate
             if risk.should_flatten() or risk.is_halted():
                 target_shares = 0.0
+                execute_trade = True
 
             # ── Execute the delta with slippage + commission ─────────────
             delta = target_shares - position_shares
-            if abs(delta) > 1e-9:
+            if execute_trade and abs(delta) > 1e-9:
                 fill_price = self._fill_price(bar_close, delta)
                 cost = abs(delta) * fill_price * self.commission
                 equity_after -= cost

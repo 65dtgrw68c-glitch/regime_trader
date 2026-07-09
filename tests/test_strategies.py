@@ -1,5 +1,5 @@
 """
-Tests for core/regime_strategies.py  — 32 test cases.
+Tests for core/regime_strategies.py.
 
 Run with:  pytest tests/test_strategies.py -v
 """
@@ -10,28 +10,34 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.regime_strategies import (
+    CONFIDENCE_MIN_FACTOR,
+    CONFIDENCE_RAMP_HIGH,
+    CONFIDENCE_RAMP_LOW,
     LABEL_TO_TIER,
     LOW_VOLUME_ALLOCATION_SCALE,
     LOW_VOLUME_ZSCORE_THRESHOLD,
-    MIN_CONFIDENCE_THRESHOLD,
     REBALANCE_DRIFT_THRESHOLD,
-    REBALANCE_MIN_BARS,
+    REBALANCE_MAX_BARS,
     REBALANCE_ON_REGIME_CHANGE,
     REGIME_PARAMS,
     REGIME_SHORT,
     TIER_COLOUR,
     TIER_DISPLAY,
+    TREND_FILTER_WINDOW,
     UNCERTAINTY_SCALING_FACTOR,
     RegimeOrchestrator,
     StrategyParams,
     StrategySignal,
     VolTier,
     VolatilityRanker,
+    is_trend_confirmed,
+    realised_vol_from_close,
     regime_display_label,
 )
 
@@ -48,7 +54,7 @@ def _uniform_proba(n: int, dominant: int) -> np.ndarray:
 
 
 def _low_proba(n: int, dominant: int) -> np.ndarray:
-    """Probability vector with only 0.40 on `dominant` — below MIN_CONFIDENCE_THRESHOLD."""
+    """Probability vector with only 0.40 on `dominant` — below CONFIDENCE_RAMP_LOW."""
     proba = np.full(n, 0.60 / max(n - 1, 1))
     proba[dominant] = 0.40
     return proba
@@ -232,11 +238,33 @@ class TestConfidenceScaling:
 
     def test_high_confidence_no_penalty(self):
         orch  = _make_orch()
-        proba = _uniform_proba(3, 2)      # 0.80 > MIN_CONFIDENCE_THRESHOLD
+        proba = _uniform_proba(3, 2)      # 0.80 > CONFIDENCE_RAMP_HIGH
         sig   = orch.evaluate(2, "Bull", proba, high_uncertainty=False)
         assert sig.effective_alloc == pytest.approx(
             REGIME_PARAMS[VolTier.LOW].allocation_pct, abs=1e-6
         )
+
+    def test_confidence_ramp_is_smooth(self):
+        """Confidence inside the ramp must scale linearly, not jump to a cliff."""
+        conf = CONFIDENCE_RAMP_LOW + 0.8 * (CONFIDENCE_RAMP_HIGH - CONFIDENCE_RAMP_LOW)
+        proba = np.full(3, (1 - conf) / 2)
+        proba[2] = conf
+        sig = _make_orch().evaluate(2, "Bull", proba, high_uncertainty=False)
+        # 80% up the ramp → factor 0.8 (above the 0.5 floor, below 1.0)
+        expected_factor = float(np.clip(0.8, CONFIDENCE_MIN_FACTOR, 1.0))
+        assert sig.effective_alloc == pytest.approx(
+            REGIME_PARAMS[VolTier.LOW].allocation_pct * expected_factor, abs=1e-6
+        )
+
+    def test_confidence_between_ramp_points_monotonic(self):
+        """Higher confidence must never produce a smaller allocation."""
+        allocs = []
+        for conf in (0.40, 0.50, 0.60, 0.70, 0.80):
+            proba = np.full(3, (1 - conf) / 2)
+            proba[2] = conf
+            sig = _make_orch().evaluate(2, "Bull", proba, high_uncertainty=False)
+            allocs.append(sig.effective_alloc)
+        assert allocs == sorted(allocs)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +313,13 @@ class TestLowVolumeBull:
 
 class TestRebalancingLogic:
 
+    def test_first_evaluation_triggers_initial_rebalance(self):
+        """The very first signal must rebalance to establish the position."""
+        orch  = _make_orch()
+        sig1  = orch.evaluate(2, "Bull", _uniform_proba(3, 2), high_uncertainty=False)
+        assert sig1.should_rebalance is True
+        assert sig1.rebalance_reason == "initial"
+
     def test_regime_change_triggers_rebalance(self):
         orch  = _make_orch()
         proba = _uniform_proba(3, 2)
@@ -298,12 +333,12 @@ class TestRebalancingLogic:
     def test_no_regime_change_no_rebalance_below_drift(self):
         orch = RegimeOrchestrator(
             tickers=["SPY"],
-            rebalance_min_bars=999,   # disable time trigger
+            rebalance_max_bars=999,   # disable staleness backstop
             drift_threshold=0.99,     # very high drift threshold — won't trigger
         )
         proba = _uniform_proba(3, 2)
         orch.evaluate(2, "Bull", proba, high_uncertainty=False)
-        # Same regime, no drift source, time not reached
+        # Same regime, no drift source, staleness not reached
         sig2 = orch.evaluate(
             2, "Bull", proba,
             high_uncertainty=False,
@@ -314,7 +349,7 @@ class TestRebalancingLogic:
     def test_drift_triggers_rebalance(self):
         orch  = RegimeOrchestrator(
             tickers=["SPY"],
-            rebalance_min_bars=999,
+            rebalance_max_bars=999,
             drift_threshold=REBALANCE_DRIFT_THRESHOLD,
         )
         proba = _uniform_proba(3, 2)
@@ -327,17 +362,156 @@ class TestRebalancingLogic:
         assert sig2.should_rebalance is True
         assert "drift" in sig2.rebalance_reason
 
-    def test_time_interval_triggers_rebalance(self):
+    def test_staleness_backstop_triggers_rebalance(self):
         orch = RegimeOrchestrator(
             tickers=["SPY"],
-            rebalance_min_bars=1,
+            rebalance_max_bars=2,
             drift_threshold=0.99,
         )
         proba = _uniform_proba(3, 2)
-        orch.evaluate(2, "Bull", proba, high_uncertainty=False)
+        # Bar 1: initial rebalance, counter resets to 0.
+        sig1 = orch.evaluate(2, "Bull", proba, high_uncertainty=False)
+        assert sig1.should_rebalance is True
+        # Bar 2: 0 bars since rebalance → below backstop.
         sig2 = orch.evaluate(2, "Bull", proba, high_uncertainty=False)
-        assert sig2.should_rebalance is True
-        assert "interval" in sig2.rebalance_reason
+        assert sig2.should_rebalance is False
+        # Bar 3: 1 bar since rebalance → still below backstop.
+        sig3 = orch.evaluate(2, "Bull", proba, high_uncertainty=False)
+        assert sig3.should_rebalance is False
+        # Bar 4: 2 bars since rebalance → backstop (>= 2) fires.
+        sig4 = orch.evaluate(2, "Bull", proba, high_uncertainty=False)
+        assert sig4.should_rebalance is True
+        assert "interval" in sig4.rebalance_reason
+
+    def test_default_backstop_is_not_churny(self):
+        """Guard: the default staleness backstop must be well above 1 bar."""
+        assert REBALANCE_MAX_BARS >= 5
+
+
+# ---------------------------------------------------------------------------
+# 6b. Trend filter
+# ---------------------------------------------------------------------------
+
+class TestTrendFilter:
+
+    def test_trend_block_forces_med_tier_to_cash(self):
+        """MED tier requires trend confirmation → below SMA = no exposure."""
+        orch = _make_orch()
+        sig = orch.evaluate(
+            1, "Neutral", _uniform_proba(3, 1),
+            high_uncertainty=False, trend_confirmed=False,
+        )
+        assert sig.trend_blocked is True
+        assert sig.effective_alloc == 0.0
+        assert sig.target_weights == {}
+
+    def test_trend_block_forces_high_tier_to_cash(self):
+        orch = _make_orch()
+        sig = orch.evaluate(
+            0, "Bear", _uniform_proba(3, 0),
+            high_uncertainty=False, trend_confirmed=False,
+        )
+        assert sig.trend_blocked is True
+        assert sig.target_weights == {}
+
+    def test_low_tier_ignores_trend_filter(self):
+        """LOW tier has require_trend_confirmation=False — never blocked."""
+        orch = _make_orch()
+        sig = orch.evaluate(
+            2, "Bull", _uniform_proba(3, 2),
+            high_uncertainty=False, trend_confirmed=False,
+        )
+        assert sig.trend_blocked is False
+        assert sig.effective_alloc > 0.0
+
+    def test_confirmed_trend_keeps_allocation(self):
+        orch = _make_orch()
+        sig = orch.evaluate(
+            1, "Neutral", _uniform_proba(3, 1),
+            high_uncertainty=False, trend_confirmed=True,
+        )
+        assert sig.trend_blocked is False
+        assert sig.effective_alloc > 0.0
+
+    def test_none_skips_filter_during_warmup(self):
+        """trend_confirmed=None (not enough history) must not block trading."""
+        orch = _make_orch()
+        sig = orch.evaluate(
+            1, "Neutral", _uniform_proba(3, 1),
+            high_uncertainty=False, trend_confirmed=None,
+        )
+        assert sig.trend_blocked is False
+        assert sig.effective_alloc > 0.0
+
+    def test_is_trend_confirmed_above_sma(self):
+        closes = pd.Series(np.linspace(100, 200, TREND_FILTER_WINDOW + 10))
+        assert is_trend_confirmed(closes) is True
+
+    def test_is_trend_confirmed_below_sma(self):
+        closes = pd.Series(np.linspace(200, 100, TREND_FILTER_WINDOW + 10))
+        assert is_trend_confirmed(closes) is False
+
+    def test_is_trend_confirmed_insufficient_history(self):
+        closes = pd.Series(np.linspace(100, 110, TREND_FILTER_WINDOW - 1))
+        assert is_trend_confirmed(closes) is None
+
+
+# ---------------------------------------------------------------------------
+# 6c. Volatility targeting
+# ---------------------------------------------------------------------------
+
+class TestVolTargeting:
+
+    def test_disabled_by_default(self):
+        orch = _make_orch()
+        sig = orch.evaluate(
+            2, "Bull", _uniform_proba(3, 2),
+            high_uncertainty=False, current_vol=0.50,   # very high realised vol
+        )
+        # vol_target defaults to 0.0 → no scaling despite huge vol
+        assert sig.effective_alloc == pytest.approx(
+            REGIME_PARAMS[VolTier.LOW].allocation_pct, abs=1e-6
+        )
+
+    def test_high_vol_scales_allocation_down(self):
+        orch = RegimeOrchestrator(tickers=["SPY", "QQQ", "IWM"], vol_target=0.10)
+        sig = orch.evaluate(
+            2, "Bull", _uniform_proba(3, 2),
+            high_uncertainty=False, current_vol=0.20,   # 2× the target
+        )
+        expected = REGIME_PARAMS[VolTier.LOW].allocation_pct * 0.5
+        assert sig.effective_alloc == pytest.approx(expected, abs=1e-6)
+
+    def test_low_vol_never_levers_up(self):
+        orch = RegimeOrchestrator(tickers=["SPY"], vol_target=0.10)
+        sig = orch.evaluate(
+            2, "Bull", _uniform_proba(3, 2),
+            high_uncertainty=False, current_vol=0.05,   # half the target
+        )
+        # scale = min(1, 0.10/0.05) = 1 → unchanged, no leverage boost
+        assert sig.effective_alloc == pytest.approx(
+            REGIME_PARAMS[VolTier.LOW].allocation_pct, abs=1e-6
+        )
+
+    def test_missing_vol_skips_scaling(self):
+        orch = RegimeOrchestrator(tickers=["SPY"], vol_target=0.10)
+        sig = orch.evaluate(
+            2, "Bull", _uniform_proba(3, 2),
+            high_uncertainty=False, current_vol=None,
+        )
+        assert sig.effective_alloc == pytest.approx(
+            REGIME_PARAMS[VolTier.LOW].allocation_pct, abs=1e-6
+        )
+
+    def test_realised_vol_from_close_positive(self):
+        rng = np.random.default_rng(0)
+        closes = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, 100))))
+        vol = realised_vol_from_close(closes)
+        assert vol is not None
+        assert 0.0 < vol < 1.0   # ~16% annualised for 1% daily moves
+
+    def test_realised_vol_insufficient_history(self):
+        assert realised_vol_from_close(pd.Series([100.0, 101.0])) is None
 
 
 # ---------------------------------------------------------------------------

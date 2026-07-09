@@ -1,0 +1,68 @@
+name: strategy-experiments
+
+# Manually triggered A/B backtest grid (scripts/run_experiments.py).
+# Results land in the run's Summary page AND as a downloadable artifact.
+#
+# This is the ONLY way strategy parameters get changed in this project:
+# run the grid, inspect the table, pick a winner for a reason, confirm it
+# on a symbol/period you did not tune on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Stooq symbol (e.g. spy.us, qqq.us, ^spx)"
+        required: false
+        default: "spy.us"
+      bars:
+        description: "Most recent N daily bars to use"
+        required: false
+        default: "2000"
+      synthetic:
+        description: "Use offline synthetic data (smoke test only)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  experiments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # full grid = 6 walk-forward backtests with HMM refits
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scikit-learn hmmlearn
+
+      - name: Run experiment grid
+        run: |
+          ARGS="--ticker ${{ inputs.ticker }} --bars ${{ inputs.bars }} --out experiments_report.md"
+          if [ "${{ inputs.synthetic }}" = "true" ]; then
+            ARGS="$ARGS --synthetic"
+          fi
+          python scripts/run_experiments.py $ARGS
+
+      - name: Publish report to run summary
+        if: always()
+        run: |
+          if [ -f experiments_report.md ]; then
+            cat experiments_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiments-report
+          path: experiments_report.md
+          if-no-files-found: warn

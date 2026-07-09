@@ -70,6 +70,8 @@ def sharpe_ratio(
         return 0.0
     excess = returns - risk_free_rate / periods_per_year
     sd = excess.std(ddof=1)
+    # Tolerance, not == 0: a constant series yields a tiny float-noise std
+    # (~1e-19) rather than exactly zero.  Real return series have std >> 1e-12.
     if sd < 1e-12 or np.isnan(sd):
         return 0.0
     return float(excess.mean() / sd * np.sqrt(periods_per_year))
@@ -115,7 +117,7 @@ def sortino_ratio(
     excess = returns - risk_free_rate / periods_per_year
     downside = excess[excess < 0]
     dd = downside.std(ddof=1)
-    if dd < 1e-12 or np.isnan(dd):
+    if dd < 1e-12 or np.isnan(dd):   # tolerance, same rationale as sharpe_ratio
         return 0.0
     return float(excess.mean() / dd * np.sqrt(periods_per_year))
 

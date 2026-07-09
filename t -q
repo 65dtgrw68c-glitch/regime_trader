@@ -1,0 +1,71 @@
+[1mdiff --git a/core/performance.py b/core/performance.py[m
+[1mindex 0764585..c7871e5 100644[m
+[1m--- a/core/performance.py[m
+[1m+++ b/core/performance.py[m
+[36m@@ -70,6 +70,8 @@[m [mdef sharpe_ratio([m
+         return 0.0[m
+     excess = returns - risk_free_rate / periods_per_year[m
+     sd = excess.std(ddof=1)[m
+[32m+[m[32m    # Tolerance, not == 0: a constant series yields a tiny float-noise std[m
+[32m+[m[32m    # (~1e-19) rather than exactly zero.  Real return series have std >> 1e-12.[m
+     if sd < 1e-12 or np.isnan(sd):[m
+         return 0.0[m
+     return float(excess.mean() / sd * np.sqrt(periods_per_year))[m
+[36m@@ -115,7 +117,7 @@[m [mdef sortino_ratio([m
+     excess = returns - risk_free_rate / periods_per_year[m
+     downside = excess[excess < 0][m
+     dd = downside.std(ddof=1)[m
+[31m-    if dd < 1e-12 or np.isnan(dd):[m
+[32m+[m[32m    if dd < 1e-12 or np.isnan(dd):   # tolerance, same rationale as sharpe_ratio[m
+         return 0.0[m
+     return float(excess.mean() / dd * np.sqrt(periods_per_year))[m
+ [m
+[1mdiff --git a/tests/test_broker_factory.py b/tests/test_broker_factory.py[m
+[1mindex 569c5b4..64ffed9 100644[m
+[1m--- a/tests/test_broker_factory.py[m
+[1m+++ b/tests/test_broker_factory.py[m
+[36m@@ -1,14 +1,23 @@[m
+[31m-"""Tests for the broker abstraction layer (Phase 1 multi-broker support)."""[m
+[32m+[m[32m"""[m
+[32m+[m[32mTests for the broker abstraction layer (Phase 1 multi-broker support).[m
+[32m+[m
+[32m+[m[32mThese verify the provider-agnostic seam without any network calls: the[m
+[32m+[m[32mfactory maps provider names to concrete clients, the Alpaca client conforms[m
+[32m+[m[32mto the interface, and unimplemented / unknown providers fail loudly.[m
+[32m+[m[32m"""[m
+[32m+[m
+ import pytest[m
+[32m+[m
+ from broker.base import BaseBroker[m
+ from broker.factory import create_broker[m
+ from broker.alpaca_client import AlpacaClient[m
+ [m
+ [m
+ class TestBaseBroker:[m
+[32m+[m
+     def test_cannot_instantiate_abstract_base(self):[m
+         with pytest.raises(TypeError):[m
+[31m-            BaseBroker()[m
+[32m+[m[32m            BaseBroker()  # abstract methods are unimplemented[m
+ [m
+     def test_alpaca_conforms_to_interface(self):[m
+         client = create_broker("alpaca")[m
+[36m@@ -16,15 +25,18 @@[m [mclass TestBaseBroker:[m
+         assert isinstance(client, AlpacaClient)[m
+ [m
+     def test_is_market_open_default_delegates_to_clock(self):[m
+[32m+[m[32m        """The base default reads is_open from get_clock()."""[m
+         class DummyBroker(BaseBroker):[m
+             def connect(self): pass[m
+             def verify_connection(self): return True[m
+             def get_account(self): return {}[m
+             def get_clock(self): return {"is_open": True}[m
+[32m+[m
+         assert DummyBroker().is_market_open() is True[m
+ [m
+ [m
+ class TestFactory:[m
+[32m+[m
+     def test_default_provider_is_alpaca(self):[m
+         assert isinstance(create_broker(), AlpacaClient)[m
+ [m

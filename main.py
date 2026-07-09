@@ -31,7 +31,11 @@ import pandas as pd
 
 from core.feature_engineering import FeatureEngineer
 from core.hmm_engine import HMMEngine
-from core.regime_strategies import RegimeOrchestrator
+from core.regime_strategies import (
+    RegimeOrchestrator,
+    is_trend_confirmed,
+    realised_vol_from_close,
+)
 from core.risk_manager import CBLevel, RiskManager
 from monitoring.alerts import AlertManager, SEVERITY_CRITICAL, SEVERITY_WARNING
 from monitoring.logger import configure_logging, get_logger, TradeLogger
@@ -315,16 +319,23 @@ class TradingSystem:
         state.last_stable_regime = regime_idx
         state.last_stable_label = regime_label
 
-        # 5 — Strategy signal
+        # 5 — Strategy signal (trend filter, vol targeting and the drift
+        #     check all need causal inputs derived from the price history)
         vol_z = float(feats.iloc[-1].get("volume_zscore_21d", 0.0))
+        closes = state.history["close"]
+        price = float(bar.get("close", closes.iloc[-1]))
+        equity = self._current_equity()
+        current_qty = self._position_qty(ticker)
+        current_weight = (current_qty * price / equity) if equity > 0 else 0.0
         strat_signal = state.orchestrator.evaluate(
             regime_index=regime_idx, regime_label=regime_label,
             proba=proba, high_uncertainty=high_unc, volume_zscore=vol_z,
+            current_weights={ticker: current_weight},
+            current_vol=realised_vol_from_close(closes),
+            trend_confirmed=is_trend_confirmed(closes),
         )
 
         # 10 — Circuit-breaker check FIRST (risk has veto power)
-        price = float(bar.get("close", state.history["close"].iloc[-1]))
-        equity = self._current_equity()
         cb = self._risk.update_equity(
             equity, regime_label=regime_label,
             open_positions=self._open_positions_dict(),
@@ -340,33 +351,54 @@ class TradingSystem:
             self._flatten_all()
             return decision
 
-        # 6 — Risk sizing
+        # 6 — Risk sizing → ABSOLUTE target position, then delta vs holding.
+        #     (Submitting the full size every bar — as this loop once did —
+        #     silently accumulates positions; only the DELTA may trade.)
         stop_price = price * (1.0 - config.RISK["stop_loss_pct"])
         target_weight = sum(strat_signal.target_weights.values())
-        qty = self._risk.size_position(price, stop_price, equity)
-        qty = int(qty * min(1.0, target_weight))
+        raw_qty = self._risk.size_position(price, stop_price, equity)
+        target_qty = int(raw_qty * min(1.0, target_weight))
+        delta = target_qty - current_qty
 
-        # 7 — Validate + submit (only while the exchange is open)
-        if qty > 0 and config.BROKER.get("trade_only_when_open", True) and not self._market_is_open():
+        # 7 — Trade only on a rebalance trigger (regime change / drift /
+        #     staleness) and only while the exchange is open; a market
+        #     order placed after hours would just queue until the next open.
+        if not strat_signal.should_rebalance:
+            decision["action"] = "hold"
+            decision["reason"] = "no_rebalance_trigger"
+        elif delta == 0:
+            decision["action"] = "no_change"
+        elif config.BROKER.get("trade_only_when_open", True) and not self._market_is_open():
             decision["action"] = "skipped_market_closed"
-            logger.info("Market closed — %s decision observed but not submitted "
-                        "(would-be qty=%d @ %.2f).", ticker, qty, price)
-        elif qty > 0:
+            logger.info(
+                "Market closed — %s decision observed but not submitted "
+                "(would-be delta=%+d @ %.2f).", ticker, delta, price,
+            )
+        elif delta > 0:
             account = self._safe_call(self._client.get_account) or {}
             buying_power = float(account.get("buying_power", equity))
             validation = self._risk.validate_order(
-                ticker, qty, price, equity, buying_power,
+                ticker, delta, price, equity, buying_power,
                 proposed_leverage=strat_signal.effective_leverage,
                 regime_label=regime_label,
             )
             if validation.approved:
-                self._submit(ticker, int(validation.approved_qty), price, regime_label, strat_signal.confidence)
+                self._submit(ticker, int(validation.approved_qty), price,
+                             regime_label, strat_signal.confidence, side="buy")
                 decision["action"] = "order_submitted"
+                decision["side"] = "buy"
                 decision["qty"] = int(validation.approved_qty)
             else:
                 decision["action"] = "rejected_by_risk"
                 decision["reason"] = validation.reason
                 logger.info("Risk rejected %s order: %s", ticker, validation.reason)
+        else:
+            # delta < 0 — reducing risk needs no order validation
+            self._submit(ticker, int(-delta), price,
+                         regime_label, strat_signal.confidence, side="sell")
+            decision["action"] = "order_submitted"
+            decision["side"] = "sell"
+            decision["qty"] = int(-delta)
 
         # 8 — Refresh positions
         self._safe_call(self._positions.refresh)
@@ -496,15 +528,25 @@ class TradingSystem:
     # Helpers
     # ==================================================================
 
-    def _submit(self, ticker, qty, price, regime, confidence) -> None:
+    def _submit(self, ticker, qty, price, regime, confidence, side="buy") -> None:
         try:
-            oid = self._executor.submit_order(ticker, qty, "buy", order_type="market")
+            oid = self._executor.submit_order(ticker, qty, side, order_type="market")
             if not oid:
                 self._handle_order_rejection(ticker, "broker returned no order id")
                 return
             self._orders_submitted += 1
         except Exception as exc:
             self._handle_order_rejection(ticker, str(exc))
+
+    def _position_qty(self, ticker: str) -> int:
+        """Current share count held for `ticker` (0 when flat/unknown)."""
+        if self._positions is None:
+            return 0
+        try:
+            pos = self._positions.get_positions().get(ticker)
+            return int(pos.qty) if pos else 0
+        except Exception:
+            return 0
 
     def _flatten_all(self) -> None:
         if self._executor is not None:
@@ -530,7 +572,14 @@ class TradingSystem:
         return "closed"
 
     def _market_is_open(self, ttl: float = 30.0) -> bool:
-        """True if the exchange is open; cached `ttl`s to spare the clock endpoint."""
+        """
+        Return True if the exchange is currently open.
+
+        The result is cached for `ttl` seconds so a single loop iteration over
+        many tickers does not hammer the clock endpoint.  If the clock call
+        cannot be resolved we fall back to the last known value (or True on the
+        very first call) so a transient failure never silently freezes trading.
+        """
         now = time.time()
         if self._market_open_cache is not None and now - self._market_check_ts < ttl:
             return self._market_open_cache

@@ -12,6 +12,9 @@ Customisation guide
 All allocation percentages and leverage caps live in the
 REGIME_PARAMS dict near the top of this file.  Every number is named
 and commented — change them in one place and the rest follows.
+Further tunables: the confidence ramp (CONFIDENCE_RAMP_*), the trend
+filter (TREND_FILTER_WINDOW), volatility targeting (VOL_TARGET_ANNUAL,
+0 = off) and the rebalance throttle (REBALANCE_MAX_BARS).
 
 Data flow
 ---------
@@ -25,9 +28,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, Sequence, Union
 
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +87,9 @@ class StrategyParams:
     # Move this fraction to cash when the tier is active (0.0 = stay invested)
     cash_buffer_pct: float
     # Allow short positions in this tier?
+    # NOTE: reserved for a future short-selling implementation — the weight
+    # builder currently only produces long (>= 0) weights, so this flag has
+    # NO effect on live behaviour yet.
     allow_shorts: bool
     # Human-readable rationale logged with every signal
     rationale: str
@@ -120,12 +127,20 @@ REGIME_PARAMS: dict[VolTier, StrategyParams] = {
 }
 
 # Uncertainty penalty: when HMM high_uncertainty is True, multiply
-# allocation_pct and max_leverage by this factor.
+# allocation_pct and max_leverage by this factor (applied ON TOP of the
+# confidence ramp below — two independent warnings compound).
 UNCERTAINTY_SCALING_FACTOR: float = 0.50   # halve exposure on flickering regimes
 
-# Confidence threshold below which we apply uncertainty scaling even if
-# high_uncertainty is not explicitly flagged.
-MIN_CONFIDENCE_THRESHOLD: float = 0.55
+# Confidence ramp: exposure scales SMOOTHLY with the dominant regime's
+# posterior probability instead of a hard on/off threshold.  (The old
+# binary cutoff at 0.55 halved the position when confidence moved from
+# 0.56 → 0.54 — whipsaw exactly when the model is least sure.)
+#   confidence <= RAMP_LOW   → factor = CONFIDENCE_MIN_FACTOR
+#   confidence >= RAMP_HIGH  → factor = 1.0 (full size)
+#   in between               → linear interpolation
+CONFIDENCE_RAMP_LOW:   float = 0.45
+CONFIDENCE_RAMP_HIGH:  float = 0.70
+CONFIDENCE_MIN_FACTOR: float = 0.50
 
 
 # ===========================================================================
@@ -142,11 +157,67 @@ LOW_VOLUME_ALLOCATION_SCALE: float = 0.80   # reduce LOW allocation by 20%
 
 
 # ===========================================================================
+# 3b. TREND FILTER & VOLATILITY TARGETING
+#     Both are consumed inside evaluate(); the helpers below let callers
+#     (main.py live loop, backtester) derive the inputs from raw closes.
+# ===========================================================================
+
+# Simple-moving-average window for the trend filter.  Tiers with
+# require_trend_confirmation=True go to cash while close <= SMA(window).
+TREND_FILTER_WINDOW: int = 200
+
+# Annualised portfolio volatility target.  When > 0 the allocation is
+# scaled by min(1, target / realised_vol) — it only ever REDUCES exposure,
+# never levers up.  0.0 disables vol targeting (default until backtests
+# justify a value; see scripts/run_experiments.py).
+VOL_TARGET_ANNUAL: float = 0.0
+
+
+def is_trend_confirmed(
+    close: Union[pd.Series, Sequence[float]],
+    window: int = TREND_FILTER_WINDOW,
+) -> Optional[bool]:
+    """
+    True when the latest close is above its `window`-bar SMA, False when
+    at/below, None when there is not enough history to decide (callers
+    should then skip the filter rather than block trading during warm-up).
+    Strictly causal: uses only the closes passed in.
+    """
+    closes = pd.Series(close).dropna()
+    if len(closes) < window:
+        return None
+    sma = float(closes.iloc[-window:].mean())
+    return bool(float(closes.iloc[-1]) > sma)
+
+
+def realised_vol_from_close(
+    close: Union[pd.Series, Sequence[float]],
+    window: int = 21,
+) -> Optional[float]:
+    """
+    Annualised realised volatility of the last `window` daily log returns,
+    or None with insufficient history.  Unlike the (RobustScaler-normalised)
+    feature matrix, this returns RAW vol — required for vol targeting.
+    """
+    closes = pd.Series(close).dropna().astype(float)
+    if len(closes) < window + 1:
+        return None
+    tail = closes.iloc[-(window + 1):].values
+    log_rets = np.log(tail[1:] / tail[:-1])
+    sd = float(np.std(log_rets, ddof=1))
+    return sd * float(np.sqrt(252))
+
+
+# ===========================================================================
 # 4. REBALANCING RULES
 # ===========================================================================
 
-# Minimum number of bars between rebalances (time-based throttle)
-REBALANCE_MIN_BARS: int = 1
+# Force a periodic re-sync to target weights after this many bars even if
+# nothing else triggered.  Keep this LARGE: every forced rebalance pays
+# slippage + commission.  Drift and regime changes are the PRIMARY triggers;
+# this is only a staleness backstop.  (The old value of 1 forced a trade
+# every other bar and made the drift threshold below meaningless.)
+REBALANCE_MAX_BARS: int = 21   # ~1 month of daily bars
 
 # Weight drift tolerance: rebalance if any ticker drifts > this from target
 REBALANCE_DRIFT_THRESHOLD: float = 0.05   # 5 percentage points
@@ -190,6 +261,9 @@ class StrategySignal:
     # ── Meta ─────────────────────────────────────────────────────────────
     rationale:       str   = ""
     low_volume_flag: bool  = False
+    # True when a require_trend_confirmation tier was forced to cash
+    # because the close sits below its trend SMA.
+    trend_blocked:   bool  = False
 
     # ── Convenience aliases / display labels ─────────────────────────────
     @property
@@ -218,6 +292,7 @@ class StrategySignal:
             f"conf={self.confidence:.2%} "
             f"{'⚠ HIGH-UNCERTAINTY ' if self.high_uncertainty else ''}"
             f"{'📉 LOW-VOL ' if self.low_volume_flag else ''}"
+            f"{'⛔ TREND-BLOCK ' if self.trend_blocked else ''}"
             f"| {self.rationale}"
         )
 
@@ -247,6 +322,9 @@ class VolatilityRanker:
         if len(self._history) < 2:
             return 0.5
         arr  = np.array(self._history)
+        # Divide by (n-1) so the highest reading ranks 1.0 and the lowest 0.0
+        # (standard percentile rank).  Dividing by n caps the max at (n-1)/n,
+        # which never reaches the top of the [0,1] range.
         rank = float(np.sum(arr < current_vol) / (len(arr) - 1))
         return rank
 
@@ -288,13 +366,15 @@ class RegimeOrchestrator:
         self,
         tickers:          list[str],
         vol_ranker:       Optional[VolatilityRanker] = None,
-        rebalance_min_bars: int = REBALANCE_MIN_BARS,
+        rebalance_max_bars: int = REBALANCE_MAX_BARS,
         drift_threshold:    float = REBALANCE_DRIFT_THRESHOLD,
+        vol_target:         float = VOL_TARGET_ANNUAL,
     ) -> None:
         self._tickers          = list(tickers)
         self._vol_ranker       = vol_ranker or VolatilityRanker()
-        self._rebalance_min_bars = rebalance_min_bars
+        self._rebalance_max_bars = rebalance_max_bars
         self._drift_threshold    = drift_threshold
+        self._vol_target         = vol_target
 
         self._last_regime_index: Optional[int]  = None
         self._bars_since_rebalance: int          = 0
@@ -313,6 +393,7 @@ class RegimeOrchestrator:
         current_weights: Optional[dict[str, float]] = None,
         volume_zscore:   float = 0.0,
         current_vol:     Optional[float] = None,
+        trend_confirmed: Optional[bool] = None,
     ) -> StrategySignal:
         """
         Evaluate the current regime and return a StrategySignal.
@@ -325,7 +406,11 @@ class RegimeOrchestrator:
         high_uncertainty : engine.high_uncertainty flag
         current_weights  : current live portfolio weights for drift check
         volume_zscore    : most recent volume z-score (from FeatureEngineer)
-        current_vol      : realised vol for VolatilityRanker update
+        current_vol      : RAW annualised realised vol (see
+                           realised_vol_from_close); feeds the ranker and,
+                           when vol_target > 0, scales the allocation
+        trend_confirmed  : output of is_trend_confirmed(); None = not enough
+                           history → the trend filter is skipped
         """
         # ── Derive tier ─────────────────────────────────────────────────
         tier = self._resolve_tier(regime_label)
@@ -346,6 +431,28 @@ class RegimeOrchestrator:
         eff_alloc, eff_lev = self._apply_confidence_scaling(
             params, confidence, high_uncertainty, low_vol_flag
         )
+
+        # ── Volatility targeting (only ever reduces exposure) ────────────
+        if self._vol_target > 0 and current_vol is not None and current_vol > 1e-9:
+            vol_scale = min(1.0, self._vol_target / current_vol)
+            if vol_scale < 1.0:
+                logger.debug(
+                    "Vol targeting: realised=%.3f target=%.3f → alloc ×%.2f",
+                    current_vol, self._vol_target, vol_scale,
+                )
+            eff_alloc *= vol_scale
+
+        # ── Trend filter: confirmation-requiring tiers go to cash while
+        #    the close sits below the trend SMA ─────────────────────────
+        trend_blocked = bool(
+            params.require_trend_confirmation and trend_confirmed is False
+        )
+        if trend_blocked:
+            eff_alloc = 0.0
+            logger.debug(
+                "Trend filter: %s tier requires confirmation and close is "
+                "below SMA — allocation forced to 0.", tier.value,
+            )
 
         # ── Target weights ───────────────────────────────────────────────
         target_weights = self._build_weights(tier, eff_alloc, params)
@@ -374,6 +481,7 @@ class RegimeOrchestrator:
             rebalance_reason = rebal_reason,
             rationale        = params.rationale,
             low_volume_flag  = low_vol_flag,
+            trend_blocked    = trend_blocked,
         )
 
         # ── Bookkeeping ──────────────────────────────────────────────────
@@ -426,22 +534,29 @@ class RegimeOrchestrator:
     ) -> tuple[float, float]:
         """
         Return (effective_allocation, effective_leverage) after applying
-        uncertainty and low-volume penalties.
+        the confidence ramp, uncertainty and low-volume penalties.
 
         Rules (applied multiplicatively in order):
-          1. If high_uncertainty OR confidence < threshold → × UNCERTAINTY_SCALING_FACTOR
-          2. If low_vol_flag (thin volume in bull) → × LOW_VOLUME_ALLOCATION_SCALE
+          1. Confidence ramp: linear from CONFIDENCE_MIN_FACTOR (at/below
+             RAMP_LOW) to 1.0 (at/above RAMP_HIGH).  Smooth by design —
+             a hard threshold caused position whipsaw around the cutoff.
+          2. If high_uncertainty (HMM flicker alarm) → × UNCERTAINTY_SCALING_FACTOR
+          3. If low_vol_flag (thin volume in bull) → alloc × LOW_VOLUME_ALLOCATION_SCALE
         """
-        alloc = params.allocation_pct
-        lev   = params.max_leverage
+        ramp_span = CONFIDENCE_RAMP_HIGH - CONFIDENCE_RAMP_LOW
+        factor = (confidence - CONFIDENCE_RAMP_LOW) / ramp_span
+        factor = float(np.clip(factor, CONFIDENCE_MIN_FACTOR, 1.0))
 
-        if high_uncertainty or confidence < MIN_CONFIDENCE_THRESHOLD:
-            alloc *= UNCERTAINTY_SCALING_FACTOR
-            lev   *= UNCERTAINTY_SCALING_FACTOR
+        if high_uncertainty:
+            factor *= UNCERTAINTY_SCALING_FACTOR
+
+        alloc = params.allocation_pct * factor
+        lev   = params.max_leverage   * factor
+        if factor < 1.0:
             logger.debug(
-                "Uncertainty scaling applied (high_uncertainty=%s, conf=%.2f): "
-                "alloc→%.2f lev→%.2f",
-                high_uncertainty, confidence, alloc, lev,
+                "Confidence scaling (conf=%.2f, high_uncertainty=%s): "
+                "factor=%.2f alloc→%.2f lev→%.2f",
+                confidence, high_uncertainty, factor, alloc, lev,
             )
 
         if low_vol_flag:
@@ -498,15 +613,23 @@ class RegimeOrchestrator:
         """
         Returns (should_rebalance, reason_string).
 
-        Triggers:
+        Triggers (in priority order):
+          0. Very first evaluation (establish the initial position)
           A. Regime change
           B. Max weight drift exceeds threshold
-          C. Minimum bar interval satisfied (time-based)
+          C. Staleness backstop: REBALANCE_MAX_BARS since last rebalance
+
+        A and B are the PRIMARY triggers.  C exists only so a long-held
+        book is eventually re-synced; keep it large — every rebalance
+        costs slippage + commission.
         """
+        # 0 — First-ever evaluation: no reference point yet → establish one
+        if self._last_regime_index is None:
+            return True, "initial"
+
         # A — Regime change
         if (
             REBALANCE_ON_REGIME_CHANGE
-            and self._last_regime_index is not None
             and regime_index != self._last_regime_index
         ):
             return True, f"regime_change({self._last_regime_index}→{regime_index})"
@@ -520,8 +643,8 @@ class RegimeOrchestrator:
             if max_drift > self._drift_threshold:
                 return True, f"drift={max_drift:.3f}"
 
-        # C — Time-based minimum interval
-        if self._bars_since_rebalance >= self._rebalance_min_bars:
+        # C — Staleness backstop
+        if self._bars_since_rebalance >= self._rebalance_max_bars:
             return True, f"interval={self._bars_since_rebalance}bars"
 
         return False, ""

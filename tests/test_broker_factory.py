@@ -1,14 +1,23 @@
-"""Tests for the broker abstraction layer (Phase 1 multi-broker support)."""
+"""
+Tests for the broker abstraction layer (Phase 1 multi-broker support).
+
+These verify the provider-agnostic seam without any network calls: the
+factory maps provider names to concrete clients, the Alpaca client conforms
+to the interface, and unimplemented / unknown providers fail loudly.
+"""
+
 import pytest
+
 from broker.base import BaseBroker
 from broker.factory import create_broker
 from broker.alpaca_client import AlpacaClient
 
 
 class TestBaseBroker:
+
     def test_cannot_instantiate_abstract_base(self):
         with pytest.raises(TypeError):
-            BaseBroker()
+            BaseBroker()  # abstract methods are unimplemented
 
     def test_alpaca_conforms_to_interface(self):
         client = create_broker("alpaca")
@@ -16,15 +25,18 @@ class TestBaseBroker:
         assert isinstance(client, AlpacaClient)
 
     def test_is_market_open_default_delegates_to_clock(self):
+        """The base default reads is_open from get_clock()."""
         class DummyBroker(BaseBroker):
             def connect(self): pass
             def verify_connection(self): return True
             def get_account(self): return {}
             def get_clock(self): return {"is_open": True}
+
         assert DummyBroker().is_market_open() is True
 
 
 class TestFactory:
+
     def test_default_provider_is_alpaca(self):
         assert isinstance(create_broker(), AlpacaClient)
 

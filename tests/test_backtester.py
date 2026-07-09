@@ -356,3 +356,46 @@ class TestStressInjection:
         dd_stress = max_drawdown(stress.returns)
         # More negative (or equal) drawdown under stress
         assert dd_stress <= dd_clean + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 8. Rebalance gating & strategy overrides
+# ---------------------------------------------------------------------------
+
+class TestTradeGatingAndOverrides:
+
+    def test_rebalance_gating_reduces_turnover(self):
+        """
+        Gated execution (drift / regime-change / staleness triggers) must
+        not trade MORE often than a deliberately churny configuration that
+        rebalances every bar.
+        """
+        data = _make_ohlcv(420, seed=6)
+        bt_gated = Backtester(
+            ticker="T", train_window=120, test_window=60, random_seed=6,
+        )
+        bt_churn = Backtester(
+            ticker="T", train_window=120, test_window=60, random_seed=6,
+            strategy_overrides={"rebalance_max_bars": 1, "drift_threshold": 0.0},
+        )
+        n_gated = len(bt_gated.run(data).trade_log)
+        n_churn = len(bt_churn.run(data).trade_log)
+        assert n_gated <= n_churn
+
+    def test_trend_filter_flag_recorded_in_metadata(self):
+        data = _make_ohlcv(420, seed=8)
+        bt = Backtester(
+            ticker="T", train_window=120, test_window=60, random_seed=8,
+            use_trend_filter=False,
+        )
+        res = bt.run(data)
+        assert res.metadata["trend_filter"] is False
+
+    def test_strategy_overrides_recorded_in_metadata(self):
+        data = _make_ohlcv(420, seed=8)
+        bt = Backtester(
+            ticker="T", train_window=120, test_window=60, random_seed=8,
+            strategy_overrides={"vol_target": 0.12},
+        )
+        res = bt.run(data)
+        assert res.metadata["strategy_overrides"] == {"vol_target": 0.12}

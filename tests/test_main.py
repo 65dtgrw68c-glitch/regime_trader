@@ -235,7 +235,32 @@ class TestMainLoop:
         assert decision["action"] in {
             "none", "waiting_for_stable_regime", "order_submitted",
             "rejected_by_risk", "halted", "flatten",
+            "hold", "no_change", "skipped_market_closed",
         }
+
+    def test_run_once_diffs_against_existing_position(self, started_system, monkeypatch):
+        """
+        Regression guard for the position-accumulation bug: the loop must
+        trade the DELTA to the target position, not resubmit the full size
+        on every bar.  We simulate a filled book and require that the next
+        bar never re-buys the whole target again.
+        """
+        bar = _make_ohlcv(1, seed=13).iloc[-1]
+        decision1 = started_system.run_once("AAA", bar)
+        if decision1.get("action") != "order_submitted":
+            pytest.skip("no entry signal for this seed — nothing to diff")
+        target = decision1["qty"]
+        assert target > 0
+
+        # Simulate the fill: the book now holds exactly the target quantity.
+        monkeypatch.setattr(started_system, "_position_qty", lambda t: target)
+
+        bar2 = _make_ohlcv(2, seed=13).iloc[-1]
+        decision2 = started_system.run_once("AAA", bar2)
+        # Already at target → at most a small delta may trade, never the
+        # full size again (the old loop bought `target` shares EVERY bar).
+        if decision2.get("action") == "order_submitted":
+            assert decision2["qty"] < target
 
 
 # ---------------------------------------------------------------------------

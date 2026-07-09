@@ -770,3 +770,98 @@ class TestAllocationSmoothing:
         # Damped result sits between the old (~0.20) and the full jump (~0.95):
         # a1 = 0.25·raw + 0.75·a0, so it must not reach the full allocation.
         assert a0 < a1 < 0.8
+
+
+# ---------------------------------------------------------------------------
+# Trend-core mode — trend rule IS the allocation, regime = risk overlay
+# ---------------------------------------------------------------------------
+
+class TestTrendCoreMode:
+
+    def _orch(self, **kw):
+        kw.setdefault("vol_target", 0.0)
+        return RegimeOrchestrator(tickers=["X"], trend_core=True, **kw)
+
+    def test_in_trend_is_fully_invested(self):
+        o = self._orch()
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 0.0}, trend_confirmed=True)
+        assert sum(s.target_weights.values()) == pytest.approx(1.0)
+        assert s.trend_blocked is False
+
+    def test_out_of_trend_is_flat(self):
+        o = self._orch()
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 1.0}, trend_confirmed=False)
+        assert sum(s.target_weights.values()) == 0.0
+        assert s.trend_blocked is True
+
+    def test_warmup_none_is_flat(self):
+        # Matches the sma_200 benchmark: flat until the SMA is defined.
+        o = self._orch()
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 0.0}, trend_confirmed=None)
+        assert sum(s.target_weights.values()) == 0.0
+
+    def test_regime_flip_alone_does_not_trade(self):
+        # Allocation is unchanged (1.0 → 1.0), so a regime change must not
+        # produce a rebalance — this was the churn engine in legacy mode.
+        o = self._orch()
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        s = o.evaluate(1, "Neutral", _proba_for(1), False,
+                       current_weights={"X": 1.0}, trend_confirmed=True)
+        assert s.should_rebalance is False
+
+    def test_trend_flip_trades_via_drift(self):
+        o = self._orch()
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 1.0}, trend_confirmed=False)
+        assert s.should_rebalance is True
+
+    def test_high_tier_overlay_scales_down(self):
+        o = self._orch(trend_core_high_scale=0.5)
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        s = o.evaluate(2, "Bear", _proba_for(2), False,
+                       current_weights={"X": 1.0}, trend_confirmed=True)
+        assert sum(s.target_weights.values()) == pytest.approx(0.5)
+        assert s.should_rebalance is True     # 1.0 → 0.5 is a real change
+
+    def test_overlay_default_off(self):
+        o = self._orch()
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        s = o.evaluate(2, "Bear", _proba_for(2), False,
+                       current_weights={"X": 1.0}, trend_confirmed=True)
+        assert sum(s.target_weights.values()) == pytest.approx(1.0)
+
+    def test_trend_confirm_bars_damps_whipsaw(self):
+        o = self._orch(trend_confirm_bars=3)
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        allocs = [
+            sum(o.evaluate(0, "Bull", _proba_for(0), False,
+                           current_weights={"X": 1.0},
+                           trend_confirmed=False).target_weights.values())
+            for _ in range(3)
+        ]
+        assert allocs == [pytest.approx(1.0), pytest.approx(1.0), 0.0]
+
+    def test_trend_flicker_never_confirms(self):
+        o = self._orch(trend_confirm_bars=3)
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        for tc in (False, True, False, True):
+            s = o.evaluate(0, "Bull", _proba_for(0), False,
+                           current_weights={"X": 1.0}, trend_confirmed=tc)
+        assert sum(s.target_weights.values()) == pytest.approx(1.0)
+
+    def test_confidence_machinery_bypassed(self):
+        # Low confidence must NOT scale the allocation in trend_core mode.
+        o = self._orch()
+        s = o.evaluate(0, "Bull", _low_proba(3, 0), True,
+                       current_weights={"X": 0.0}, trend_confirmed=True)
+        assert sum(s.target_weights.values()) == pytest.approx(1.0)

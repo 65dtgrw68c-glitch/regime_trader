@@ -9,12 +9,15 @@ source of truth instead of scattering magic numbers across the codebase.
 # Tickers
 # ---------------------------------------------------------------------------
 # List of symbols the system is allowed to trade.
+# Only tickers the pinned strategy profile (see ORCHESTRATOR below) has been
+# validated on — SPY and QQQ passed the walk-forward grid; on the never-tuned
+# IWM the profile stayed ~flat while pure trend lost -23%, i.e. it degrades
+# gracefully where trend has no edge. AAPL/MSFT/NVDA were removed 2026-07-09:
+# single-name trend following was never backtested here — run the experiment
+# grid on a name BEFORE adding it back.
 TICKERS = [
     "SPY",
     "QQQ",
-    "AAPL",
-    "MSFT",
-    "NVDA",
 ]
 
 # ---------------------------------------------------------------------------
@@ -82,19 +85,45 @@ STRATEGY = {
 }
 
 # ---------------------------------------------------------------------------
+# Orchestrator profile — the LIVE bot's pinned strategy configuration.
+# ---------------------------------------------------------------------------
+# Keyword arguments passed straight to RegimeOrchestrator in main.py.
+# Change this ONLY on the basis of an experiment-grid result
+# (scripts/run_experiments.py) confirmed on a ticker you did not tune on.
+# An empty dict = the orchestrator's legacy defaults.
+#
+# Pinned 2026-07-09 from the SPY+QQQ walk-forward grid ("tc_vol15"):
+#   * trend_core  — SMA-200 trend rule IS the allocation; the HMM regime
+#     tiers no longer drive it (they were measured to subtract value on
+#     both tickers, even as a mere risk overlay).
+#   * vol_target 0.15 — scale exposure down when realised vol exceeds 15%
+#     annualised; cut drawdowns on BOTH tickers (SPY -22%→-19%, QQQ
+#     -21%→-13%) and lifted QQQ Sharpe 0.68→0.93.
+# Result vs the old regime-driven defaults: SPY -6.7%→+30.2%,
+# QQQ +19.6%→+72.8% (1496/1495 bars, walk-forward, net of costs).
+# Out-of-sample check on IWM (never used for tuning): +0.1% — i.e. roughly
+# flat on a choppy ticker where PURE trend lost -23% and where even the
+# costless sma_200 benchmark badly lags buy&hold. The profile degrades
+# gracefully where trend has no edge; it does not manufacture one.
+ORCHESTRATOR: dict = {
+    "trend_core": True,
+    "vol_target": 0.15,
+}
+
+# ---------------------------------------------------------------------------
 # Risk thresholds
 # ---------------------------------------------------------------------------
 RISK = {
     # Maximum fraction of portfolio per position.
-    # regime_trader runs a SINGLE-symbol strategy, so this is a portfolio-
-    # level exposure ceiling, not a diversification limit. At 0.10 it capped
-    # every position to 10% of equity, which — combined with the tier weights
-    # applied on top — held effective exposure near 2% and left the bot in
-    # cash. 1.0 lets the vol-tier allocations (0.20/0.60/0.95) be the real
-    # allocation control; lower it only if you deliberately want a hard cap
-    # below the tier weights (e.g. trading several names through one account).
-    # No leverage (>1.0) without also raising max_leverage.
-    "max_position_size": 1.00,
+    # Per-name exposure ceiling. Each ticker runs its OWN orchestrator that
+    # targets up to 100% of equity, so with several tickers this cap is what
+    # divides the book between them: 2 validated tickers × 0.50 = fully
+    # invested when both are in-trend, half-invested when only one is.
+    # (History: 0.10 was the old cap that — multiplied with the tier weights —
+    # collapsed effective exposure to ~2% and kept the bot in cash; it was
+    # briefly 1.00 while the bot traded a single symbol.)
+    # No leverage (sum > 1.0) without also raising max_leverage.
+    "max_position_size": 0.50,
     # Maximum gross leverage
     "max_leverage": 1.0,
     # Daily drawdown limit triggering a circuit breaker (fraction)

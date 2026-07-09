@@ -300,7 +300,6 @@ class Backtester:
             lock_path = Path(tempfile.gettempdir()) / f"bt_halt_{uuid.uuid4().hex}.lock"
             lock_path.unlink(missing_ok=True)
             risk = RiskManager(lock_file_path=str(lock_path))
-        risk.start_new_day(equity)
 
         # We need features for OOS bars too, computed from data up to each
         # bar WITHOUT refitting the scaler (transform only).  To stay strictly
@@ -313,6 +312,13 @@ class Backtester:
             bar_close = float(data["close"].iloc[i])
             prev_close = float(data["close"].iloc[i - 1]) if i > 0 else bar_close
             bar_ret_raw = (bar_close - prev_close) / prev_close if prev_close else 0.0
+
+            # ── New trading day: anchor the DAILY breakers to yesterday's
+            #    close. Anchoring once per window (as this used to) made the
+            #    "-2%/-3% single-day" breakers fire on CUMULATIVE window
+            #    losses and then kept the book flat for the rest of the
+            #    window — systematically selling lows. One bar = one day.
+            risk.start_new_day(equity)
 
             # ── Causal features: only data [0 : i+1] ─────────────────────
             window_df = data.iloc[: i + 1]
@@ -408,6 +414,9 @@ class Backtester:
             oos_regimes.append(regime_label)
             oos_conf.append(confidence)
             equity = equity_after
+            # Feed the rolling weekly-loss breaker with the daily close
+            # (end_of_day existed but was never called anywhere).
+            risk.end_of_day(equity)
 
         # Remove this run's throwaway HALT lock (only exists if the breaker
         # fired). Skip when the caller injected its own RiskManager.

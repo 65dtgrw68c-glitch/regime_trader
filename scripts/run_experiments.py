@@ -73,6 +73,7 @@ STOOQ_URL = "https://stooq.com/q/d/l/?s={symbol}&i=d"
 # "legacy_churn" reproduces the pre-fix behaviour (forced rebalance every
 # bar, no trend filter) so the table shows what each fix is worth.
 VARIANTS: list[tuple[str, dict, str]] = [
+    # ── References ─────────────────────────────────────────────────────────
     (
         "legacy_churn",
         {
@@ -82,56 +83,52 @@ VARIANTS: list[tuple[str, dict, str]] = [
         "pre-fix behaviour: rebalance every bar, no trend filter",
     ),
     (
-        "gated_rebalance",
-        {"use_trend_filter": False},
-        "churn fix only: drift/regime triggers, 21-bar backstop",
-    ),
-    (
-        "trend_filter",
+        "regime_defaults",
         {},
-        "churn fix + SMA-200 trend filter (current defaults)",
+        "legacy regime-driven mode with current defaults",
     ),
     (
-        "trend_vol_10",
-        {"strategy_overrides": {"vol_target": 0.10}},
-        "defaults + 10% annualised vol target",
-    ),
-    (
-        "trend_vol_12",
-        {"strategy_overrides": {"vol_target": 0.12}},
-        "defaults + 12% annualised vol target",
-    ),
-    (
-        "trend_vol_15",
-        {"strategy_overrides": {"vol_target": 0.15}},
-        "defaults + 15% annualised vol target",
-    ),
-    # ── Turnover / regime-stability dampers (see regime_strategies) ───────
-    # The sizing fix exposed 44-68x turnover from raw regime flips; these
-    # test each damper alone, then combined.
-    (
-        "hysteresis_5",
-        {"strategy_overrides": {"regime_confirm_bars": 5}},
-        "#1: act on a regime change only after 5 confirming bars",
-    ),
-    (
-        "brake_15",
-        {"strategy_overrides": {"min_trade_delta": 0.15}},
-        "#2: skip trades whose allocation change is < 15pts",
-    ),
-    (
-        "smooth_30",
+        "regime_smooth_30",
         {"strategy_overrides": {"alloc_smoothing": 0.30}},
-        "#3: EWMA-glide the target allocation (alpha=0.30)",
+        "legacy mode + best turnover damper from the damper grid",
+    ),
+    # ── Trend-core family ──────────────────────────────────────────────────
+    # SMA-200 was the only signal robust across SPY AND QQQ (Sharpe
+    # 0.77/1.00); these make it the core and demote the HMM to a risk
+    # overlay. Goal: reproduce the sma_200 benchmark net of costs, then see
+    # whether any overlay ADDS to it on both tickers.
+    (
+        "trend_core",
+        {"strategy_overrides": {"trend_core": True}},
+        "pure SMA-200 core: in-trend=100%, out=cash, no overlay",
     ),
     (
-        "all_dampers",
-        {"strategy_overrides": {
-            "regime_confirm_bars": 5,
-            "min_trade_delta": 0.15,
-            "alloc_smoothing": 0.30,
-        }},
-        "#1+#2+#3 combined on top of the current defaults",
+        "tc_confirm3",
+        {"strategy_overrides": {"trend_core": True, "trend_confirm_bars": 3}},
+        "trend core, flips must persist 3 bars (whipsaw damper)",
+    ),
+    (
+        "tc_hi50",
+        {"strategy_overrides": {"trend_core": True,
+                                "trend_core_high_scale": 0.5}},
+        "trend core, HIGH-tier regimes halve the allocation",
+    ),
+    (
+        "tc_confirm3_hi50",
+        {"strategy_overrides": {"trend_core": True, "trend_confirm_bars": 3,
+                                "trend_core_high_scale": 0.5}},
+        "trend core + 3-bar confirm + HIGH-tier halving",
+    ),
+    (
+        "tc_confirm3_brake",
+        {"strategy_overrides": {"trend_core": True, "trend_confirm_bars": 3,
+                                "min_trade_delta": 0.02}},
+        "trend core + 3-bar confirm + skip <2pt resync trades",
+    ),
+    (
+        "tc_vol15",
+        {"strategy_overrides": {"trend_core": True, "vol_target": 0.15}},
+        "trend core + 15% annualised vol target",
     ),
 ]
 

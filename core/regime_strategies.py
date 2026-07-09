@@ -278,6 +278,26 @@ MIN_TRADE_DELTA: float = 0.0        # 0 = no minimum (legacy)
 #    smoother. 1.0 = no smoothing (legacy), 0.3 ≈ month-scale glide.
 ALLOC_SMOOTHING: float = 1.0        # 1.0 = instantaneous (legacy)
 
+# ── Trend-core mode (default OFF = legacy regime-driven behaviour) ─────────
+# Every experiment across SPY and QQQ showed the same thing: the simple
+# SMA-200 trend rule was the ONLY robust signal (Sharpe 0.77/1.00, beating
+# every HMM-driven variant on both tickers), while HMM regime tiers as the
+# primary allocation driver produced inverted rankings between tickers (no
+# edge). trend_core inverts the architecture accordingly:
+#   * the trend rule IS the allocation:  in-trend → 1.0, out-of-trend → 0.0
+#   * the HMM regime only acts as an optional RISK OVERLAY that scales the
+#     allocation down in HIGH-tier (Bear/Crash) regimes
+#   * the confidence ramp / low-volume machinery is bypassed (measured to
+#     add turnover, not value)
+TREND_CORE: bool = False
+# Bars a trend flip must persist before we act on it (0 = act immediately).
+# Damps whipsaw when price hovers around the SMA.
+TREND_CONFIRM_BARS: int = 0
+# Allocation multiplier applied while the confirmed regime maps to the HIGH
+# tier — the regime engine's only remaining lever in trend_core mode.
+# 1.0 = overlay disabled.
+TREND_CORE_HIGH_SCALE: float = 1.0
+
 
 # ===========================================================================
 # 5. SIGNAL DATA CLASS
@@ -425,6 +445,9 @@ class RegimeOrchestrator:
         regime_confirm_bars: int = REGIME_CONFIRM_BARS,
         min_trade_delta:     float = MIN_TRADE_DELTA,
         alloc_smoothing:     float = ALLOC_SMOOTHING,
+        trend_core:          bool = TREND_CORE,
+        trend_confirm_bars:  int = TREND_CONFIRM_BARS,
+        trend_core_high_scale: float = TREND_CORE_HIGH_SCALE,
     ) -> None:
         self._tickers          = list(tickers)
         self._vol_ranker       = vol_ranker or VolatilityRanker()
@@ -434,6 +457,9 @@ class RegimeOrchestrator:
         self._regime_confirm_bars = max(0, int(regime_confirm_bars))
         self._min_trade_delta     = max(0.0, float(min_trade_delta))
         self._alloc_smoothing     = float(np.clip(alloc_smoothing, 1e-6, 1.0))
+        self._trend_core            = bool(trend_core)
+        self._trend_confirm_bars    = max(0, int(trend_confirm_bars))
+        self._trend_core_high_scale = float(np.clip(trend_core_high_scale, 0.0, 1.0))
 
         self._last_regime_index: Optional[int]  = None
         self._bars_since_rebalance: int          = 0
@@ -447,6 +473,11 @@ class RegimeOrchestrator:
         self._pending_regime_count: int             = 0
         # #3 smoothing state: last emitted (smoothed) allocation.
         self._smoothed_alloc: Optional[float]       = None
+        # trend_core hysteresis state: the trend side we're acting on plus
+        # the flip candidate we're counting confirmation bars for.
+        self._trend_state: Optional[bool]           = None
+        self._pending_trend: Optional[bool]         = None
+        self._pending_trend_count: int              = 0
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -490,19 +521,47 @@ class RegimeOrchestrator:
         # ── Confidence (mass on the regime we're acting on) ──────────────
         confidence = self._dominant_confidence(proba, eff_index)
 
-        # ── Low-volume bull adjustment ───────────────────────────────────
-        low_vol_flag = (
-            tier == VolTier.LOW
-            and volume_zscore < LOW_VOLUME_ZSCORE_THRESHOLD
-        )
-
         # ── Base params ─────────────────────────────────────────────────
         params = REGIME_PARAMS[tier]
 
-        # ── Effective allocation after confidence / uncertainty scaling ──
-        eff_alloc, eff_lev = self._apply_confidence_scaling(
-            params, confidence, high_uncertainty, low_vol_flag
-        )
+        if self._trend_core:
+            # ── TREND-CORE MODE: the trend rule IS the allocation. ────────
+            # The regime engine is demoted to a risk overlay (HIGH-tier
+            # scale-down); the confidence ramp / low-volume machinery is
+            # bypassed entirely — it was measured to add churn, not value.
+            low_vol_flag = False
+            eff_trend = self._confirm_trend(trend_confirmed)
+            base_alloc = 1.0 if eff_trend else 0.0
+            overlay = (
+                self._trend_core_high_scale if tier == VolTier.HIGH else 1.0
+            )
+            eff_alloc = base_alloc * overlay
+            eff_lev   = eff_alloc            # long-only, no leverage
+            trend_blocked = not bool(eff_trend)
+        else:
+            # ── LEGACY MODE: regime tier drives the allocation. ───────────
+            # Low-volume bull adjustment
+            low_vol_flag = (
+                tier == VolTier.LOW
+                and volume_zscore < LOW_VOLUME_ZSCORE_THRESHOLD
+            )
+
+            # Effective allocation after confidence / uncertainty scaling
+            eff_alloc, eff_lev = self._apply_confidence_scaling(
+                params, confidence, high_uncertainty, low_vol_flag
+            )
+
+            # Trend filter: confirmation-requiring tiers go to cash while
+            # the close sits below the trend SMA
+            trend_blocked = bool(
+                params.require_trend_confirmation and trend_confirmed is False
+            )
+            if trend_blocked:
+                eff_alloc = 0.0
+                logger.debug(
+                    "Trend filter: %s tier requires confirmation and close is "
+                    "below SMA — allocation forced to 0.", tier.value,
+                )
 
         # ── Volatility targeting (only ever reduces exposure) ────────────
         if self._vol_target > 0 and current_vol is not None and current_vol > 1e-9:
@@ -513,18 +572,6 @@ class RegimeOrchestrator:
                     current_vol, self._vol_target, vol_scale,
                 )
             eff_alloc *= vol_scale
-
-        # ── Trend filter: confirmation-requiring tiers go to cash while
-        #    the close sits below the trend SMA ─────────────────────────
-        trend_blocked = bool(
-            params.require_trend_confirmation and trend_confirmed is False
-        )
-        if trend_blocked:
-            eff_alloc = 0.0
-            logger.debug(
-                "Trend filter: %s tier requires confirmation and close is "
-                "below SMA — allocation forced to 0.", tier.value,
-            )
 
         # ── Allocation smoothing (#3): EWMA-glide the target so a regime
         #    flip can't swing the book 20%↔95% in one bar. α=1.0 = off. ───
@@ -543,8 +590,12 @@ class RegimeOrchestrator:
             self._vol_ranker.update(current_vol)
 
         # ── Rebalance decision ───────────────────────────────────────────
+        # In trend_core mode a regime flip alone must not trade — only an
+        # actual allocation change (trend flip / overlay change) does, and
+        # those are caught by the drift trigger.
         should_rebal, rebal_reason = self._rebalance_decision(
-            eff_index, target_weights, current_weights or {}
+            eff_index, target_weights, current_weights or {},
+            allow_regime_trigger=not self._trend_core,
         )
 
         # ── Build signal (reports the regime we ACT on) ──────────────────
@@ -624,6 +675,55 @@ class RegimeOrchestrator:
             self._pending_regime_count = 0
 
         return self._confirmed_regime_index, self._confirmed_regime_label
+
+    # ------------------------------------------------------------------
+    # Trend hysteresis (trend_core mode)
+    # ------------------------------------------------------------------
+
+    def _confirm_trend(self, trend_confirmed: Optional[bool]) -> bool:
+        """
+        Hysteresis-filtered trend state for trend_core mode: a flip must
+        persist `trend_confirm_bars` consecutive bars before we act on it.
+        None (warm-up, not enough history) keeps the current state; before
+        any state exists it means "not invested" — matching the SMA-200
+        benchmark, which is flat until its SMA is defined.
+        """
+        if trend_confirmed is None:
+            return bool(self._trend_state)
+
+        # First defined reading: adopt it immediately.
+        if self._trend_state is None:
+            self._trend_state = trend_confirmed
+            self._pending_trend = None
+            self._pending_trend_count = 0
+            return self._trend_state
+
+        # Same side as the state we're acting on → clear any pending flip.
+        if trend_confirmed == self._trend_state:
+            self._pending_trend = None
+            self._pending_trend_count = 0
+            return self._trend_state
+
+        # Opposite side. Act immediately when hysteresis is off.
+        if self._trend_confirm_bars <= 0:
+            self._trend_state = trend_confirmed
+            self._pending_trend = None
+            self._pending_trend_count = 0
+            return self._trend_state
+
+        # Count consecutive bars of the pending flip.
+        if trend_confirmed == self._pending_trend:
+            self._pending_trend_count += 1
+        else:
+            self._pending_trend = trend_confirmed
+            self._pending_trend_count = 1
+
+        if self._pending_trend_count >= self._trend_confirm_bars:
+            self._trend_state = trend_confirmed
+            self._pending_trend = None
+            self._pending_trend_count = 0
+
+        return bool(self._trend_state)
 
     # ------------------------------------------------------------------
     # Tier resolution
@@ -741,6 +841,7 @@ class RegimeOrchestrator:
         regime_index:    int,
         target_weights:  dict[str, float],
         current_weights: dict[str, float],
+        allow_regime_trigger: bool = True,
     ) -> tuple[bool, str]:
         """
         Returns (should_rebalance, reason_string).
@@ -774,9 +875,11 @@ class RegimeOrchestrator:
             )
         meaningful = max_delta >= self._min_trade_delta
 
-        # A — Regime change (gated by the turnover brake)
+        # A — Regime change (gated by the turnover brake; suppressed in
+        #     trend_core mode where only allocation changes matter)
         if (
-            REBALANCE_ON_REGIME_CHANGE
+            allow_regime_trigger
+            and REBALANCE_ON_REGIME_CHANGE
             and regime_index != self._last_regime_index
             and meaningful
         ):

@@ -126,6 +126,9 @@ class TradingSystem:
         self._orders_submitted = 0
         self._equity = 0.0
         self._market_status = "unknown"
+        # Trading date the daily circuit breakers are currently anchored to;
+        # run_once rolls it forward when a bar from a new day arrives.
+        self._risk_day = None
         self._market_open_cache: Optional[bool] = None
         self._market_check_ts = 0.0
 
@@ -193,7 +196,9 @@ class TradingSystem:
             self._states[ticker] = TickerState(
                 feature_engineer=fe,
                 engine=engine,
-                orchestrator=RegimeOrchestrator(tickers=[ticker]),
+                orchestrator=RegimeOrchestrator(
+                    tickers=[ticker], **getattr(config, "ORCHESTRATOR", {})
+                ),
                 history=hist.copy(),
             )
 
@@ -336,7 +341,22 @@ class TradingSystem:
             trend_confirmed=is_trend_confirmed(closes),
         )
 
-        # 10 — Circuit-breaker check FIRST (risk has veto power)
+        # 10 — Circuit-breaker check FIRST (risk has veto power).
+        #     Roll the daily anchor when a bar from a new trading day
+        #     arrives: the "-2%/-3% single-day" breakers must reference
+        #     yesterday's close, not the equity at bot startup (start_new_day
+        #     used to be called exactly once, at startup — so after a few
+        #     weeks any cumulative -3% would flatten the book for good).
+        try:
+            bar_day = pd.Timestamp(state.history.index[-1]).date()
+        except (TypeError, ValueError):
+            bar_day = None
+        if bar_day is not None and bar_day != self._risk_day:
+            if self._risk_day is not None:
+                self._risk.end_of_day(equity)   # feed weekly-loss breaker
+            self._risk.start_new_day(equity)
+            self._risk_day = bar_day
+
         cb = self._risk.update_equity(
             equity, regime_label=regime_label,
             open_positions=self._open_positions_dict(),

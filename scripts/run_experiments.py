@@ -12,23 +12,27 @@ walk-forward windows, same seed.
 
 Data sources
 ------------
-1. --csv (recommended in sandboxed/cloud environments): a local OHLCV file
-   you downloaded yourself, e.g. from https://stooq.com/q/d/l/?s=spy.us&i=d
-   or a Yahoo Finance "Historical Data" export. Stooq blocks requests from
-   cloud-datacenter IPs (Codespaces included), so this is the reliable path
-   there — download the CSV in a normal browser, then point here.
-2. Stooq (default when --csv is omitted): free daily OHLCV via CSV download,
-   no API key. Symbols use Stooq notation, e.g. "spy.us", "qqq.us", "^spx".
-   Will fail with a 404 from most cloud IPs — use --csv instead in that case.
-3. --synthetic: offline regime-switching random walk.  ONLY useful as a
+1. Alpaca (default): uses the ALPACA_API_KEY / ALPACA_SECRET_KEY already in
+   .env for live trading — the same paper-trading account this bot trades
+   through. Since the bot itself talks to api.alpaca.markets, this endpoint
+   is normally already reachable from wherever the bot runs (Codespaces,
+   corporate networks), unlike Stooq. Plain ticker symbols, e.g. "SPY".
+2. --csv: a local OHLCV file you downloaded yourself (Stooq or Yahoo Finance
+   "Historical Data" export). Use this if Alpaca credentials aren't set up
+   or its data endpoint is blocked too.
+3. --stooq: force the free Stooq CSV download instead of Alpaca. Stooq
+   blocks cloud-datacenter IPs (Codespaces) and is blocked by some corporate
+   firewalls — try --csv or the Alpaca default instead if this 404s.
+4. --synthetic: offline regime-switching random walk.  ONLY useful as a
    smoke test — parameter choices tuned on synthetic noise mean nothing
    for real markets.
 
 Usage
 -----
-    python scripts/run_experiments.py                          # SPY via Stooq, full grid
+    python scripts/run_experiments.py                          # SPY via Alpaca, full grid
+    python scripts/run_experiments.py --ticker QQQ --bars 1500
     python scripts/run_experiments.py --csv spy_daily.csv       # local file, no network
-    python scripts/run_experiments.py --ticker qqq.us --bars 1500
+    python scripts/run_experiments.py --stooq --ticker spy.us   # legacy Stooq path
     python scripts/run_experiments.py --synthetic              # offline smoke run
     python scripts/run_experiments.py --out experiments_report.md
 
@@ -42,8 +46,10 @@ not tune on, and leave a final out-of-sample stretch untouched.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -107,8 +113,57 @@ VARIANTS: list[tuple[str, dict, str]] = [
 # Data loading
 # ---------------------------------------------------------------------------
 
+def fetch_alpaca(symbol: str, bars: int) -> pd.DataFrame:
+    """Download daily history for `symbol` via the Alpaca Market Data API,
+    using the same ALPACA_API_KEY / ALPACA_SECRET_KEY the bot trades with.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    except ImportError:
+        pass
+
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        raise RuntimeError(
+            "ALPACA_API_KEY / ALPACA_SECRET_KEY not set (checked .env and "
+            "environment). Set them, or use --csv / --stooq / --synthetic instead."
+        )
+
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+
+    symbol = symbol.upper().replace(".US", "").lstrip("^")
+    client = StockHistoricalDataClient(api_key, secret_key)
+    end = datetime.now(timezone.utc) - timedelta(minutes=16)   # free IEX feed lag
+    start = end - timedelta(days=int(bars * 1.6) + 15)         # buffer for weekends/holidays
+    print(f"Fetching {symbol} from Alpaca (IEX feed, {start.date()} … {end.date()}) ...")
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+        feed=DataFeed.IEX,
+    )
+    bars_df = client.get_stock_bars(req).df
+    if bars_df.empty:
+        raise ValueError(f"Alpaca returned no bars for '{symbol}'. Wrong symbol?")
+    df = bars_df.xs(symbol, level="symbol").copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    out = df[["open", "high", "low", "close", "volume"]].astype(float).dropna()
+    if len(out) < 400:
+        raise ValueError(f"Only {len(out)} usable bars for '{symbol}' — too few.")
+    print(f"Got {len(out)} daily bars ({out.index[0].date()} … {out.index[-1].date()}).")
+    return out
+
+
 def fetch_stooq(symbol: str) -> pd.DataFrame:
     """Download full daily history for `symbol` from Stooq."""
+    if "." not in symbol and "^" not in symbol:
+        symbol = f"{symbol}.us"          # allow plain tickers like "SPY" too
     url = STOOQ_URL.format(symbol=symbol.lower())
     print(f"Fetching {symbol} from {url} ...")
     df = pd.read_csv(url)
@@ -228,13 +283,17 @@ def to_markdown(rows: list[dict], meta: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--ticker", default="spy.us",
-                    help="Stooq symbol, e.g. spy.us / qqq.us (default: spy.us)")
+    ap.add_argument("--ticker", default="SPY",
+                    help="Ticker symbol, e.g. SPY / QQQ (default: SPY). "
+                         "With --stooq, Stooq notation also works (spy.us).")
     ap.add_argument("--bars", type=int, default=2000,
                     help="Use only the most recent N bars (default: 2000 ≈ 8y)")
     ap.add_argument("--csv", default=None,
                     help="Path to a local OHLCV CSV (Stooq or Yahoo export). "
-                         "Use this in Codespaces/CI — Stooq blocks cloud IPs.")
+                         "Use this if Alpaca creds/endpoint aren't available.")
+    ap.add_argument("--stooq", action="store_true",
+                    help="Force the free Stooq download instead of Alpaca "
+                         "(blocked from Codespaces and some corporate networks).")
     ap.add_argument("--synthetic", action="store_true",
                     help="Offline synthetic data (smoke test only)")
     ap.add_argument("--seed", type=int, default=42)
@@ -250,9 +309,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.synthetic:
         data = synthetic_ohlcv(args.bars, seed=args.seed)
         source = f"synthetic (seed={args.seed})"
-    else:
+    elif args.stooq:
         data = fetch_stooq(args.ticker).iloc[-args.bars:]
         source = f"{args.ticker} via Stooq"
+    else:
+        data = fetch_alpaca(args.ticker, args.bars).iloc[-args.bars:]
+        source = f"{args.ticker} via Alpaca (IEX feed)"
 
     rows: list[dict] = []
     benchmarks_row: list[dict] = []

@@ -10,19 +10,27 @@ source of truth instead of scattering magic numbers across the codebase.
 # ---------------------------------------------------------------------------
 # List of symbols the system is allowed to trade.
 TICKERS = [
-    # e.g. "SPY", "QQQ", "IWM", "GLD", "TLT"
+    "SPY",
+    "QQQ",
+    "AAPL",
+    "MSFT",
+    "NVDA",
 ]
 
 # ---------------------------------------------------------------------------
 # Broker / Alpaca settings
 # ---------------------------------------------------------------------------
 BROKER = {
+    # Which broker backend: "alpaca" (US) or "ibkr" (Phase 2, EU).
+    "provider": "alpaca",
     # "paper" or "live"
     "mode": "paper",
     # Maximum number of API retries before raising
     "max_retries": 3,
     # Seconds to wait between retries
     "retry_delay": 2,
+    # Only submit orders while the exchange is open (else just log the decision).
+    "trade_only_when_open": True,
 }
 
 # ---------------------------------------------------------------------------

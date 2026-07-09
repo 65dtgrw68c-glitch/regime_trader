@@ -121,6 +121,8 @@ class TradingSystem:
         self._orders_submitted = 0
         self._equity = 0.0
         self._market_status = "unknown"
+        self._market_open_cache: Optional[bool] = None
+        self._market_check_ts = 0.0
 
     # ==================================================================
     # STARTUP SEQUENCE (exact order required by Prompt 7)
@@ -136,11 +138,12 @@ class TradingSystem:
             logger.error("No tickers configured in settings/config.TICKERS.")
             return False
 
-        # 2 — Credentials (.env loaded by AlpacaClient)
-        logger.info("[startup 2/10] Loading credentials / broker client...")
+        # 2 — Credentials (.env loaded by the concrete broker client)
+        logger.info("[startup 2/10] Loading credentials / broker client (%s)...",
+                    config.BROKER.get("provider", "alpaca"))
         if self._client is None:
-            from broker.alpaca_client import AlpacaClient
-            self._client = AlpacaClient()
+            from broker.factory import create_broker
+            self._client = create_broker()
 
         # 3 — Connect + verify account active & funded
         logger.info("[startup 3/10] Connecting to Alpaca and verifying account...")
@@ -343,8 +346,12 @@ class TradingSystem:
         qty = self._risk.size_position(price, stop_price, equity)
         qty = int(qty * min(1.0, target_weight))
 
-        # 7 — Validate + submit
-        if qty > 0:
+        # 7 — Validate + submit (only while the exchange is open)
+        if qty > 0 and config.BROKER.get("trade_only_when_open", True) and not self._market_is_open():
+            decision["action"] = "skipped_market_closed"
+            logger.info("Market closed — %s decision observed but not submitted "
+                        "(would-be qty=%d @ %.2f).", ticker, qty, price)
+        elif qty > 0:
             account = self._safe_call(self._client.get_account) or {}
             buying_power = float(account.get("buying_power", equity))
             validation = self._risk.validate_order(
@@ -521,6 +528,19 @@ class TradingSystem:
         if clock.get("is_open"):
             return "open"
         return "closed"
+
+    def _market_is_open(self, ttl: float = 30.0) -> bool:
+        """True if the exchange is open; cached `ttl`s to spare the clock endpoint."""
+        now = time.time()
+        if self._market_open_cache is not None and now - self._market_check_ts < ttl:
+            return self._market_open_cache
+        clock = self._safe_call(self._client.get_clock) if self._client else None
+        if clock is None:
+            return True if self._market_open_cache is None else self._market_open_cache
+        self._market_open_cache = bool(clock.get("is_open", False))
+        self._market_check_ts = now
+        self._market_status = "open" if self._market_open_cache else "closed"
+        return self._market_open_cache
 
     def _current_equity(self) -> float:
         account = self._safe_call(self._client.get_account) if self._client else None

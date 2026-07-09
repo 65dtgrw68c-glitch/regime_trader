@@ -19,10 +19,12 @@ from typing import Any, Optional
 
 from settings import config
 
+from broker.base import BaseBroker
+
 logger = logging.getLogger(__name__)
 
 
-class AlpacaClient:
+class AlpacaClient(BaseBroker):
     """
     Thin wrapper around alpaca-py's trading + historical data clients.
 

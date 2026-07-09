@@ -152,13 +152,13 @@ def get_live_state(ticker: str) -> Optional[dict]:
     Returns None if anything fails (caller falls back to demo).
     """
     try:
-        from broker.alpaca_client import AlpacaClient
+        from broker.factory import create_broker
         from broker.position_tracker import PositionTracker
         from data.market_data import MarketDataFeed
         from core.feature_engineering import FeatureEngineer
         from core.hmm_engine import HMMEngine
 
-        client = AlpacaClient()
+        client = create_broker()
         if not client.verify_connection():
             return None
         account = client.get_account()

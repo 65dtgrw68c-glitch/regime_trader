@@ -164,6 +164,7 @@ class MarketDataFeed:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        from alpaca.data.enums import DataFeed
 
         data_client = getattr(self._client, "data", None) or StockHistoricalDataClient(
             getattr(self._client, "api_key", ""),
@@ -175,6 +176,7 @@ class MarketDataFeed:
             timeframe=tf,
             start=pd.Timestamp(start).to_pydatetime(),
             end=pd.Timestamp(end).to_pydatetime() if end else None,
+            feed=DataFeed.IEX,
         )
         bars = data_client.get_stock_bars(request)
         df = bars.df

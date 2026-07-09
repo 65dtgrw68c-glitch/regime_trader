@@ -35,6 +35,7 @@ from core.regime_strategies import (
     RegimeOrchestrator,
     is_trend_confirmed,
     realised_vol_from_close,
+    shares_for_target_weight,
 )
 from core.risk_manager import CBLevel, RiskManager
 from monitoring.alerts import AlertManager, SEVERITY_CRITICAL, SEVERITY_WARNING
@@ -351,13 +352,19 @@ class TradingSystem:
             self._flatten_all()
             return decision
 
-        # 6 — Risk sizing → ABSOLUTE target position, then delta vs holding.
+        # 6 — Sizing → ABSOLUTE target position, then delta vs holding.
+        #     target_weight IS the fraction of equity to deploy (the vol-tier
+        #     allocations). The shared helper turns it into a share count with
+        #     the circuit-breaker factor folded in — the backtester uses the
+        #     exact same helper so live and backtest sizing cannot diverge.
         #     (Submitting the full size every bar — as this loop once did —
         #     silently accumulates positions; only the DELTA may trade.)
-        stop_price = price * (1.0 - config.RISK["stop_loss_pct"])
         target_weight = sum(strat_signal.target_weights.values())
-        raw_qty = self._risk.size_position(price, stop_price, equity)
-        target_qty = int(raw_qty * min(1.0, target_weight))
+        target_qty = int(shares_for_target_weight(
+            target_weight, price, equity,
+            cb_scaling=self._risk.size_scaling_factor(),
+            max_exposure=config.RISK["max_position_size"],
+        ))
         delta = target_qty - current_qty
 
         # 7 — Trade only on a rebalance trigger (regime change / drift /

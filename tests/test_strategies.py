@@ -39,6 +39,7 @@ from core.regime_strategies import (
     is_trend_confirmed,
     realised_vol_from_close,
     regime_display_label,
+    shares_for_target_weight,
 )
 
 
@@ -634,3 +635,48 @@ class TestAliasesAndLabels:
     def test_regime_display_label_unknown_falls_back(self):
         label = regime_display_label("Quantum Bear", 0.50)
         assert "50%" in label
+
+
+# ---------------------------------------------------------------------------
+# Position sizing — target_weight IS the allocation (sizing overhaul)
+# ---------------------------------------------------------------------------
+
+class TestSharesForTargetWeight:
+    """`shares_for_target_weight` must deploy the full target_weight of equity,
+    not a discounted risk-based sliver (the pre-fix bug capped exposure ~2%)."""
+
+    def test_full_allocation_deploys_full_notional(self):
+        # 60% tier at $100, $100k equity → 600 shares = $60k = 60% of equity.
+        shares = shares_for_target_weight(0.60, price=100.0, equity=100_000)
+        assert shares == pytest.approx(600.0)
+
+    def test_notional_matches_weight(self):
+        for w in (0.20, 0.60, 0.95):
+            shares = shares_for_target_weight(w, price=50.0, equity=200_000)
+            notional = shares * 50.0
+            assert notional == pytest.approx(w * 200_000)
+
+    def test_zero_or_negative_weight_is_flat(self):
+        assert shares_for_target_weight(0.0, 100.0, 100_000) == 0.0
+        assert shares_for_target_weight(-0.3, 100.0, 100_000) == 0.0
+
+    def test_bad_price_or_equity_is_flat(self):
+        assert shares_for_target_weight(0.6, 0.0, 100_000) == 0.0
+        assert shares_for_target_weight(0.6, 100.0, 0.0) == 0.0
+
+    def test_max_exposure_ceiling_caps_allocation(self):
+        # Weight above the ceiling is clamped to the ceiling.
+        shares = shares_for_target_weight(
+            0.95, price=100.0, equity=100_000, max_exposure=0.50
+        )
+        assert shares * 100.0 == pytest.approx(0.50 * 100_000)
+
+    def test_circuit_breaker_scaling_halves_size(self):
+        full = shares_for_target_weight(0.60, 100.0, 100_000, cb_scaling=1.0)
+        halved = shares_for_target_weight(0.60, 100.0, 100_000, cb_scaling=0.5)
+        assert halved == pytest.approx(full * 0.5)
+
+    def test_default_ceiling_is_fully_invested(self):
+        # Default max_exposure=1.0 allows a ~100% allocation (no leverage).
+        shares = shares_for_target_weight(1.0, price=100.0, equity=100_000)
+        assert shares * 100.0 == pytest.approx(100_000)

@@ -115,6 +115,11 @@ class RiskManager:
         # ── Price history for correlation checks: ticker -> [returns] ────
         self._price_history: dict[str, list[float]] = {}
 
+    @property
+    def lock_path(self) -> Path:
+        """Path to this manager's circuit-breaker HALT lock file."""
+        return self._lock_path
+
     # ------------------------------------------------------------------
     # Equity / circuit-breaker updates
     # ------------------------------------------------------------------

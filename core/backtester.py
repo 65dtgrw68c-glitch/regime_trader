@@ -38,7 +38,10 @@ Stress testing
 from __future__ import annotations
 
 import logging
+import tempfile
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -50,6 +53,7 @@ from core.regime_strategies import (
     RegimeOrchestrator,
     is_trend_confirmed,
     realised_vol_from_close,
+    shares_for_target_weight,
 )
 from core.risk_manager import CBLevel, RiskManager
 from settings import config
@@ -286,7 +290,16 @@ class Backtester:
         orchestrator = RegimeOrchestrator(
             tickers=[self.ticker], **self.strategy_overrides
         )
-        risk = self._risk_manager or RiskManager()
+        # Isolate the circuit-breaker lock file: a backtest that hits the
+        # -10% HALT breaker must NEVER write the live bot's RISK_HALT.lock
+        # (that would halt real trading), nor leak halted state into the next
+        # backtest run or test. Each run gets its own throwaway lock path.
+        if self._risk_manager is not None:
+            risk = self._risk_manager
+        else:
+            lock_path = Path(tempfile.gettempdir()) / f"bt_halt_{uuid.uuid4().hex}.lock"
+            lock_path.unlink(missing_ok=True)
+            risk = RiskManager(lock_file_path=str(lock_path))
         risk.start_new_day(equity)
 
         # We need features for OOS bars too, computed from data up to each
@@ -396,6 +409,10 @@ class Backtester:
             oos_conf.append(confidence)
             equity = equity_after
 
+        # Remove this run's throwaway HALT lock (only exists if the breaker
+        # fired). Skip when the caller injected its own RiskManager.
+        if self._risk_manager is None:
+            Path(risk.lock_path).unlink(missing_ok=True)
         return equity
 
     # ------------------------------------------------------------------
@@ -411,16 +428,23 @@ class Backtester:
         regime_label: str,
     ) -> float:
         """
-        Convert a strategy signal into a risk-approved share count.
-        Uses the RiskManager's 1%-risk sizing with the configured stop.
+        Convert a strategy signal into a share count.
+
+        `target_weight` (the sum of the signal's target weights) IS the
+        fraction of equity to deploy — the vol-tier allocations already
+        express this. It is used directly as the allocation via the shared
+        `shares_for_target_weight` helper, with the RiskManager's circuit-
+        breaker factor folded in for defensive de-risking. main.py uses the
+        same helper so live sizing and backtest sizing cannot diverge.
         """
         target_weight = sum(signal.target_weights.values())
-        if target_weight <= 0 or price <= 0:
-            return 0.0
-        stop_price = price * (1.0 - self.stop_loss_pct)
-        risk_qty = risk.size_position(price, stop_price, equity)
-        # Scale risk-sized quantity by the strategy's allocation intensity.
-        return float(risk_qty) * min(1.0, target_weight)
+        return shares_for_target_weight(
+            target_weight,
+            price,
+            equity,
+            cb_scaling=risk.size_scaling_factor(),
+            max_exposure=config.RISK["max_position_size"],
+        )
 
     def _fill_price(self, mid_price: float, delta_shares: float) -> float:
         """Apply slippage: buys fill higher, sells fill lower."""

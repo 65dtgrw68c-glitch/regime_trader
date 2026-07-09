@@ -208,6 +208,40 @@ def realised_vol_from_close(
     return sd * float(np.sqrt(252))
 
 
+def shares_for_target_weight(
+    target_weight: float,
+    price: float,
+    equity: float,
+    cb_scaling: float = 1.0,
+    max_exposure: float = 1.0,
+) -> float:
+    """
+    Convert a strategy portfolio weight into a (fractional) share count.
+
+    `target_weight` IS the fraction of equity the strategy wants deployed —
+    the vol-tier allocations (0.20 / 0.60 / 0.95) already express this. It is
+    therefore used DIRECTLY as the allocation, not as a discount applied on
+    top of a separate risk-based size. (The previous code multiplied a
+    1%-risk-sized quantity by target_weight and then capped it at a 10%
+    per-name limit, which collapsed effective exposure to ~2% of equity and
+    left the strategy sitting in cash — see the sizing overhaul.)
+
+        notional = min(max_exposure, target_weight) * cb_scaling * equity
+        shares   = notional / price
+
+    `cb_scaling` folds in the RiskManager's circuit-breaker de-risking factor
+    (1.0 normally, 0.5 when the "halve" breaker is active, …). `max_exposure`
+    is the portfolio-level ceiling (1.0 = fully invested, no leverage). Both
+    the backtester and the live loop call this so their sizing can never
+    drift apart. Returns fractional shares; callers that need whole shares
+    (live broker orders) floor the result themselves.
+    """
+    if target_weight <= 0 or price <= 0 or equity <= 0:
+        return 0.0
+    alloc = min(max_exposure, target_weight) * max(0.0, cb_scaling)
+    return alloc * equity / price
+
+
 # ===========================================================================
 # 4. REBALANCING RULES
 # ===========================================================================

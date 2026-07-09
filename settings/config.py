@@ -85,8 +85,16 @@ STRATEGY = {
 # Risk thresholds
 # ---------------------------------------------------------------------------
 RISK = {
-    # Maximum fraction of portfolio per position
-    "max_position_size": 0.10,
+    # Maximum fraction of portfolio per position.
+    # regime_trader runs a SINGLE-symbol strategy, so this is a portfolio-
+    # level exposure ceiling, not a diversification limit. At 0.10 it capped
+    # every position to 10% of equity, which — combined with the tier weights
+    # applied on top — held effective exposure near 2% and left the bot in
+    # cash. 1.0 lets the vol-tier allocations (0.20/0.60/0.95) be the real
+    # allocation control; lower it only if you deliberately want a hard cap
+    # below the tier weights (e.g. trading several names through one account).
+    # No leverage (>1.0) without also raising max_leverage.
+    "max_position_size": 1.00,
     # Maximum gross leverage
     "max_leverage": 1.0,
     # Daily drawdown limit triggering a circuit breaker (fraction)

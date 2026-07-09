@@ -106,6 +106,33 @@ VARIANTS: list[tuple[str, dict, str]] = [
         {"strategy_overrides": {"vol_target": 0.15}},
         "defaults + 15% annualised vol target",
     ),
+    # ── Turnover / regime-stability dampers (see regime_strategies) ───────
+    # The sizing fix exposed 44-68x turnover from raw regime flips; these
+    # test each damper alone, then combined.
+    (
+        "hysteresis_5",
+        {"strategy_overrides": {"regime_confirm_bars": 5}},
+        "#1: act on a regime change only after 5 confirming bars",
+    ),
+    (
+        "brake_15",
+        {"strategy_overrides": {"min_trade_delta": 0.15}},
+        "#2: skip trades whose allocation change is < 15pts",
+    ),
+    (
+        "smooth_30",
+        {"strategy_overrides": {"alloc_smoothing": 0.30}},
+        "#3: EWMA-glide the target allocation (alpha=0.30)",
+    ),
+    (
+        "all_dampers",
+        {"strategy_overrides": {
+            "regime_confirm_bars": 5,
+            "min_trade_delta": 0.15,
+            "alloc_smoothing": 0.30,
+        }},
+        "#1+#2+#3 combined on top of the current defaults",
+    ),
 ]
 
 

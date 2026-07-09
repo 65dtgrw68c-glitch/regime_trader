@@ -259,6 +259,25 @@ REBALANCE_DRIFT_THRESHOLD: float = 0.05   # 5 percentage points
 # Always rebalance on a regime change regardless of the above
 REBALANCE_ON_REGIME_CHANGE: bool = True
 
+# ── Turnover / regime-stability controls (default OFF = legacy behaviour) ──
+# The HMM reclassifies constantly; at full position size every flip between
+# tiers (LOW≈95% ↔ HIGH≈20%) trades a huge notional, so raw regime changes
+# were the dominant source of turnover (44-68× in the sizing-fix backtests).
+# These three orthogonal dampers each attack that; all default to the no-op
+# value so existing behaviour and tests are unchanged, and the experiment
+# grid toggles them individually.
+#
+# #1 Hysteresis: a regime change must persist this many consecutive bars
+#    before the orchestrator acts on it (switches tier / triggers a rebalance).
+REGIME_CONFIRM_BARS: int = 0        # 0 = act on every raw flip (legacy)
+# #2 Turnover brake: minimum |target − current| allocation change required to
+#    trade, applied to EVERY trigger including regime change (trigger A used
+#    to bypass the drift check entirely).
+MIN_TRADE_DELTA: float = 0.0        # 0 = no minimum (legacy)
+# #3 Allocation smoothing: EWMA weight on the NEW target each bar; lower =
+#    smoother. 1.0 = no smoothing (legacy), 0.3 ≈ month-scale glide.
+ALLOC_SMOOTHING: float = 1.0        # 1.0 = instantaneous (legacy)
+
 
 # ===========================================================================
 # 5. SIGNAL DATA CLASS
@@ -403,16 +422,31 @@ class RegimeOrchestrator:
         rebalance_max_bars: int = REBALANCE_MAX_BARS,
         drift_threshold:    float = REBALANCE_DRIFT_THRESHOLD,
         vol_target:         float = VOL_TARGET_ANNUAL,
+        regime_confirm_bars: int = REGIME_CONFIRM_BARS,
+        min_trade_delta:     float = MIN_TRADE_DELTA,
+        alloc_smoothing:     float = ALLOC_SMOOTHING,
     ) -> None:
         self._tickers          = list(tickers)
         self._vol_ranker       = vol_ranker or VolatilityRanker()
         self._rebalance_max_bars = rebalance_max_bars
         self._drift_threshold    = drift_threshold
         self._vol_target         = vol_target
+        self._regime_confirm_bars = max(0, int(regime_confirm_bars))
+        self._min_trade_delta     = max(0.0, float(min_trade_delta))
+        self._alloc_smoothing     = float(np.clip(alloc_smoothing, 1e-6, 1.0))
 
         self._last_regime_index: Optional[int]  = None
         self._bars_since_rebalance: int          = 0
         self._last_weights: dict[str, float]     = {}
+
+        # #1 hysteresis state: the regime we're currently ACTING on, plus the
+        # candidate we're counting confirmation bars for.
+        self._confirmed_regime_index: Optional[int] = None
+        self._confirmed_regime_label: Optional[str] = None
+        self._pending_regime_index: Optional[int]   = None
+        self._pending_regime_count: int             = 0
+        # #3 smoothing state: last emitted (smoothed) allocation.
+        self._smoothed_alloc: Optional[float]       = None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -446,11 +480,15 @@ class RegimeOrchestrator:
         trend_confirmed  : output of is_trend_confirmed(); None = not enough
                            history → the trend filter is skipped
         """
-        # ── Derive tier ─────────────────────────────────────────────────
-        tier = self._resolve_tier(regime_label)
+        # ── Regime hysteresis (#1): act on a confirmed regime, not every
+        #    raw HMM flip. Pass-through when regime_confirm_bars == 0. ─────
+        eff_index, eff_label = self._confirm_regime(regime_index, regime_label)
 
-        # ── Confidence ──────────────────────────────────────────────────
-        confidence = self._dominant_confidence(proba, regime_index)
+        # ── Derive tier ─────────────────────────────────────────────────
+        tier = self._resolve_tier(eff_label)
+
+        # ── Confidence (mass on the regime we're acting on) ──────────────
+        confidence = self._dominant_confidence(proba, eff_index)
 
         # ── Low-volume bull adjustment ───────────────────────────────────
         low_vol_flag = (
@@ -488,6 +526,15 @@ class RegimeOrchestrator:
                 "below SMA — allocation forced to 0.", tier.value,
             )
 
+        # ── Allocation smoothing (#3): EWMA-glide the target so a regime
+        #    flip can't swing the book 20%↔95% in one bar. α=1.0 = off. ───
+        if self._alloc_smoothing < 1.0 and self._smoothed_alloc is not None:
+            eff_alloc = (
+                self._alloc_smoothing * eff_alloc
+                + (1.0 - self._alloc_smoothing) * self._smoothed_alloc
+            )
+        self._smoothed_alloc = eff_alloc
+
         # ── Target weights ───────────────────────────────────────────────
         target_weights = self._build_weights(tier, eff_alloc, params)
 
@@ -497,13 +544,13 @@ class RegimeOrchestrator:
 
         # ── Rebalance decision ───────────────────────────────────────────
         should_rebal, rebal_reason = self._rebalance_decision(
-            regime_index, target_weights, current_weights or {}
+            eff_index, target_weights, current_weights or {}
         )
 
-        # ── Build signal ─────────────────────────────────────────────────
+        # ── Build signal (reports the regime we ACT on) ──────────────────
         signal = StrategySignal(
-            regime_index     = regime_index,
-            regime_label     = regime_label,
+            regime_index     = eff_index,
+            regime_label     = eff_label,
             vol_tier         = tier,
             confidence       = confidence,
             high_uncertainty = high_uncertainty,
@@ -519,13 +566,64 @@ class RegimeOrchestrator:
         )
 
         # ── Bookkeeping ──────────────────────────────────────────────────
-        self._last_regime_index = regime_index
+        self._last_regime_index = eff_index
         self._bars_since_rebalance = 0 if should_rebal else self._bars_since_rebalance + 1
         if should_rebal:
             self._last_weights = dict(target_weights)
 
         logger.info("RegimeOrchestrator: %s", signal.summary())
         return signal
+
+    # ------------------------------------------------------------------
+    # Regime hysteresis (#1)
+    # ------------------------------------------------------------------
+
+    def _confirm_regime(
+        self, regime_index: int, regime_label: str
+    ) -> tuple[int, str]:
+        """
+        Apply hysteresis: only switch the regime we ACT on once a new regime
+        has persisted `regime_confirm_bars` consecutive bars. With the default
+        of 0 this is a pass-through (acts on every raw flip). Returns the
+        (index, label) the rest of evaluate() should use.
+        """
+        # First-ever bar: adopt whatever we're given.
+        if self._confirmed_regime_index is None:
+            self._confirmed_regime_index = regime_index
+            self._confirmed_regime_label = regime_label
+            self._pending_regime_index = None
+            self._pending_regime_count = 0
+            return regime_index, regime_label
+
+        # Same as the regime we're already acting on → nothing pending.
+        if regime_index == self._confirmed_regime_index:
+            self._pending_regime_index = None
+            self._pending_regime_count = 0
+            return self._confirmed_regime_index, self._confirmed_regime_label
+
+        # A different regime arrived. Legacy (0 bars) → switch immediately.
+        if self._regime_confirm_bars <= 0:
+            self._confirmed_regime_index = regime_index
+            self._confirmed_regime_label = regime_label
+            self._pending_regime_index = None
+            self._pending_regime_count = 0
+            return regime_index, regime_label
+
+        # Count consecutive bars of the SAME pending candidate.
+        if regime_index == self._pending_regime_index:
+            self._pending_regime_count += 1
+        else:
+            self._pending_regime_index = regime_index
+            self._pending_regime_count = 1
+
+        # Enough confirmation → promote it to the acted-on regime.
+        if self._pending_regime_count >= self._regime_confirm_bars:
+            self._confirmed_regime_index = regime_index
+            self._confirmed_regime_label = regime_label
+            self._pending_regime_index = None
+            self._pending_regime_count = 0
+
+        return self._confirmed_regime_index, self._confirmed_regime_label
 
     # ------------------------------------------------------------------
     # Tier resolution
@@ -656,29 +754,41 @@ class RegimeOrchestrator:
         A and B are the PRIMARY triggers.  C exists only so a long-held
         book is eventually re-synced; keep it large — every rebalance
         costs slippage + commission.
+
+        Turnover brake (#2, min_trade_delta): triggers A and C only fire when
+        the resulting allocation change clears `min_trade_delta`. This stops a
+        regime flip from trading a huge notional when the target barely moves
+        (e.g. both regimes map to a similar allocation). Default 0 = off, so A
+        fires on every regime change as before.
         """
         # 0 — First-ever evaluation: no reference point yet → establish one
         if self._last_regime_index is None:
             return True, "initial"
 
-        # A — Regime change
+        # Max change between where we are and where we'd move to.
+        max_delta = 0.0
+        if current_weights or target_weights:
+            max_delta = max(
+                abs(target_weights.get(t, 0.0) - current_weights.get(t, 0.0))
+                for t in set(target_weights) | set(current_weights)
+            )
+        meaningful = max_delta >= self._min_trade_delta
+
+        # A — Regime change (gated by the turnover brake)
         if (
             REBALANCE_ON_REGIME_CHANGE
             and regime_index != self._last_regime_index
+            and meaningful
         ):
             return True, f"regime_change({self._last_regime_index}→{regime_index})"
 
         # B — Drift check
-        if current_weights:
-            max_drift = max(
-                abs(target_weights.get(t, 0.0) - current_weights.get(t, 0.0))
-                for t in set(target_weights) | set(current_weights)
-            )
-            if max_drift > self._drift_threshold:
-                return True, f"drift={max_drift:.3f}"
+        if current_weights and max_delta > self._drift_threshold:
+            return True, f"drift={max_delta:.3f}"
 
-        # C — Staleness backstop
-        if self._bars_since_rebalance >= self._rebalance_max_bars:
+        # C — Staleness backstop (also gated: don't force a churn trade when
+        #     nothing meaningful has changed)
+        if self._bars_since_rebalance >= self._rebalance_max_bars and meaningful:
             return True, f"interval={self._bars_since_rebalance}bars"
 
         return False, ""

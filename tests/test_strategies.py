@@ -680,3 +680,93 @@ class TestSharesForTargetWeight:
         # Default max_exposure=1.0 allows a ~100% allocation (no leverage).
         shares = shares_for_target_weight(1.0, price=100.0, equity=100_000)
         assert shares * 100.0 == pytest.approx(100_000)
+
+
+# ---------------------------------------------------------------------------
+# Turnover / regime-stability dampers (all default OFF)
+# ---------------------------------------------------------------------------
+
+def _proba_for(idx: int, n: int = 3, p: float = 0.8) -> np.ndarray:
+    v = np.full(n, (1 - p) / (n - 1))
+    v[idx] = p
+    return v
+
+
+class TestRegimeHysteresis:
+    """#1: a regime change must persist regime_confirm_bars before acting."""
+
+    def test_default_zero_acts_immediately(self):
+        o = RegimeOrchestrator(tickers=["X"], vol_target=0.0)
+        o.evaluate(0, "Bull", _proba_for(0), False, current_weights={"X": 0.0})
+        s = o.evaluate(2, "Bear", _proba_for(2), False, current_weights={"X": 0.5})
+        assert s.vol_tier is VolTier.HIGH   # switched on the very first flip
+
+    def test_holds_tier_until_confirmed(self):
+        o = RegimeOrchestrator(tickers=["X"], regime_confirm_bars=3, vol_target=0.0)
+        base = o.evaluate(0, "Bull", _proba_for(0), False,
+                          current_weights={"X": 0.0}).vol_tier
+        assert base is VolTier.LOW
+        for _ in range(2):                  # 2 unconfirmed bars → still LOW
+            s = o.evaluate(2, "Bear", _proba_for(2), False,
+                           current_weights={"X": 0.5})
+            assert s.vol_tier is VolTier.LOW
+        s = o.evaluate(2, "Bear", _proba_for(2), False,
+                       current_weights={"X": 0.5})
+        assert s.vol_tier is VolTier.HIGH   # 3rd consecutive bar → switch
+
+    def test_flicker_never_confirms(self):
+        # Alternating candidates never accrue enough consecutive bars.
+        o = RegimeOrchestrator(tickers=["X"], regime_confirm_bars=3, vol_target=0.0)
+        o.evaluate(0, "Bull", _proba_for(0), False, current_weights={"X": 0.0})
+        for idx, lab in [(2, "Bear"), (1, "Neutral"), (2, "Bear"), (1, "Neutral")]:
+            s = o.evaluate(idx, lab, _proba_for(idx), False,
+                           current_weights={"X": 0.5})
+        assert s.vol_tier is VolTier.LOW    # never held the same flip 3x
+
+
+class TestTurnoverBrake:
+    """#2: min_trade_delta suppresses trades whose allocation change is tiny."""
+
+    def test_small_delta_suppresses_regime_change_trade(self):
+        o = RegimeOrchestrator(tickers=["X"], min_trade_delta=0.20, vol_target=0.0)
+        o.evaluate(0, "Bull", _proba_for(0), False, current_weights={"X": 0.0})
+        # Regime changes but we're already ~at the new target → no trade.
+        s = o.evaluate(1, "Neutral", _proba_for(1), False,
+                       current_weights={"X": 0.60})
+        assert s.should_rebalance is False
+
+    def test_large_delta_still_trades(self):
+        o = RegimeOrchestrator(tickers=["X"], min_trade_delta=0.20, vol_target=0.0)
+        o.evaluate(0, "Bull", _proba_for(0), False, current_weights={"X": 0.0})
+        # Regime change with a big gap between holding and target → trade.
+        s = o.evaluate(2, "Bear", _proba_for(2), False,
+                       current_weights={"X": 0.90})
+        assert s.should_rebalance is True
+
+    def test_default_zero_keeps_legacy_regime_trigger(self):
+        o = RegimeOrchestrator(tickers=["X"], vol_target=0.0)
+        o.evaluate(0, "Bull", _proba_for(0), False, current_weights={"X": 0.0})
+        s = o.evaluate(1, "Neutral", _proba_for(1), False,
+                       current_weights={"X": 0.60})
+        assert s.should_rebalance is True    # every regime change trades
+
+
+class TestAllocationSmoothing:
+    """#3: alloc_smoothing EWMA-damps allocation jumps."""
+
+    def test_default_one_is_instantaneous(self):
+        o = RegimeOrchestrator(tickers=["X"], vol_target=0.0)
+        o.evaluate(2, "Bear", _proba_for(2), False, current_weights={"X": 0.0})
+        s = o.evaluate(0, "Bull", _proba_for(0), False, current_weights={"X": 0.2})
+        # No smoothing → full LOW-tier allocation immediately.
+        assert sum(s.target_weights.values()) > 0.8
+
+    def test_smoothing_damps_the_jump(self):
+        o = RegimeOrchestrator(tickers=["X"], alloc_smoothing=0.25, vol_target=0.0)
+        a0 = sum(o.evaluate(2, "Bear", _proba_for(2), False,
+                            current_weights={"X": 0.0}).target_weights.values())
+        a1 = sum(o.evaluate(0, "Bull", _proba_for(0), False,
+                            current_weights={"X": a0}).target_weights.values())
+        # Damped result sits between the old (~0.20) and the full jump (~0.95):
+        # a1 = 0.25·raw + 0.75·a0, so it must not reach the full allocation.
+        assert a0 < a1 < 0.8

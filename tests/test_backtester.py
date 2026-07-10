@@ -399,3 +399,27 @@ class TestTradeGatingAndOverrides:
         )
         res = bt.run(data)
         assert res.metadata["strategy_overrides"] == {"vol_target": 0.12}
+
+
+# ---------------------------------------------------------------------------
+# 9. Costs — slippage must hit the equity curve
+# ---------------------------------------------------------------------------
+
+class TestSlippageCharged:
+
+    def test_slippage_reduces_equity(self):
+        """
+        Identical run with higher slippage must end with a lower total
+        return.  (Slippage used to be applied to the logged fill price only
+        and never charged against equity.)
+        """
+        data = _make_ohlcv(420, seed=6)
+        common = dict(
+            ticker="T", train_window=120, test_window=60, random_seed=6,
+            commission=0.0,
+            strategy_overrides={"rebalance_max_bars": 1, "drift_threshold": 0.0},
+        )
+        res_free = Backtester(slippage=0.0, **common).run(data)
+        res_slip = Backtester(slippage=0.01, **common).run(data)
+        assert len(res_slip.trade_log) > 0
+        assert total_return(res_slip.returns) < total_return(res_free.returns)

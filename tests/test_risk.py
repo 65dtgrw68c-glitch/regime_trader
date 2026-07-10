@@ -339,3 +339,61 @@ class TestCorrelationChecks:
             existing_returns=None, new_returns=None,
         )
         assert v.approved is True
+
+
+# ---------------------------------------------------------------------------
+# 8. Config flags — daily-breaker switch & regime-cap switch
+# ---------------------------------------------------------------------------
+
+class TestRiskConfigFlags:
+
+    def _rm_with(self, tmp_path, **extra) -> RiskManager:
+        cfg = dict(BASE_CFG)
+        cfg.update(extra)
+        return RiskManager(
+            cfg=cfg,
+            regime_leverage_caps=dict(REGIME_CAPS),
+            lock_file_path=str(tmp_path / "lock"),
+        )
+
+    def test_daily_breakers_disabled_no_halve(self, tmp_path):
+        rm = self._rm_with(tmp_path, cb_daily_enabled=False)
+        rm.start_new_day(100_000)
+        assert rm.update_equity(98_000) == CBLevel.NONE      # -2% → no HALVE
+
+    def test_daily_breakers_disabled_no_flatten(self, tmp_path):
+        rm = self._rm_with(tmp_path, cb_daily_enabled=False)
+        rm.start_new_day(100_000)
+        assert rm.update_equity(96_500) == CBLevel.NONE      # -3.5% → no FLATTEN
+
+    def test_weekly_breaker_unaffected_by_daily_flag(self, tmp_path):
+        rm = self._rm_with(tmp_path, cb_daily_enabled=False)
+        rm.start_new_day(100_000)
+        for eq in (100_000, 99_500, 99_000, 98_500, 98_000, 97_500):
+            rm.end_of_day(eq)
+        # New day so the -2.6% move is not a daily loss; weekly is -5.5%.
+        rm.start_new_day(97_500)
+        level = rm.update_equity(94_500)
+        assert level == CBLevel.WEEKLY_RESIZE
+
+    def test_halt_breaker_unaffected_by_daily_flag(self, tmp_path):
+        rm = self._rm_with(tmp_path, cb_daily_enabled=False)
+        rm.start_new_day(100_000)
+        rm.update_equity(100_000)
+        assert rm.update_equity(89_000) == CBLevel.HALT      # -11% drawdown
+
+    def test_daily_breakers_enabled_by_default(self, tmp_path):
+        rm = self._rm_with(tmp_path)          # no flag in cfg → enabled
+        rm.start_new_day(100_000)
+        assert rm.update_equity(98_000) == CBLevel.HALVE
+
+    def test_regime_caps_ignored_when_flag_off(self, tmp_path):
+        rm = self._rm_with(tmp_path, use_regime_leverage_caps=False)
+        # "Bear" caps at 0.0 when enabled; with the flag off the global
+        # max_leverage (1.0) applies to every regime label.
+        assert rm.max_leverage_for_regime("Bear") == pytest.approx(1.0)
+        assert rm.max_leverage_for_regime("Bull") == pytest.approx(1.0)
+
+    def test_regime_caps_apply_by_default(self, tmp_path):
+        rm = self._rm_with(tmp_path)
+        assert rm.max_leverage_for_regime("Bear") == pytest.approx(0.0)

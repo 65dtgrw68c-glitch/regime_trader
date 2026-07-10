@@ -448,12 +448,23 @@ class RegimeOrchestrator:
         trend_core:          bool = TREND_CORE,
         trend_confirm_bars:  int = TREND_CONFIRM_BARS,
         trend_core_high_scale: float = TREND_CORE_HIGH_SCALE,
+        max_exposure:        float = 1.0,
     ) -> None:
+        """
+        max_exposure caps the TOTAL allocation the orchestrator will ever
+        target (RISK["max_position_size"] in production).  The cap must live
+        HERE — inside the target the drift check compares against — not
+        downstream in share sizing: when sizing silently clipped a 1.0
+        target to 0.5 of equity, the drift check saw a permanent 0.5 gap
+        and fired a rebalance on every single bar (965 trades instead of
+        ~70 in the walk-forward backtest).
+        """
         self._tickers          = list(tickers)
         self._vol_ranker       = vol_ranker or VolatilityRanker()
         self._rebalance_max_bars = rebalance_max_bars
         self._drift_threshold    = drift_threshold
         self._vol_target         = vol_target
+        self._max_exposure       = float(np.clip(max_exposure, 0.0, 1.0))
         self._regime_confirm_bars = max(0, int(regime_confirm_bars))
         self._min_trade_delta     = max(0.0, float(min_trade_delta))
         self._alloc_smoothing     = float(np.clip(alloc_smoothing, 1e-6, 1.0))
@@ -572,6 +583,10 @@ class RegimeOrchestrator:
                     current_vol, self._vol_target, vol_scale,
                 )
             eff_alloc *= vol_scale
+
+        # ── Portfolio exposure cap: applied INSIDE the target so the drift
+        #    check and the share sizing always agree (see __init__). ───────
+        eff_alloc = min(eff_alloc, self._max_exposure)
 
         # ── Allocation smoothing (#3): EWMA-glide the target so a regime
         #    flip can't swing the book 20%↔95% in one bar. α=1.0 = off. ───

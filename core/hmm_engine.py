@@ -288,14 +288,20 @@ class HMMEngine:
         """
         Bayesian Information Criterion.
         Lower is better.  n_params for a Gaussian HMM with full covariance:
+          initial state dist: k - 1
           transition matrix:  k*(k-1)
           means:              k * d
           covariances:        k * d*(d+1)/2   (full)
+
+        hmmlearn's score() already returns the TOTAL log-likelihood of X.
+        (It was previously multiplied by len(X) again, which inflated the
+        likelihood term ~N-fold and made the complexity penalty numerically
+        irrelevant — the selection then always picked the most complex k.)
         """
         k = model.n_components
         d = X.shape[1]
-        n_params = k * (k - 1) + k * d + k * d * (d + 1) // 2
-        log_likelihood = model.score(X) * len(X)
+        n_params = (k - 1) + k * (k - 1) + k * d + k * d * (d + 1) // 2
+        log_likelihood = model.score(X)
         return -2 * log_likelihood + n_params * np.log(len(X))
 
     def _build_label_map(self, features: pd.DataFrame) -> None:

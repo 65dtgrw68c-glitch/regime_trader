@@ -112,6 +112,7 @@ class Backtester:
         risk_manager: Optional[RiskManager] = None,
         use_trend_filter: bool = True,
         strategy_overrides: Optional[dict] = None,
+        risk_overrides: Optional[dict] = None,
     ) -> None:
         """
         use_trend_filter   : feed is_trend_confirmed() into the orchestrator
@@ -121,6 +122,11 @@ class Backtester:
                              (e.g. {"vol_target": 0.10,
                                     "rebalance_max_bars": 5}) — the hook
                              scripts/run_experiments.py uses for A/B runs.
+        risk_overrides     : keys merged over config.RISK for the per-window
+                             RiskManager (e.g. {"cb_daily_enabled": False})
+                             so risk-layer settings can be A/B-tested with
+                             the same walk-forward machinery.  Ignored when
+                             an explicit risk_manager is injected.
         """
         self.ticker        = ticker
         self.train_window  = train_window
@@ -139,6 +145,7 @@ class Backtester:
         self._risk_manager = risk_manager
         self.use_trend_filter = use_trend_filter
         self.strategy_overrides = dict(strategy_overrides or {})
+        self.risk_overrides = dict(risk_overrides or {})
 
         self._result: Optional[BacktestResult] = None
 
@@ -239,6 +246,8 @@ class Backtester:
                 "stress_injected": inject_stress,
                 "trend_filter": self.use_trend_filter,
                 "strategy_overrides": dict(self.strategy_overrides),
+                "risk_overrides": dict(self.risk_overrides),
+                "max_position_size": config.RISK["max_position_size"],
             },
         )
         self._result = result
@@ -287,9 +296,14 @@ class Backtester:
                 oos_conf.append(0.0)
             return equity
 
-        orchestrator = RegimeOrchestrator(
-            tickers=[self.ticker], **self.strategy_overrides
-        )
+        # The exposure cap lives inside the orchestrator target (not in share
+        # sizing) so the drift check compares against what will actually be
+        # held; strategy_overrides may still override it for experiments.
+        orch_kwargs = {
+            "max_exposure": config.RISK["max_position_size"],
+            **self.strategy_overrides,
+        }
+        orchestrator = RegimeOrchestrator(tickers=[self.ticker], **orch_kwargs)
         # Isolate the circuit-breaker lock file: a backtest that hits the
         # -10% HALT breaker must NEVER write the live bot's RISK_HALT.lock
         # (that would halt real trading), nor leak halted state into the next
@@ -299,7 +313,8 @@ class Backtester:
         else:
             lock_path = Path(tempfile.gettempdir()) / f"bt_halt_{uuid.uuid4().hex}.lock"
             lock_path.unlink(missing_ok=True)
-            risk = RiskManager(lock_file_path=str(lock_path))
+            risk_cfg = {**config.RISK, **self.risk_overrides}
+            risk = RiskManager(cfg=risk_cfg, lock_file_path=str(lock_path))
 
         # We need features for OOS bars too, computed from data up to each
         # bar WITHOUT refitting the scaler (transform only).  To stay strictly
@@ -391,7 +406,11 @@ class Backtester:
             delta = target_shares - position_shares
             if execute_trade and abs(delta) > 1e-9:
                 fill_price = self._fill_price(bar_close, delta)
-                cost = abs(delta) * fill_price * self.commission
+                # Slippage must hit the equity curve, not just the trade log:
+                # the position is marked to CLOSE prices, so the adverse
+                # fill-vs-close difference is a realised cash cost.
+                slip_cost = abs(delta) * abs(fill_price - bar_close)
+                cost = abs(delta) * fill_price * self.commission + slip_cost
                 equity_after -= cost
                 trades.append({
                     "timestamp":  data.index[i],
@@ -441,10 +460,11 @@ class Backtester:
 
         `target_weight` (the sum of the signal's target weights) IS the
         fraction of equity to deploy — the vol-tier allocations already
-        express this. It is used directly as the allocation via the shared
-        `shares_for_target_weight` helper, with the RiskManager's circuit-
-        breaker factor folded in for defensive de-risking. main.py uses the
-        same helper so live sizing and backtest sizing cannot diverge.
+        express this, and the orchestrator has already applied the portfolio
+        exposure cap inside the target (so drift check and sizing agree).
+        Only the RiskManager's circuit-breaker factor is folded in here.
+        main.py uses the same helper so live and backtest sizing cannot
+        diverge.
         """
         target_weight = sum(signal.target_weights.values())
         return shares_for_target_weight(
@@ -452,7 +472,6 @@ class Backtester:
             price,
             equity,
             cb_scaling=risk.size_scaling_factor(),
-            max_exposure=config.RISK["max_position_size"],
         )
 
     def _fill_price(self, mid_price: float, delta_shares: float) -> float:

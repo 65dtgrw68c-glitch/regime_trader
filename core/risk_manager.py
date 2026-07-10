@@ -169,8 +169,17 @@ class RiskManager:
 
         level = CBLevel.NONE
 
+        # The daily HALVE/FLATTEN breakers measure CLOSE-to-close equity on a
+        # daily-bar system: they fire only after the loss is fully realised,
+        # sell the low, and the next bar's drift trigger buys straight back.
+        # Measured on the walk-forward grid they cost return with ZERO
+        # drawdown benefit, so the pinned trend profile disables them via
+        # cb_daily_enabled.  The weekly breaker and the max-drawdown HALT
+        # (tail protection with manual review) always stay active.
+        daily_enabled = self._cfg.get("cb_daily_enabled", True)
+
         # ── -2% single day → halve ───────────────────────────────────────
-        if daily_ret <= -self._cfg["cb_daily_halve_loss"]:
+        if daily_enabled and daily_ret <= -self._cfg["cb_daily_halve_loss"]:
             level = max(level, CBLevel.HALVE)
 
         # ── -5% week → resize remaining positions down ───────────────────
@@ -178,7 +187,7 @@ class RiskManager:
             level = max(level, CBLevel.WEEKLY_RESIZE)
 
         # ── -3% single day → flatten everything ──────────────────────────
-        if daily_ret <= -self._cfg["cb_daily_flatten_loss"]:
+        if daily_enabled and daily_ret <= -self._cfg["cb_daily_flatten_loss"]:
             level = max(level, CBLevel.FLATTEN)
 
         # ── -10% drawdown → HALT + lock file (terminal) ──────────────────
@@ -271,8 +280,17 @@ class RiskManager:
         """
         Return the leverage cap for a regime, reduced by any partial
         circuit breaker.  Falls back to the global RISK["max_leverage"].
+
+        When RISK["use_regime_leverage_caps"] is False the per-regime caps
+        are ignored entirely (global cap only).  The backtester never
+        applied these caps, so leaving them active live made the demoted
+        HMM a hard, never-validated entry gate: a (noisy) "Bear"/"Weak"
+        label rejected every trend-core buy.
         """
-        cap = self._regime_caps.get(regime_label, self._cfg["max_leverage"])
+        if self._cfg.get("use_regime_leverage_caps", True):
+            cap = self._regime_caps.get(regime_label, self._cfg["max_leverage"])
+        else:
+            cap = self._cfg["max_leverage"]
         # Partial breakers shrink allowed leverage in step with sizing.
         cap *= self.size_scaling_factor()
         return cap

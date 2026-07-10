@@ -865,3 +865,47 @@ class TestTrendCoreMode:
         s = o.evaluate(0, "Bull", _low_proba(3, 0), True,
                        current_weights={"X": 0.0}, trend_confirmed=True)
         assert sum(s.target_weights.values()) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# 12. Exposure cap inside the orchestrator target
+# ---------------------------------------------------------------------------
+
+class TestMaxExposureCap:
+    """
+    The portfolio exposure cap must live INSIDE the orchestrator's target
+    weights.  When it was applied downstream in share sizing instead, the
+    drift check compared an uncapped 1.0 target against a capped ~0.5
+    holding and fired a rebalance on every single bar (965 trades instead
+    of ~70 in the walk-forward backtest).
+    """
+
+    def _orch(self, **kw):
+        kw.setdefault("vol_target", 0.0)
+        return RegimeOrchestrator(tickers=["X"], trend_core=True, **kw)
+
+    def test_target_weights_respect_cap(self):
+        o = self._orch(max_exposure=0.5)
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 0.0}, trend_confirmed=True)
+        assert sum(s.target_weights.values()) == pytest.approx(0.5)
+
+    def test_no_drift_rebalance_when_held_at_cap(self):
+        """Held == capped target → no permanent phantom drift."""
+        o = self._orch(max_exposure=0.5)
+        o.evaluate(0, "Bull", _proba_for(0), False,
+                   current_weights={"X": 0.0}, trend_confirmed=True)
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 0.5}, trend_confirmed=True)
+        assert s.should_rebalance is False
+
+    def test_default_cap_is_full_exposure(self):
+        o = self._orch()
+        s = o.evaluate(0, "Bull", _proba_for(0), False,
+                       current_weights={"X": 0.0}, trend_confirmed=True)
+        assert sum(s.target_weights.values()) == pytest.approx(1.0)
+
+    def test_cap_applies_in_legacy_mode_too(self):
+        o = RegimeOrchestrator(tickers=["X"], max_exposure=0.5)
+        s = o.evaluate(2, "Bull", _uniform_proba(3, 2), high_uncertainty=False)
+        assert sum(s.target_weights.values()) <= 0.5 + 1e-9

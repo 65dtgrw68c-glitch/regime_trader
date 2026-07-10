@@ -171,7 +171,7 @@ class MarketDataFeed:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-        from alpaca.data.enums import DataFeed
+        from alpaca.data.enums import Adjustment, DataFeed
 
         data_client = getattr(self._client, "data", None) or StockHistoricalDataClient(
             getattr(self._client, "api_key", ""),
@@ -184,6 +184,11 @@ class MarketDataFeed:
             start=pd.Timestamp(start).to_pydatetime(),
             end=pd.Timestamp(end).to_pydatetime() if end else None,
             feed=DataFeed.IEX,
+            # Split+dividend adjusted (total-return) prices: raw prices drop
+            # ~0.3-0.4% at every ex-dividend date, which both distorts trend
+            # signals near the SMA and understates every return comparison
+            # by the ETF's ~1.3%/yr dividend yield.
+            adjustment=Adjustment.ALL,
         )
         bars = data_client.get_stock_bars(request)
         df = bars.df
@@ -222,7 +227,9 @@ class MarketDataFeed:
         return df.dropna(subset=price_cols)
 
     def _cache_path(self, ticker: str, timeframe: str) -> Path:
-        return self._cache_dir / f"{ticker}_{timeframe}.parquet"
+        # "_adj" suffix: caches written before the switch to split+dividend
+        # adjusted prices hold RAW prices and must not be served.
+        return self._cache_dir / f"{ticker}_{timeframe}_adj.parquet"
 
     # Cached daily data may lag the requested end by up to this many calendar
     # days (weekends/holidays/settlement) before it counts as stale.

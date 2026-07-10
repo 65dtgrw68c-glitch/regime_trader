@@ -19,8 +19,12 @@ Pipeline per bar (identical ordering to the live loop)
 
 Realism
 -------
-* Slippage applied to every entry and exit.
-* All position sizing flows through the RiskManager (1% risk + caps).
+* Next-open execution: a decision made on bar i's completed close fills
+  at bar i+1's OPEN (a same-close fill is impossible live and hides the
+  overnight gap on trend-flip days).
+* Slippage and commission are charged against equity on every fill.
+* Idle cash earns a flat T-bill-like yield (BACKTEST["cash_yield_annual"]).
+* All position sizing flows through the RiskManager (caps + breakers).
 * Circuit breakers can flatten the book mid-window.
 
 Benchmarks (computed over the same OOS period)
@@ -59,6 +63,13 @@ from core.risk_manager import CBLevel, RiskManager
 from settings import config
 
 logger = logging.getLogger(__name__)
+
+# Trailing window fed to the per-bar feature computation.  Matches the live
+# loop's history cap (main._MAX_HISTORY_BARS): every rolling feature needs at
+# most ~221 bars and the trend SMA 200, so results are identical to the full
+# expanding window — but the per-bar cost stays O(1), which is what makes
+# multi-decade (7000+ bar) structural runs feasible at all.
+_FEATURE_WINDOW_BARS = 800
 
 
 # ===========================================================================
@@ -107,6 +118,7 @@ class Backtester:
         initial_capital: Optional[float] = None,
         slippage: Optional[float] = None,
         commission: Optional[float] = None,
+        cash_yield_annual: Optional[float] = None,
         stop_loss_pct: Optional[float] = None,
         random_seed: int = 42,
         risk_manager: Optional[RiskManager] = None,
@@ -137,6 +149,10 @@ class Backtester:
         )
         self.slippage   = slippage   if slippage   is not None else config.BACKTEST["slippage"]
         self.commission = commission if commission is not None else config.BACKTEST["commission"]
+        self.cash_yield_annual = (
+            cash_yield_annual if cash_yield_annual is not None
+            else config.BACKTEST.get("cash_yield_annual", 0.0)
+        )
         self.stop_loss_pct = (
             stop_loss_pct if stop_loss_pct is not None else config.RISK["stop_loss_pct"]
         )
@@ -243,6 +259,8 @@ class Backtester:
                 "n_splits": len(splits),
                 "slippage": self.slippage,
                 "commission": self.commission,
+                "cash_yield_annual": self.cash_yield_annual,
+                "execution": "next_open",
                 "stress_injected": inject_stress,
                 "trend_filter": self.use_trend_filter,
                 "strategy_overrides": dict(self.strategy_overrides),
@@ -322,11 +340,24 @@ class Backtester:
         # the last row — only past data ever enters a given bar's features.
         position_shares = 0.0
         entry_price     = 0.0
+        # Execution timing: a decision made on bar i's COMPLETED close cannot
+        # fill at that same close — the order fills at bar i+1's OPEN.  The
+        # decision is parked here and executed at the top of the next
+        # iteration.  (Same-close fills gave the backtest an overnight-gap
+        # advantage the live bot can never have, systematically flattering
+        # trend flips on crash days.)
+        pending: Optional[dict] = None
+        # Idle cash earns a flat daily yield (T-bill approximation) so a
+        # strategy that spends long stretches in cash is compared fairly.
+        daily_yield = (
+            (1.0 + self.cash_yield_annual) ** (1.0 / 252) - 1.0
+            if self.cash_yield_annual > 0 else 0.0
+        )
 
         for i in range(split.test_start, split.test_end):
+            bar_open  = float(data["open"].iloc[i])
             bar_close = float(data["close"].iloc[i])
-            prev_close = float(data["close"].iloc[i - 1]) if i > 0 else bar_close
-            bar_ret_raw = (bar_close - prev_close) / prev_close if prev_close else 0.0
+            prev_close = float(data["close"].iloc[i - 1]) if i > 0 else bar_open
 
             # ── New trading day: anchor the DAILY breakers to yesterday's
             #    close. Anchoring once per window (as this used to) made the
@@ -335,8 +366,47 @@ class Backtester:
             #    window — systematically selling lows. One bar = one day.
             risk.start_new_day(equity)
 
-            # ── Causal features: only data [0 : i+1] ─────────────────────
-            window_df = data.iloc[: i + 1]
+            # ── 1) Execute the pending decision at THIS bar's open ───────
+            pos_before = position_shares
+            trade_cost = 0.0
+            if pending is not None:
+                delta = pending["target"] - position_shares
+                if abs(delta) > 1e-9:
+                    fill_price = self._fill_price(bar_open, delta)
+                    # Slippage must hit the equity curve, not just the trade
+                    # log: the adverse fill-vs-open difference is a realised
+                    # cash cost.
+                    slip_cost = abs(delta) * abs(fill_price - bar_open)
+                    trade_cost = abs(delta) * fill_price * self.commission + slip_cost
+                    trades.append({
+                        "timestamp":  data.index[i],
+                        "ticker":     self.ticker,
+                        "side":       "BUY" if delta > 0 else "SELL",
+                        "qty":        abs(delta),
+                        "fill_price": fill_price,
+                        "regime":     pending["regime"],
+                        "confidence": pending["confidence"],
+                        "cb_level":   risk.circuit_breaker_level().name,
+                    })
+                    if pending["target"] > 0:
+                        entry_price = fill_price
+                    position_shares = pending["target"]
+                pending = None
+
+            # ── 2) Mark-to-market: old position over the overnight gap,
+            #    new position over the intraday move, plus cash yield. ─────
+            pnl = (
+                pos_before * (bar_open - prev_close)
+                + position_shares * (bar_close - bar_open)
+                - trade_cost
+            )
+            if daily_yield and equity > 0:
+                cash_frac = 1.0 - (pos_before * prev_close / equity)
+                pnl += equity * float(np.clip(cash_frac, 0.0, 1.0)) * daily_yield
+            equity_after = equity + pnl
+
+            # ── Causal features: trailing window ending at bar i ─────────
+            window_df = data.iloc[max(0, i + 1 - _FEATURE_WINDOW_BARS): i + 1]
             try:
                 feats = fe.transform(window_df)
                 obs   = feats.iloc[-1].values
@@ -361,7 +431,7 @@ class Backtester:
             )
             current_vol = realised_vol_from_close(closes_so_far)
             current_weight = (
-                position_shares * prev_close / equity if equity > 0 else 0.0
+                position_shares * bar_close / equity_after if equity_after > 0 else 0.0
             )
 
             signal = orchestrator.evaluate(
@@ -376,10 +446,6 @@ class Backtester:
             )
             confidence = signal.confidence
 
-            # ── Mark-to-market existing position over this bar ───────────
-            bar_pnl_ret = position_shares * prev_close / equity * bar_ret_raw if equity else 0.0
-            equity_after = equity * (1.0 + bar_pnl_ret)
-
             # ── Risk layer: update breakers on the new equity ────────────
             risk.update_equity(
                 equity_after,
@@ -388,7 +454,7 @@ class Backtester:
                 regime_label=regime_label,
             )
 
-            # ── Determine target position for NEXT bar ───────────────────
+            # ── 3) Decide the target to fill at the NEXT bar's open ──────
             target_shares = self._target_shares(
                 signal, risk, bar_close, equity_after, regime_label
             )
@@ -402,29 +468,12 @@ class Backtester:
                 target_shares = 0.0
                 execute_trade = True
 
-            # ── Execute the delta with slippage + commission ─────────────
-            delta = target_shares - position_shares
-            if execute_trade and abs(delta) > 1e-9:
-                fill_price = self._fill_price(bar_close, delta)
-                # Slippage must hit the equity curve, not just the trade log:
-                # the position is marked to CLOSE prices, so the adverse
-                # fill-vs-close difference is a realised cash cost.
-                slip_cost = abs(delta) * abs(fill_price - bar_close)
-                cost = abs(delta) * fill_price * self.commission + slip_cost
-                equity_after -= cost
-                trades.append({
-                    "timestamp":  data.index[i],
-                    "ticker":     self.ticker,
-                    "side":       "BUY" if delta > 0 else "SELL",
-                    "qty":        abs(delta),
-                    "fill_price": fill_price,
+            if execute_trade and abs(target_shares - position_shares) > 1e-9:
+                pending = {
+                    "target":     target_shares,
                     "regime":     regime_label,
                     "confidence": confidence,
-                    "cb_level":   risk.circuit_breaker_level().name,
-                })
-                if target_shares > 0:
-                    entry_price = fill_price
-                position_shares = target_shares
+                }
 
             # ── Record OOS bar ───────────────────────────────────────────
             bar_total_ret = (equity_after - equity) / equity if equity else 0.0
@@ -503,27 +552,41 @@ class Backtester:
         rets.name = "buy_and_hold"
         return rets
 
+    def _daily_cash_yield(self) -> float:
+        """Per-bar yield credited on idle cash (0 when disabled)."""
+        if self.cash_yield_annual > 0:
+            return (1.0 + self.cash_yield_annual) ** (1.0 / 252) - 1.0
+        return 0.0
+
     def _bench_sma_trend(self, data: pd.DataFrame, oos_index: list) -> pd.Series:
-        """Invested when close > 200-day SMA (computed causally), else cash."""
+        """
+        Invested when close > 200-day SMA (computed causally), else cash.
+        Out-of-market bars earn the same cash yield as the strategy so the
+        comparison stays fair.  NOTE: the benchmark still fills at the
+        signal close (ideal, costless) while the strategy fills at the next
+        open with slippage — the strategy side is the conservative one.
+        """
         close = data["close"]
         sma = close.rolling(200).mean()
-        invested = (close > sma).shift(1).fillna(False)   # signal acts next bar
+        invested = (close > sma).shift(1).fillna(False).astype(float)
         asset_ret = close.pct_change().fillna(0.0)
-        bench = (asset_ret * invested.astype(float)).loc[oos_index]
+        rets = asset_ret * invested + self._daily_cash_yield() * (1.0 - invested)
+        bench = rets.loc[oos_index]
         bench.name = "sma_200"
         return bench
 
     def _bench_random_entry(self, oos_close: pd.Series) -> pd.Series:
         """
-        Random long/flat entries (50/50) with the same per-bar return basis.
-        Isolates whether the HMM adds value beyond random timing.
+        Random long/flat entries (50/50) with the same per-bar return basis
+        (idle bars earn the cash yield).  Isolates whether the HMM adds
+        value beyond random timing.
         """
         rng = np.random.default_rng(self.random_seed + 1)
         asset_ret = oos_close.pct_change().fillna(0.0)
         signal = pd.Series(
             rng.integers(0, 2, len(oos_close)), index=oos_close.index
-        ).shift(1).fillna(0.0)
-        bench = asset_ret * signal.astype(float)
+        ).shift(1).fillna(0.0).astype(float)
+        bench = asset_ret * signal + self._daily_cash_yield() * (1.0 - signal)
         bench.name = "random_entry"
         return bench
 

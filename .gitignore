@@ -32,3 +32,6 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Market-data cache — regenerated on demand, never commit
+data_cache/

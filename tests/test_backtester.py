@@ -423,3 +423,78 @@ class TestSlippageCharged:
         res_slip = Backtester(slippage=0.01, **common).run(data)
         assert len(res_slip.trade_log) > 0
         assert total_return(res_slip.returns) < total_return(res_free.returns)
+
+
+# ---------------------------------------------------------------------------
+# 10. Execution timing — decisions fill at the NEXT bar's open
+# ---------------------------------------------------------------------------
+
+class TestNextOpenExecution:
+
+    def test_fills_occur_at_the_bars_open(self):
+        """
+        Every logged fill must price off the OPEN of the bar it executes on
+        (± slippage).  A fill at the signal bar's close is impossible live:
+        the daily bar only completes at the close.
+        """
+        data = _make_ohlcv(420, seed=6)
+        slip = 0.001
+        bt = Backtester(
+            ticker="T", train_window=120, test_window=60, random_seed=6,
+            slippage=slip, commission=0.0,
+        )
+        res = bt.run(data)
+        tl = res.trade_log
+        assert len(tl) > 0
+        for _, t in tl.iterrows():
+            o = float(data["open"].loc[t["timestamp"]])
+            expected = o * (1 + slip) if t["side"] == "BUY" else o * (1 - slip)
+            assert t["fill_price"] == pytest.approx(expected), (
+                f"fill at {t['timestamp']} priced off something other than "
+                f"that bar's open"
+            )
+
+    def test_no_fill_on_first_oos_bar(self):
+        """The first OOS bar can only DECIDE; the earliest fill is bar 2."""
+        data = _make_ohlcv(420, seed=6)
+        bt = Backtester(ticker="T", train_window=120, test_window=60,
+                        random_seed=6)
+        res = bt.run(data)
+        first_oos_ts = res.returns.index[0]
+        tl = res.trade_log
+        if len(tl):
+            assert (tl["timestamp"] > first_oos_ts).all()
+
+
+# ---------------------------------------------------------------------------
+# 11. Cash yield — idle cash must earn the configured rate
+# ---------------------------------------------------------------------------
+
+class TestCashYield:
+
+    def test_cash_yield_credits_idle_cash(self):
+        """
+        With the exposure cap at 0.5 the book is always >= 50% cash, so a
+        positive cash yield must strictly raise the total return without
+        changing any trading decision (weights are equity-proportional).
+        """
+        data = _make_ohlcv(420, seed=8)
+        common = dict(ticker="T", train_window=120, test_window=60,
+                      random_seed=8, slippage=0.0, commission=0.0)
+        res0 = Backtester(cash_yield_annual=0.0, **common).run(data)
+        res5 = Backtester(cash_yield_annual=0.05, **common).run(data)
+        assert total_return(res5.returns) > total_return(res0.returns)
+        assert len(res5.trade_log) == len(res0.trade_log)
+
+    def test_benchmarks_receive_cash_yield_on_idle_bars(self):
+        data = _make_ohlcv(420, seed=8)
+        common = dict(ticker="T", train_window=120, test_window=60,
+                      random_seed=8)
+        b0 = Backtester(cash_yield_annual=0.0, **common).run(data).benchmark_returns
+        b5 = Backtester(cash_yield_annual=0.05, **common).run(data).benchmark_returns
+        # sma_200 spends some OOS bars in cash for this seed → yield helps.
+        assert total_return(b5["sma_200"]) >= total_return(b0["sma_200"])
+        # buy & hold is always invested → identical either way.
+        assert total_return(b5["buy_and_hold"]) == pytest.approx(
+            total_return(b0["buy_and_hold"])
+        )

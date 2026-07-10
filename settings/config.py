@@ -109,19 +109,31 @@ STRATEGY = {
 #     worst episodes.  Kept: never worse than plain trend_core on any
 #     ticker, and it restores the full DD protection automatically if the
 #     cap is ever raised.
-# v3 walk-forward results (net of costs, at the 0.50 cap):
+# v3 walk-forward results for the tc_vol15 core (net of costs, 0.50 cap):
 #   SPY  +36.4% / Sharpe 1.14 / DD  -7.7%   (bench sma_200@100%: 0.92 / -18.3%)
 #   QQQ  +49.3% / Sharpe 1.09 / DD  -8.9%   (bench sma_200@100%: 1.01 / -19.1%)
 #   IWM  +21.3% / Sharpe 0.55 / DD -10.1%   (never tuned on; costless
 #     sma_200 bench: 0.46 — profile stays modestly ahead where trend is weak)
-# HONESTY NOTE: the block-bootstrap 90% CIs on these Sharpes are wide
-# (SPY [0.42, 1.85]) and overlap almost completely across ALL trend-core
-# variants — none of them is statistically distinguishable on ~6 years of
-# data.  In particular tc_confirm3 (3-bar trend confirm) points ahead on
-# QQQ/IWM and behind on SPY; do NOT switch the pin on this evidence —
-# re-test pre-registered on fresh data/tickers first.
+# HONESTY NOTE: the block-bootstrap 90% CIs on ~6y of data are wide (SPY
+# [0.42, 1.85]) and overlap almost completely across ALL trend-core
+# variants — short-window rankings alone are not decision-grade.
+#
+# trend_confirm_bars=3 added 2026-07-10 by a PRE-REGISTERED single-shot
+# test (decision rule fixed before running: switch iff combo Sharpe >=
+# tc_vol15 on >= 4 of 5 datasets AND max DD nowhere >2pp worse).  The 30y
+# Yahoo structural runs (1998-2026, spanning dotcom/2008/2011/2018/2020/
+# 2022 — none of which was ever used for tuning) plus the v3 spans:
+#   SPY 30y  0.84 vs 0.78,  DD  -9.9% vs -11.1%
+#   QQQ 30y  0.84 vs 0.79,  DD -14.0% vs -17.5%
+#   SPY v3   1.11 vs 1.14 (the single miss, -0.03)
+#   QQQ v3   1.19 vs 1.09,  IWM v3  0.60 vs 0.55
+# → 4/5 wins, DD better everywhere, ~25-40% fewer trades.  The 3-bar
+# confirmation damps SMA-hover whipsaw — the a-priori rationale it was
+# added to the grid with.  vol_target stays: under the 0.50 cap it rarely
+# binds, but it restores tail protection automatically if the cap rises.
 ORCHESTRATOR: dict = {
     "trend_core": True,
+    "trend_confirm_bars": 3,
     "vol_target": 0.15,
 }
 

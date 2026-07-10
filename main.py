@@ -338,6 +338,14 @@ class TradingSystem:
         state.bar_count += 1
         self._bars_processed += 1
 
+        # 1b — Periodic model refresh.  The HMM and feature scaler were
+        #      previously fitted exactly once at startup and drifted stale
+        #      for the bot's whole lifetime (refit_interval_bars was dead
+        #      config); the backtester refits every walk-forward window.
+        refit_interval = config.HMM.get("refit_interval_bars", 0)
+        if refit_interval and state.bar_count % refit_interval == 0:
+            self._refit_models(ticker, state)
+
         # 2 — Features (causal: only data up to this bar)
         try:
             feats = state.feature_engineer.transform(state.history)
@@ -541,6 +549,41 @@ class TradingSystem:
                         SEVERITY_CRITICAL, key="data_drop")
         else:
             logger.info("Data feed reconnected.")
+
+    def _refit_models(self, ticker: str, state: TickerState) -> None:
+        """
+        Refit the feature scaler + HMM on the trailing history (mirrors the
+        backtester's per-window retraining) and warm the forward state by
+        replaying recent observations so the stability filter has a
+        confirmed regime immediately — without the replay, every refit
+        would block trading for the 3-bar confirmation warm-up.
+
+        On any failure the previous fitted models stay in place: a failed
+        refit must never take down a working pipeline.
+        """
+        try:
+            train_df = state.history.iloc[-max(config.HMM["min_history_bars"], 252):]
+            fe = FeatureEngineer()
+            feats = fe.fit_transform(train_df)
+            engine = HMMEngine(
+                n_iter=config.HMM["n_iter"],
+                random_state=config.HMM["random_state"],
+                min_history_bars=min(config.HMM["min_history_bars"], len(feats)),
+                refit_interval_bars=config.HMM["refit_interval_bars"],
+            )
+            engine.fit(feats)
+            # Replay the tail so confirmed-regime + flicker state are warm.
+            for row in feats.iloc[-20:].values:
+                engine.update(row)
+        except Exception as exc:
+            logger.warning("Model refit failed for %s — keeping previous "
+                           "models: %s", ticker, exc)
+            return
+        state.feature_engineer = fe
+        state.engine = engine
+        logger.info("Refit HMM for %s on %d bars: k=%d, regime=%s",
+                    ticker, len(feats), engine.n_components,
+                    engine.current_regime_label())
 
     def _attempt_resume(self, min_probe_interval: float = 60.0) -> bool:
         """

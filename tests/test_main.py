@@ -474,3 +474,34 @@ class TestAlertManager:
         body = am._format_body("msg", SEVERITY_CRITICAL, {"drawdown": -0.12})
         assert "drawdown" in body
         assert "CRITICAL" in body
+
+
+# ---------------------------------------------------------------------------
+# 2d. Periodic model refit
+# ---------------------------------------------------------------------------
+
+class TestModelRefit:
+
+    def test_refit_replaces_models_and_stays_warm(self, started_system):
+        state = started_system._states["AAA"]
+        old_engine = state.engine
+        old_fe = state.feature_engineer
+        started_system._refit_models("AAA", state)
+        assert state.engine is not old_engine
+        assert state.feature_engineer is not old_fe
+        # The replay must leave a confirmed regime — otherwise every refit
+        # would block trading for the 3-bar stability warm-up.
+        assert state.engine.current_regime() != -1
+
+    def test_failed_refit_keeps_previous_models(self, started_system, monkeypatch):
+        import main as main_mod
+        state = started_system._states["AAA"]
+        old_engine = state.engine
+        old_fe = state.feature_engineer
+        monkeypatch.setattr(
+            main_mod, "FeatureEngineer",
+            MagicMock(side_effect=RuntimeError("refit boom")),
+        )
+        started_system._refit_models("AAA", state)
+        assert state.engine is old_engine
+        assert state.feature_engineer is old_fe

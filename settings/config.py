@@ -95,27 +95,31 @@ STRATEGY = {
 # an explicit key here would override that.)
 #
 # Pinned 2026-07-09 ("tc_vol15"), re-validated 2026-07-10 under the LIVE
-# configuration (exposure cap 0.50 inside the orchestrator target, costs
-# 2 bps slippage / zero commission charged to equity, daily breakers off) —
-# see experiments_report_{spy,qqq,iwm}_v2.md:
+# configuration and the corrected measurement stack (exposure cap 0.50
+# inside the orchestrator target; 2 bps slippage / zero commission charged
+# to equity; decisions fill at the NEXT bar's open; dividend-adjusted
+# prices; idle cash earns 2% p.a.; daily breakers off) — see
+# experiments_report_{spy,qqq,iwm}_v3.md:
 #   * trend_core  — SMA-200 trend rule IS the allocation; the HMM regime
 #     tiers no longer drive it (they were measured to subtract value on
 #     both tickers, even as a mere risk overlay).
 #   * vol_target 0.15 — scales exposure down when realised 21d vol exceeds
 #     15% annualised.  NOTE: under the 0.50 cap it only binds when the
-#     vol-scale drops below 0.5 (realised vol > 30%), so it now trims only
-#     the worst episodes (QQQ DD -10.3%→-10.2%, IWM -14.4%→-14.2%, SPY
-#     unchanged).  Kept: never worse than plain trend_core on any ticker,
-#     and it restores the full DD protection automatically if the cap is
-#     ever raised.
-# v2 walk-forward results (net of costs, at the 0.50 cap):
-#   SPY  +23.0% / Sharpe 0.78 / DD -11.0%   (bench sma_200@100%: 0.77 / -20.6%)
-#   QQQ  +45.1% / Sharpe 1.01 / DD -10.2%   (bench sma_200@100%: 1.00 / -19.6%)
-#   IWM   +8.0% / Sharpe 0.24 / DD -14.2%   (never tuned on; degrades
-#     gracefully where trend has no edge — costless sma_200 bench: 0.30)
-# Candidate NOT pinned: tc_confirm3 (3-bar trend confirm) leads on QQQ/IWM
-# but trails on SPY — inconsistent ranking = no robust edge; re-test it
-# pre-registered on fresh data before ever switching.
+#     vol-scale drops below 0.5 (realised vol > 30%), so it trims only the
+#     worst episodes.  Kept: never worse than plain trend_core on any
+#     ticker, and it restores the full DD protection automatically if the
+#     cap is ever raised.
+# v3 walk-forward results (net of costs, at the 0.50 cap):
+#   SPY  +36.4% / Sharpe 1.14 / DD  -7.7%   (bench sma_200@100%: 0.92 / -18.3%)
+#   QQQ  +49.3% / Sharpe 1.09 / DD  -8.9%   (bench sma_200@100%: 1.01 / -19.1%)
+#   IWM  +21.3% / Sharpe 0.55 / DD -10.1%   (never tuned on; costless
+#     sma_200 bench: 0.46 — profile stays modestly ahead where trend is weak)
+# HONESTY NOTE: the block-bootstrap 90% CIs on these Sharpes are wide
+# (SPY [0.42, 1.85]) and overlap almost completely across ALL trend-core
+# variants — none of them is statistically distinguishable on ~6 years of
+# data.  In particular tc_confirm3 (3-bar trend confirm) points ahead on
+# QQQ/IWM and behind on SPY; do NOT switch the pin on this evidence —
+# re-test pre-registered on fresh data/tickers first.
 ORCHESTRATOR: dict = {
     "trend_core": True,
     "vol_target": 0.15,
@@ -250,6 +254,13 @@ BACKTEST = {
     # backtester: half-spread + impact + timing noise for SPY/QQQ-class
     # liquidity.  Stress-test any variant choice at 2×/4× this value.
     "slippage": 0.0002,
+    # Annualised yield credited on idle cash (flat T-bill approximation —
+    # 3M bills averaged roughly 2.5% over 2020-2026, near 0% in 2020-21 and
+    # ~5% in 2023-24).  A trend strategy spends long stretches in cash;
+    # crediting nothing systematically understates it vs buy & hold.  The
+    # same yield is credited to the sma_200 / random benchmarks' idle bars.
+    # Sensitivity-check important decisions at 0.0 and 0.04.
+    "cash_yield_annual": 0.02,
 }
 
 # ---------------------------------------------------------------------------

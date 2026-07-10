@@ -171,7 +171,7 @@ def fetch_alpaca(symbol: str, bars: int) -> pd.DataFrame:
             "environment). Set them, or use --csv / --stooq / --synthetic instead."
         )
 
-    from alpaca.data.enums import DataFeed
+    from alpaca.data.enums import Adjustment, DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
@@ -180,13 +180,14 @@ def fetch_alpaca(symbol: str, bars: int) -> pd.DataFrame:
     client = StockHistoricalDataClient(api_key, secret_key)
     end = datetime.now(timezone.utc) - timedelta(minutes=16)   # free IEX feed lag
     start = end - timedelta(days=int(bars * 1.6) + 15)         # buffer for weekends/holidays
-    print(f"Fetching {symbol} from Alpaca (IEX feed, {start.date()} … {end.date()}) ...")
+    print(f"Fetching {symbol} from Alpaca (IEX feed, adjusted, {start.date()} … {end.date()}) ...")
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
         feed=DataFeed.IEX,
+        adjustment=Adjustment.ALL,   # total-return prices (splits + dividends)
     )
     bars_df = client.get_stock_bars(req).df
     if bars_df.empty:
@@ -194,6 +195,50 @@ def fetch_alpaca(symbol: str, bars: int) -> pd.DataFrame:
     df = bars_df.xs(symbol, level="symbol").copy()
     df.index = pd.to_datetime(df.index).tz_localize(None)
     out = df[["open", "high", "low", "close", "volume"]].astype(float).dropna()
+    if len(out) < 400:
+        raise ValueError(f"Only {len(out)} usable bars for '{symbol}' — too few.")
+    print(f"Got {len(out)} daily bars ({out.index[0].date()} … {out.index[-1].date()}).")
+    return out
+
+
+def fetch_yahoo(symbol: str, bars: int, range_str: str = "30y") -> pd.DataFrame:
+    """
+    Download long daily history from the Yahoo Finance chart API (reachable
+    from Codespaces, unlike Stooq).  OHLC are rescaled by adjclose/close so
+    prices are split+dividend adjusted (total-return), matching the Alpaca
+    adjustment=ALL path.
+
+    This is the STRUCTURAL-validation data source: Alpaca/IEX history only
+    reaches back to ~2020 (essentially one bear market).  Decisions like
+    breaker design or vol-target level should hold on 25+ years — 2000-02,
+    2008, 2011, 2015, 2018 — before they are trusted.
+    """
+    import requests
+
+    symbol = symbol.upper().replace(".US", "").lstrip("^")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": range_str, "interval": "1d"}
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    print(f"Fetching {symbol} from Yahoo Finance ({range_str}, adjusted) ...")
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    result = resp.json()["chart"]["result"][0]
+    ts = (
+        pd.to_datetime(result["timestamp"], unit="s", utc=True)
+        .tz_convert("America/New_York").tz_localize(None).normalize()
+    )
+    quote = result["indicators"]["quote"][0]
+    adj = result["indicators"]["adjclose"][0]["adjclose"]
+    df = pd.DataFrame(
+        {"open": quote["open"], "high": quote["high"], "low": quote["low"],
+         "close": quote["close"], "volume": quote["volume"], "adjclose": adj},
+        index=ts,
+    ).dropna()
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    factor = df["adjclose"] / df["close"]
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col] * factor
+    out = df[["open", "high", "low", "close", "volume"]].astype(float)
     if len(out) < 400:
         raise ValueError(f"Only {len(out)} usable bars for '{symbol}' — too few.")
     print(f"Got {len(out)} daily bars ({out.index[0].date()} … {out.index[-1].date()}).")
@@ -272,6 +317,41 @@ def synthetic_ohlcv(n: int = 2000, seed: int = 7) -> pd.DataFrame:
 # Metrics
 # ---------------------------------------------------------------------------
 
+def sharpe_block_bootstrap_ci(
+    returns: pd.Series,
+    n_boot: int = 1000,
+    block: int = 21,
+    level: float = 0.90,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """
+    Circular block-bootstrap confidence interval for the annualised Sharpe.
+
+    Daily returns are autocorrelated in volatility, so an i.i.d. bootstrap
+    understates uncertainty; resampling contiguous ~1-month blocks keeps
+    that structure.  The CI is the honesty check the summary table lacks —
+    two variants whose intervals overlap heavily are NOT distinguishable,
+    however tidy the point-estimate ranking looks.
+    """
+    r = np.asarray(returns.dropna(), dtype=float)
+    n = len(r)
+    if n < 2 * block:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block))
+    starts = rng.integers(0, n, size=(n_boot, n_blocks))
+    # Circular blocks: indices wrap around so every start is valid.
+    idx = (starts[:, :, None] + np.arange(block)[None, None, :]) % n
+    samples = r[idx.reshape(n_boot, -1)[:, :n]]          # (n_boot, n)
+    mean = samples.mean(axis=1)
+    sd = samples.std(axis=1, ddof=1)
+    valid = sd > 1e-12
+    sharpes = np.where(valid, mean / np.where(valid, sd, 1.0) * np.sqrt(252), 0.0)
+    alpha = (1.0 - level) / 2.0
+    lo, hi = np.quantile(sharpes, [alpha, 1.0 - alpha])
+    return (float(lo), float(hi))
+
+
 def summarise(name: str, returns: pd.Series, trade_log: pd.DataFrame,
               commission: float, initial_capital: float) -> dict:
     """One comparison-table row."""
@@ -281,11 +361,13 @@ def summarise(name: str, returns: pd.Series, trade_log: pd.DataFrame,
     else:
         traded_notional = 0.0
         n_trades = 0
+    ci_lo, ci_hi = sharpe_block_bootstrap_ci(returns)
     return {
         "variant":       name,
         "total_return":  total_return(returns),
         "cagr":          annualised_return(returns),
         "sharpe":        sharpe_ratio(returns),
+        "sharpe_ci":     (ci_lo, ci_hi),
         "max_dd":        max_drawdown(returns),
         "n_trades":      n_trades,
         "turnover_x":    traded_notional / initial_capital if initial_capital else 0.0,
@@ -295,20 +377,23 @@ def summarise(name: str, returns: pd.Series, trade_log: pd.DataFrame,
 
 def to_markdown(rows: list[dict], meta: str) -> str:
     header = (
-        "| Variant | Total return | CAGR | Sharpe | Max DD | Trades | "
-        "Turnover× | Est. commission |\n"
-        "|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        "| Variant | Total return | CAGR | Sharpe | Sharpe 90% CI | Max DD | "
+        "Trades | Turnover× | Est. commission |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     )
     lines = []
     for r in rows:
         if "error" in r:
-            lines.append(f"| {r['variant']} | ERROR: {r['error']} |||||||")
+            lines.append(f"| {r['variant']} | ERROR: {r['error']} ||||||||")
             continue
+        lo, hi = r.get("sharpe_ci", (float("nan"), float("nan")))
+        ci = "n/a" if lo != lo else f"[{lo:.2f}, {hi:.2f}]"
         lines.append(
             f"| {r['variant']} "
             f"| {r['total_return']:+.1%} "
             f"| {r['cagr']:+.1%} "
             f"| {r['sharpe']:.2f} "
+            f"| {ci} "
             f"| {r['max_dd']:.1%} "
             f"| {r['n_trades']} "
             f"| {r['turnover_x']:.1f} "
@@ -331,6 +416,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--csv", default=None,
                     help="Path to a local OHLCV CSV (Stooq or Yahoo export). "
                          "Use this if Alpaca creds/endpoint aren't available.")
+    ap.add_argument("--yahoo", action="store_true",
+                    help="Fetch up to 30y of adjusted daily history from the "
+                         "Yahoo chart API — the long-history source for "
+                         "structural validation (Alpaca/IEX only reaches ~2020).")
     ap.add_argument("--stooq", action="store_true",
                     help="Force the free Stooq download instead of Alpaca "
                          "(blocked from Codespaces and some corporate networks).")
@@ -346,6 +435,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.csv:
         data = load_csv(args.csv).iloc[-args.bars:]
         source = f"{args.csv} (local file)"
+    elif args.yahoo:
+        data = fetch_yahoo(args.ticker, args.bars).iloc[-args.bars:]
+        source = f"{args.ticker} via Yahoo (30y, adjusted)"
     elif args.synthetic:
         data = synthetic_ohlcv(args.bars, seed=args.seed)
         source = f"synthetic (seed={args.seed})"
@@ -395,6 +487,10 @@ def main(argv: list[str] | None = None) -> int:
         f"seed={args.seed}  \n"
         f"Costs: commission={_cfg.BACKTEST['commission']:.4f}, "
         f"slippage={_cfg.BACKTEST['slippage']:.4f} per fill (charged to equity)  \n"
+        f"Execution: decisions on bar close fill at the NEXT bar's open; "
+        f"idle cash earns "
+        f"{_cfg.BACKTEST.get('cash_yield_annual', 0.0):.1%} p.a. (also credited "
+        f"to sma_200/random benchmarks' idle bars)  \n"
         f"Exposure cap (RISK.max_position_size): "
         f"{_cfg.RISK['max_position_size']:.2f} — strategy rows are capped at "
         f"this fraction of equity, benchmarks run at 100%.  \n"

@@ -120,6 +120,7 @@ class Backtester:
         commission: Optional[float] = None,
         cash_yield_annual: Optional[float] = None,
         stop_loss_pct: Optional[float] = None,
+        take_profit_pct: Optional[float] = None,
         random_seed: int = 42,
         risk_manager: Optional[RiskManager] = None,
         use_trend_filter: bool = True,
@@ -163,8 +164,21 @@ class Backtester:
         self.cash_yield_series = cash_yield_series
         # Per-bar daily yield aligned to the current run's data; built in run().
         self._daily_yield: Optional[pd.Series] = None
+        # Per-trade protective exits, simulated intraday against the bar's
+        # low/high (0.0 = disabled).  A long exits at entry*(1-sl) when the
+        # LOW breaches it, at entry*(1+tp) when the HIGH does; a gap through
+        # the level fills at the open (never at the untouchable level), and
+        # when both trigger inside one bar the STOP is assumed first
+        # (conservative).  Exits happen mid-bar; the normal decision logic
+        # may re-enter at the next open, so the realistic stop-whipsaw cost
+        # is fully modelled.
         self.stop_loss_pct = (
-            stop_loss_pct if stop_loss_pct is not None else config.RISK["stop_loss_pct"]
+            stop_loss_pct if stop_loss_pct is not None
+            else config.RISK.get("stop_loss_pct", 0.0)
+        )
+        self.take_profit_pct = (
+            take_profit_pct if take_profit_pct is not None
+            else config.RISK.get("take_profit_pct", 0.0)
         )
         self.random_seed = random_seed
         self._rng = np.random.default_rng(random_seed)
@@ -271,6 +285,8 @@ class Backtester:
                 "slippage": self.slippage,
                 "commission": self.commission,
                 "cash_yield_annual": self.cash_yield_annual,
+                "stop_loss_pct": self.stop_loss_pct,
+                "take_profit_pct": self.take_profit_pct,
                 "execution": "next_open",
                 "stress_injected": inject_stress,
                 "trend_filter": self.use_trend_filter,
@@ -392,11 +408,56 @@ class Backtester:
                         "regime":     pending["regime"],
                         "confidence": pending["confidence"],
                         "cb_level":   risk.circuit_breaker_level().name,
+                        "exit_reason": "",
                     })
-                    if pending["target"] > 0:
+                    # Only a BUY re-anchors the entry price; a partial
+                    # reduction must not move the stop/TP reference (and
+                    # previously set it to the SELL fill).
+                    if delta > 0:
                         entry_price = fill_price
                     position_shares = pending["target"]
                 pending = None
+
+            # ── 1b) Intraday protective exit (stop-loss / take-profit),
+            #    simulated against the bar's low/high.  Gap through the
+            #    level → fill at the open; stop assumed before take-profit
+            #    when both trigger inside one bar (conservative). ──────────
+            intraday_pnl = position_shares * (bar_close - bar_open)
+            if position_shares > 0 and entry_price > 0 and (
+                self.stop_loss_pct > 0 or self.take_profit_pct > 0
+            ):
+                exit_reason, exit_base = None, 0.0
+                if self.stop_loss_pct > 0:
+                    stop_lvl = entry_price * (1.0 - self.stop_loss_pct)
+                    if float(data["low"].iloc[i]) <= stop_lvl:
+                        exit_reason, exit_base = "stop_loss", min(bar_open, stop_lvl)
+                if exit_reason is None and self.take_profit_pct > 0:
+                    tp_lvl = entry_price * (1.0 + self.take_profit_pct)
+                    if float(data["high"].iloc[i]) >= tp_lvl:
+                        exit_reason, exit_base = "take_profit", max(bar_open, tp_lvl)
+                if exit_reason is not None:
+                    fill_price = self._fill_price(exit_base, -position_shares)
+                    slip_cost = position_shares * abs(fill_price - exit_base)
+                    trade_cost += (
+                        position_shares * fill_price * self.commission + slip_cost
+                    )
+                    trades.append({
+                        "timestamp":  data.index[i],
+                        "ticker":     self.ticker,
+                        "side":       "SELL",
+                        "qty":        position_shares,
+                        "fill_price": fill_price,
+                        "regime":     "n/a",
+                        "confidence": 0.0,
+                        "cb_level":   risk.circuit_breaker_level().name,
+                        "exit_reason": exit_reason,
+                    })
+                    # Position rode open → exit level, cash for the rest of
+                    # the bar; the close-side decision below may re-enter at
+                    # the NEXT open (the realistic stop-whipsaw round trip).
+                    intraday_pnl = position_shares * (exit_base - bar_open)
+                    position_shares = 0.0
+                    entry_price = 0.0
 
             # ── 2) Mark-to-market: old position over the overnight gap,
             #    new position over the intraday move, plus cash yield
@@ -407,7 +468,7 @@ class Backtester:
             )
             pnl = (
                 pos_before * (bar_open - prev_close)
-                + position_shares * (bar_close - bar_open)
+                + intraday_pnl
                 - trade_cost
             )
             if daily_yield and equity > 0:

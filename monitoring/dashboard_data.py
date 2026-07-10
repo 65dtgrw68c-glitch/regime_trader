@@ -67,13 +67,21 @@ def assemble_signals(
     """
     if trade_log is None or len(trade_log) == 0:
         return []
-    stop_loss_pct = stop_loss_pct if stop_loss_pct is not None else config.RISK["stop_loss_pct"]
+    stop_loss_pct = (
+        stop_loss_pct if stop_loss_pct is not None
+        else config.RISK.get("stop_loss_pct", 0.0)
+    )
     rows = []
     for _, t in trade_log.iterrows():
         side = str(t.get("side", "")).lower()
         entry = float(t.get("fill_price", 0.0) or 0.0)
-        # Protective stop sits below entry for longs, above for shorts.
-        stop = entry * (1 - stop_loss_pct) if side == "buy" else entry * (1 + stop_loss_pct)
+        # Protective stop sits below entry for longs, above for shorts;
+        # blank when per-trade stops are disabled (the default).
+        if stop_loss_pct > 0:
+            stop = entry * (1 - stop_loss_pct) if side == "buy" else entry * (1 + stop_loss_pct)
+            stop_display = round(stop, 2)
+        else:
+            stop_display = ""
         rows.append({
             "timestamp":      t.get("timestamp", ""),
             "ticker":         t.get("ticker", ""),
@@ -81,7 +89,7 @@ def assemble_signals(
             "regime":         t.get("regime", ""),
             "allocation_pct": round(float(t.get("confidence", 0.0) or 0.0) * 100, 1),
             "entry_price":    round(entry, 2),
-            "stop_price":     round(stop, 2),
+            "stop_price":     stop_display,
             "pnl":            "",
             "status":         "filled",
         })

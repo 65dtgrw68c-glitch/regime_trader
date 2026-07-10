@@ -545,3 +545,65 @@ class TestBenchmarkTimingAndYieldSeries:
                         cash_yield_series=sparse)
         daily = bt._build_daily_yield(data.index)
         assert (daily.iloc[1:] > 0).all()                 # ffilled everywhere
+
+
+# ---------------------------------------------------------------------------
+# 13. Per-trade protective exits (stop-loss / take-profit)
+# ---------------------------------------------------------------------------
+
+class TestProtectiveExits:
+
+    def _run(self, **kw):
+        data = _make_ohlcv(420, seed=6)
+        common = dict(ticker="T", train_window=120, test_window=60,
+                      random_seed=6, slippage=0.0, commission=0.0,
+                      cash_yield_annual=0.0)
+        common.update(kw)
+        return Backtester(**common).run(data)
+
+    def test_disabled_by_default_and_identical(self):
+        """stop/tp = 0.0 must change nothing (regression guard)."""
+        res_off = self._run()
+        res_zero = self._run(stop_loss_pct=0.0, take_profit_pct=0.0)
+        assert np.allclose(res_off.returns.values, res_zero.returns.values)
+        assert not (res_off.trade_log.get("exit_reason", pd.Series(dtype=str))
+                    .isin(["stop_loss", "take_profit"])).any()
+
+    def test_tight_stop_produces_stop_exits(self):
+        res = self._run(stop_loss_pct=0.01)
+        tl = res.trade_log
+        stops = tl[tl["exit_reason"] == "stop_loss"]
+        assert len(stops) > 0
+        assert (stops["side"] == "SELL").all()
+
+    def test_stop_exit_fills_at_or_below_stop_level(self):
+        """A stop fill can never be BETTER than the stop level (gaps fill
+        at the open, i.e. lower for a long)."""
+        res = self._run(stop_loss_pct=0.01)
+        tl = res.trade_log.reset_index(drop=True)
+        # Reconstruct entry price per stop exit: the last BUY before it.
+        last_buy_price = None
+        for _, t in tl.iterrows():
+            if t["side"] == "BUY":
+                last_buy_price = t["fill_price"]
+            elif t["exit_reason"] == "stop_loss":
+                assert last_buy_price is not None
+                stop_lvl = last_buy_price * (1 - 0.01)
+                assert t["fill_price"] <= stop_lvl + 1e-9
+
+    def test_take_profit_produces_tp_exits(self):
+        res = self._run(take_profit_pct=0.02)
+        tl = res.trade_log
+        tps = tl[tl["exit_reason"] == "take_profit"]
+        assert len(tps) > 0
+        assert (tps["side"] == "SELL").all()
+
+    def test_tight_stop_degrades_the_trend_system(self):
+        """
+        Economic sanity: a tight stop on a daily trend system is the
+        sell-low/rebuy whipsaw — it must not IMPROVE the result on this
+        seed (this is the reason the feature defaults to OFF).
+        """
+        base = self._run()
+        stopped = self._run(stop_loss_pct=0.02)
+        assert total_return(stopped.returns) <= total_return(base.returns)

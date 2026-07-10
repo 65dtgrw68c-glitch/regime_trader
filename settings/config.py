@@ -164,10 +164,16 @@ RISK = {
     "daily_drawdown_limit": 0.02,
     # Peak-to-trough drawdown limit triggering full halt (fraction)
     "max_drawdown_limit": 0.10,
-    # Stop-loss per trade (fraction of entry price)
-    "stop_loss_pct": 0.02,
-    # Take-profit per trade (fraction of entry price)
-    "take_profit_pct": 0.04,
+    # Per-trade protective exits, simulated intraday by the backtester
+    # against each bar's low/high (0.0 = disabled).  DISABLED by default:
+    # for a daily-bar trend system the exit IS the signal (SMA-200 flip,
+    # vol targeting, portfolio breakers).  A tight stop re-creates the
+    # measured sell-low/rebuy-next-open whipsaw of the daily breakers, and
+    # a take-profit caps exactly the right-tail trades a trend follower
+    # lives on.  See the stop/TP sweep (experiments_report_stops.md)
+    # before ever turning these on.
+    "stop_loss_pct": 0.0,
+    "take_profit_pct": 0.0,
     # Volatility scaling: target annualised portfolio vol
     "target_vol": 0.10,
 

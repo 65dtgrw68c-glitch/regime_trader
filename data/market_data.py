@@ -69,7 +69,7 @@ class MarketDataFeed:
         for ticker in tickers:
             df = None
             if use_cache:
-                df = self._load_cache(ticker, timeframe)
+                df = self._load_cache(ticker, timeframe, start=start, end=end)
             if df is None:
                 df = self._fetch_bars_with_retry(ticker, start, end, timeframe)
                 if use_cache and not df.empty:
@@ -100,8 +100,15 @@ class MarketDataFeed:
     # Latest / real-time bars
     # ------------------------------------------------------------------
 
-    def get_latest_bar(self, ticker: str, timeframe: str = "5Min") -> pd.Series:
-        """Fetch the most recent bar for `ticker` at the given interval."""
+    def get_latest_bar(self, ticker: str, timeframe: str = "1Day") -> pd.Series:
+        """
+        Fetch the most recent bar for `ticker` at the given interval.
+
+        Default is 1Day: this system's features, HMM and trend rule are all
+        defined on DAILY bars.  (The previous 5Min default fed intraday bars
+        into the daily pipeline — every rolling feature and the SMA-200
+        became a mix of daily and 5-minute data.)
+        """
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=5)   # enough lookback to guarantee a bar
         df = self._fetch_bars_with_retry(
@@ -217,14 +224,55 @@ class MarketDataFeed:
     def _cache_path(self, ticker: str, timeframe: str) -> Path:
         return self._cache_dir / f"{ticker}_{timeframe}.parquet"
 
-    def _load_cache(self, ticker: str, timeframe: str = "1Day") -> Optional[pd.DataFrame]:
+    # Cached daily data may lag the requested end by up to this many calendar
+    # days (weekends/holidays/settlement) before it counts as stale.
+    _CACHE_END_GRACE_DAYS = 5
+    # ... and may start up to this many days after the requested start
+    # (listing date, source depth) before it counts as incomplete.
+    _CACHE_START_GRACE_DAYS = 10
+
+    def _load_cache(
+        self,
+        ticker: str,
+        timeframe: str = "1Day",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Return the cached frame ONLY if it covers the requested [start, end]
+        range (within a small grace window).  A stale or too-short cache
+        returns None so the caller re-fetches and overwrites it.  (The cache
+        previously ignored the requested range entirely — a bot restarted
+        weeks later silently trained on data frozen at the last fetch.)
+        """
         path = self._cache_path(ticker, timeframe)
-        if path.exists():
-            try:
-                return pd.read_parquet(path)
-            except Exception as exc:            # pragma: no cover
-                logger.warning("Failed to read cache %s: %s", path, exc)
-        return None
+        if not path.exists():
+            return None
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:            # pragma: no cover
+            logger.warning("Failed to read cache %s: %s", path, exc)
+            return None
+        if df.empty:
+            return None
+        try:
+            cache_first = pd.Timestamp(df.index.min()).date()
+            cache_last  = pd.Timestamp(df.index.max()).date()
+            if start is not None:
+                want_start = pd.Timestamp(start).date()
+                if (cache_first - want_start).days > self._CACHE_START_GRACE_DAYS:
+                    logger.info("Cache for %s starts %s but %s requested — refetching.",
+                                ticker, cache_first, want_start)
+                    return None
+            want_end = pd.Timestamp(end).date() if end else datetime.now(timezone.utc).date()
+            if (want_end - cache_last).days > self._CACHE_END_GRACE_DAYS:
+                logger.info("Cache for %s ends %s but %s requested — refetching.",
+                            ticker, cache_last, want_end)
+                return None
+        except (TypeError, ValueError) as exc:
+            logger.warning("Cache range check failed for %s: %s — refetching.", ticker, exc)
+            return None
+        return df
 
     def _save_cache(self, ticker: str, timeframe: str, df: pd.DataFrame) -> None:
         try:

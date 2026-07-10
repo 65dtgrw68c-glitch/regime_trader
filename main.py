@@ -44,6 +44,11 @@ from settings import config
 
 logger = logging.getLogger(__name__)
 
+# Cap on the per-ticker OHLCV history kept in memory.  The widest causal
+# window any feature needs is the SMA-200 (plus warm-up); 800 bars is ample
+# and keeps the per-bar feature recompute O(1) instead of growing forever.
+_MAX_HISTORY_BARS = 800
+
 
 # ===========================================================================
 # Per-ticker live state
@@ -193,12 +198,19 @@ class TradingSystem:
             except Exception as exc:
                 logger.error("HMM training failed for %s: %s", ticker, exc)
                 continue
+            # The portfolio exposure cap goes INTO the orchestrator target so
+            # the drift trigger compares against what will actually be held
+            # (a downstream sizing clip left a permanent target-vs-held gap
+            # that fired a rebalance on every bar).  ORCHESTRATOR may still
+            # override it explicitly.
+            orch_kwargs = {
+                "max_exposure": config.RISK["max_position_size"],
+                **getattr(config, "ORCHESTRATOR", {}),
+            }
             self._states[ticker] = TickerState(
                 feature_engineer=fe,
                 engine=engine,
-                orchestrator=RegimeOrchestrator(
-                    tickers=[ticker], **getattr(config, "ORCHESTRATOR", {})
-                ),
+                orchestrator=RegimeOrchestrator(tickers=[ticker], **orch_kwargs),
                 history=hist.copy(),
             )
 
@@ -233,6 +245,10 @@ class TradingSystem:
             self._executor = OrderExecutor(self._client, self._positions, self._trade_logger)
         if self._alerts is None:
             self._alerts = AlertManager()
+        # Reconcile: a crash/restart may have left working orders at the
+        # broker.  Start from a clean slate — positions were synced in step 8,
+        # and any still-pending order would double up with the next decision.
+        self._safe_call(self._executor.cancel_all_open_orders)
 
         # 10 — Log startup status
         logger.info("[startup 10/10] Startup complete.")
@@ -272,6 +288,12 @@ class TradingSystem:
         while self._running:
             if max_iterations is not None and iterations >= max_iterations:
                 break
+            # A pause (API outage, data drop) must not be terminal: probe the
+            # broker and resume automatically once connectivity is back.
+            # (Previously nothing ever reset _paused — one transient outage
+            # silently stopped trading until a manual restart.)
+            if self._paused:
+                self._attempt_resume()
             try:
                 bars = bar_source() if bar_source else self._poll_bars()
             except Exception as exc:
@@ -301,8 +323,18 @@ class TradingSystem:
         if state is None:
             return decision
 
-        # 1 — Append new bar to history
+        # 1 — Append new bar to history.  The poll loop re-delivers the same
+        #     (possibly still-forming) daily bar many times per day; appending
+        #     it repeatedly corrupted every rolling feature and produced one
+        #     order per poll.  A re-delivered timestamp only UPDATES the row
+        #     (keep=last); the decision pipeline runs once per NEW bar.
+        prev_len = len(state.history)
         state.history = self._append_bar(state.history, bar)
+        if len(state.history) <= prev_len:
+            decision["action"] = "stale_bar"
+            return decision
+        if len(state.history) > _MAX_HISTORY_BARS:
+            state.history = state.history.iloc[-_MAX_HISTORY_BARS:]
         state.bar_count += 1
         self._bars_processed += 1
 
@@ -373,17 +405,18 @@ class TradingSystem:
             return decision
 
         # 6 — Sizing → ABSOLUTE target position, then delta vs holding.
-        #     target_weight IS the fraction of equity to deploy (the vol-tier
-        #     allocations). The shared helper turns it into a share count with
-        #     the circuit-breaker factor folded in — the backtester uses the
-        #     exact same helper so live and backtest sizing cannot diverge.
-        #     (Submitting the full size every bar — as this loop once did —
-        #     silently accumulates positions; only the DELTA may trade.)
+        #     target_weight IS the fraction of equity to deploy; the
+        #     orchestrator has already applied the exposure cap inside the
+        #     target (so drift trigger and sizing agree).  The shared helper
+        #     turns it into a share count with the circuit-breaker factor
+        #     folded in — the backtester uses the exact same helper so live
+        #     and backtest sizing cannot diverge.  (Submitting the full size
+        #     every bar — as this loop once did — silently accumulates
+        #     positions; only the DELTA may trade.)
         target_weight = sum(strat_signal.target_weights.values())
         target_qty = int(shares_for_target_weight(
             target_weight, price, equity,
             cb_scaling=self._risk.size_scaling_factor(),
-            max_exposure=config.RISK["max_position_size"],
         ))
         delta = target_qty - current_qty
 
@@ -411,7 +444,8 @@ class TradingSystem:
             )
             if validation.approved:
                 self._submit(ticker, int(validation.approved_qty), price,
-                             regime_label, strat_signal.confidence, side="buy")
+                             regime_label, strat_signal.confidence, side="buy",
+                             bar_date=bar_day)
                 decision["action"] = "order_submitted"
                 decision["side"] = "buy"
                 decision["qty"] = int(validation.approved_qty)
@@ -422,7 +456,8 @@ class TradingSystem:
         else:
             # delta < 0 — reducing risk needs no order validation
             self._submit(ticker, int(-delta), price,
-                         regime_label, strat_signal.confidence, side="sell")
+                         regime_label, strat_signal.confidence, side="sell",
+                         bar_date=bar_day)
             decision["action"] = "order_submitted"
             decision["side"] = "sell"
             decision["qty"] = int(-delta)
@@ -507,6 +542,28 @@ class TradingSystem:
         else:
             logger.info("Data feed reconnected.")
 
+    def _attempt_resume(self, min_probe_interval: float = 60.0) -> bool:
+        """
+        While paused, probe broker connectivity (rate-limited) and resume
+        trading once it is back.  Returns True if trading was resumed.
+        """
+        now = time.time()
+        if now - getattr(self, "_last_resume_probe", 0.0) < min_probe_interval:
+            return False
+        self._last_resume_probe = now
+        try:
+            clock = self._client.get_clock() if self._client else None
+        except Exception as exc:
+            logger.warning("Resume probe failed — staying paused: %s", exc)
+            return False
+        if clock is None:
+            return False
+        self._paused = False
+        logger.info("Broker connectivity restored — resuming trading.")
+        self._alert("Trading resumed after pause (connectivity restored).",
+                    SEVERITY_WARNING, key="resume")
+        return True
+
     def _handle_order_rejection(self, ticker: str, reason: str) -> None:
         """
         Failure mode 4: order rejected by Alpaca.
@@ -555,15 +612,35 @@ class TradingSystem:
     # Helpers
     # ==================================================================
 
-    def _submit(self, ticker, qty, price, regime, confidence, side="buy") -> None:
+    def _submit(self, ticker, qty, price, regime, confidence, side="buy",
+                bar_date=None) -> None:
+        # Idempotency: one decision per ticker per bar.  If a retry / stale
+        # loop ever re-submits the same decision, the broker rejects the
+        # duplicate client_order_id instead of silently doubling the
+        # position (this happened: 126 duplicate orders in 40 minutes).
+        coid = f"rt-{ticker}-{bar_date}-{side}" if bar_date is not None else None
         try:
-            oid = self._executor.submit_order(ticker, qty, side, order_type="market")
+            oid = self._executor.submit_order(
+                ticker, qty, side, order_type="market", client_order_id=coid,
+            )
             if not oid:
                 self._handle_order_rejection(ticker, "broker returned no order id")
                 return
             self._orders_submitted += 1
         except Exception as exc:
             self._handle_order_rejection(ticker, str(exc))
+            return
+        # Wait briefly for the fill so the position snapshot the NEXT
+        # decision diffs against is fresh; a still-working order after the
+        # timeout is surfaced instead of silently re-traded.
+        try:
+            self._executor.await_fills([oid], timeout=15)
+        except TimeoutError:
+            self._alert(f"Order {oid} for {ticker} not filled within 15s — "
+                        f"position snapshot may lag.", SEVERITY_WARNING,
+                        key=f"slow_fill_{ticker}")
+        except Exception as exc:
+            logger.warning("await_fills failed for %s: %s", oid, exc)
 
     def _position_qty(self, ticker: str) -> int:
         """Current share count held for `ticker` (0 when flat/unknown)."""
@@ -637,9 +714,17 @@ class TradingSystem:
 
     @staticmethod
     def _append_bar(history: pd.DataFrame, bar: pd.Series) -> pd.DataFrame:
+        """
+        Append one bar, deduplicating on the timestamp index: a re-delivered
+        bar (same timestamp) REPLACES the stored row rather than duplicating
+        it.  Duplicated rows previously turned every rolling feature into
+        garbage (ret_1d = 0, collapsed vol) once the poll loop re-delivered
+        the latest bar each iteration.
+        """
         row = bar.to_frame().T
         row.columns = [c.lower() for c in row.columns]
-        return pd.concat([history, row])
+        out = pd.concat([history, row])
+        return out[~out.index.duplicated(keep="last")].sort_index()
 
     def _alert(self, message: str, severity: str, key: Optional[str] = None) -> None:
         if self._alerts is not None:

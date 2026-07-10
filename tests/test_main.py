@@ -57,6 +57,17 @@ def _make_ohlcv(n: int = 340, seed: int = 21) -> pd.DataFrame:
     }, index=dates)
 
 
+def _bars_after(n: int = 1, seed: int = 99, start: str = "2022-06-01") -> pd.DataFrame:
+    """
+    Bars dated AFTER the default 340-bar training window (which ends
+    ~2022-04).  run_once skips bars whose timestamp already exists in the
+    history ("stale_bar"), so live-loop tests must feed genuinely new bars.
+    """
+    df = _make_ohlcv(n, seed=seed)
+    df.index = pd.bdate_range(start, periods=n)
+    return df
+
+
 class FakeClient:
     """Stand-in for AlpacaClient with no network."""
     def __init__(self, equity=100_000.0, is_open=True, status="ACTIVE"):
@@ -190,24 +201,24 @@ class TestStartup:
 class TestMainLoop:
 
     def test_run_once_returns_decision(self, started_system):
-        bar = _make_ohlcv(1, seed=99).iloc[-1]
+        bar = _bars_after(1, seed=99).iloc[-1]
         decision = started_system.run_once("AAA", bar)
         assert decision["ticker"] == "AAA"
         assert "action" in decision
 
     def test_run_once_unknown_ticker(self, started_system):
-        bar = _make_ohlcv(1).iloc[-1]
+        bar = _bars_after(1).iloc[-1]
         decision = started_system.run_once("ZZZ", bar)
         assert decision["action"] == "none"
 
     def test_run_once_increments_bar_count(self, started_system):
         before = started_system._bars_processed
-        bar = _make_ohlcv(1, seed=7).iloc[-1]
+        bar = _bars_after(1, seed=7).iloc[-1]
         started_system.run_once("AAA", bar)
         assert started_system._bars_processed == before + 1
 
     def test_run_with_finite_bar_source(self, started_system):
-        feed = _make_ohlcv(5, seed=5)
+        feed = _bars_after(5, seed=5)
         bars = iter([{"AAA": feed.iloc[i]} for i in range(5)])
 
         def source():
@@ -217,7 +228,7 @@ class TestMainLoop:
         assert started_system._bars_processed >= 5
 
     def test_run_respects_max_iterations(self, started_system):
-        feed = _make_ohlcv(50, seed=3)
+        feed = _bars_after(50, seed=3)
         counter = {"i": 0}
 
         def source():
@@ -230,12 +241,12 @@ class TestMainLoop:
         assert started_system._bars_processed == 3
 
     def test_run_once_produces_known_action(self, started_system):
-        bar = _make_ohlcv(1, seed=1).iloc[-1]
+        bar = _bars_after(1, seed=1).iloc[-1]
         decision = started_system.run_once("AAA", bar)
         assert decision["action"] in {
             "none", "waiting_for_stable_regime", "order_submitted",
             "rejected_by_risk", "halted", "flatten",
-            "hold", "no_change", "skipped_market_closed",
+            "hold", "no_change", "skipped_market_closed", "stale_bar",
         }
 
     def test_run_once_diffs_against_existing_position(self, started_system, monkeypatch):
@@ -245,7 +256,7 @@ class TestMainLoop:
         on every bar.  We simulate a filled book and require that the next
         bar never re-buys the whole target again.
         """
-        bar = _make_ohlcv(1, seed=13).iloc[-1]
+        bar = _bars_after(1, seed=13).iloc[-1]
         decision1 = started_system.run_once("AAA", bar)
         if decision1.get("action") != "order_submitted":
             pytest.skip("no entry signal for this seed — nothing to diff")
@@ -255,12 +266,90 @@ class TestMainLoop:
         # Simulate the fill: the book now holds exactly the target quantity.
         monkeypatch.setattr(started_system, "_position_qty", lambda t: target)
 
-        bar2 = _make_ohlcv(2, seed=13).iloc[-1]
+        bar2 = _bars_after(2, seed=13).iloc[-1]
         decision2 = started_system.run_once("AAA", bar2)
         # Already at target → at most a small delta may trade, never the
         # full size again (the old loop bought `target` shares EVERY bar).
         if decision2.get("action") == "order_submitted":
             assert decision2["qty"] < target
+
+
+# ---------------------------------------------------------------------------
+# 2b. Bar hygiene — the live loop must act once per NEW bar
+# ---------------------------------------------------------------------------
+
+class TestBarHygiene:
+
+    def test_redelivered_bar_is_skipped(self, started_system):
+        """
+        The poll loop re-delivers the latest (possibly still-forming) bar
+        many times per day.  Re-delivery must not re-run the decision
+        pipeline (this once produced one duplicate order per minute).
+        """
+        bar = _bars_after(1, seed=11).iloc[-1]
+        started_system.run_once("AAA", bar)
+        before = started_system._bars_processed
+        decision = started_system.run_once("AAA", bar)
+        assert decision["action"] == "stale_bar"
+        assert started_system._bars_processed == before
+
+    def test_redelivered_bar_updates_row_in_place(self, started_system):
+        """A re-delivered timestamp replaces the stored row (keep=last)."""
+        bar = _bars_after(1, seed=11).iloc[-1].copy()
+        started_system.run_once("AAA", bar)
+        n = len(started_system._states["AAA"].history)
+        bar["close"] = float(bar["close"]) * 1.01   # intraday update
+        started_system.run_once("AAA", bar)
+        hist = started_system._states["AAA"].history
+        assert len(hist) == n
+        assert float(hist["close"].iloc[-1]) == pytest.approx(float(bar["close"]))
+
+    def test_stale_training_bar_is_skipped(self, started_system):
+        """A bar whose timestamp already sits in the training history is stale."""
+        stale = _make_ohlcv(1, seed=42).iloc[-1]   # 2021-01-01 — inside training
+        decision = started_system.run_once("AAA", stale)
+        assert decision["action"] == "stale_bar"
+
+    def test_history_is_capped(self, started_system, monkeypatch):
+        import main as main_mod
+        monkeypatch.setattr(main_mod, "_MAX_HISTORY_BARS", 345)
+        bars = _bars_after(10, seed=17)
+        for i in range(10):
+            started_system.run_once("AAA", bars.iloc[i])
+        assert len(started_system._states["AAA"].history) <= 345
+
+
+# ---------------------------------------------------------------------------
+# 2c. Pause recovery
+# ---------------------------------------------------------------------------
+
+class TestPauseRecovery:
+
+    def test_paused_system_resumes_when_probe_succeeds(self, tmp_path):
+        sys_ = _make_system(tmp_path)
+        sys_.startup()
+        sys_._paused = True
+        assert sys_._attempt_resume() is True
+        assert sys_._paused is False
+
+    def test_stays_paused_while_probe_fails(self, tmp_path):
+        sys_ = _make_system(tmp_path)
+        sys_.startup()
+        sys_._paused = True
+        sys_._client.get_clock = MagicMock(side_effect=RuntimeError("still down"))
+        assert sys_._attempt_resume() is False
+        assert sys_._paused is True
+
+    def test_resume_probe_is_rate_limited(self, tmp_path):
+        sys_ = _make_system(tmp_path)
+        sys_.startup()
+        sys_._paused = True
+        sys_._client.get_clock = MagicMock(side_effect=RuntimeError("down"))
+        sys_._attempt_resume()
+        sys_._client.get_clock = MagicMock(return_value={"is_open": True})
+        # Immediately after a probe the next attempt is throttled.
+        assert sys_._attempt_resume() is False
+        assert sys_._paused is True
 
 
 # ---------------------------------------------------------------------------

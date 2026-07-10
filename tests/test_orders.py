@@ -269,3 +269,26 @@ class TestAwaitFills:
         ex = OrderExecutor(client, _tracker_with({}))
         result = ex.await_fills(["oid-1"], timeout=2)
         assert result["oid-1"]["filled_qty"] == 3
+
+
+# ---------------------------------------------------------------------------
+# OrderExecutor.submit_order — idempotency key
+# ---------------------------------------------------------------------------
+
+class TestClientOrderId:
+
+    def test_client_order_id_forwarded_to_request(self):
+        client = MagicMock()
+        client.trading.submit_order.return_value = _FakeOrder("oid-1")
+        ex = OrderExecutor(client, _tracker_with({}))
+        ex.submit_order("SPY", 5, "buy", client_order_id="rt-SPY-2026-07-10-buy")
+        request = client.trading.submit_order.call_args.args[0]
+        assert request.client_order_id == "rt-SPY-2026-07-10-buy"
+
+    def test_no_client_order_id_by_default(self):
+        client = MagicMock()
+        client.trading.submit_order.return_value = _FakeOrder("oid-1")
+        ex = OrderExecutor(client, _tracker_with({}))
+        ex.submit_order("SPY", 5, "buy")
+        request = client.trading.submit_order.call_args.args[0]
+        assert not hasattr(request, "client_order_id")

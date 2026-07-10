@@ -82,10 +82,16 @@ class OrderExecutor:
         order_type: str = "market",
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
     ) -> str:
         """
         Submit a market, limit, or stop order and return its broker order ID.
         Returns "" on zero qty or a rejected submission.
+
+        `client_order_id` makes the submission idempotent: Alpaca rejects a
+        second order carrying the same id, so an accidental re-submission of
+        the same decision surfaces as a rejection instead of silently
+        doubling the position.
         """
         if qty <= 0:
             return ""
@@ -97,24 +103,26 @@ class OrderExecutor:
 
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
         tif = TimeInForce.DAY
+        extra = {"client_order_id": client_order_id} if client_order_id else {}
 
         if order_type == "limit":
             if limit_price is None:
                 raise ValueError("limit order requires limit_price")
             request = LimitOrderRequest(
                 symbol=ticker, qty=qty, side=order_side,
-                time_in_force=tif, limit_price=limit_price,
+                time_in_force=tif, limit_price=limit_price, **extra,
             )
         elif order_type == "stop":
             if stop_price is None:
                 raise ValueError("stop order requires stop_price")
             request = StopOrderRequest(
                 symbol=ticker, qty=qty, side=order_side,
-                time_in_force=tif, stop_price=stop_price,
+                time_in_force=tif, stop_price=stop_price, **extra,
             )
         else:
             request = MarketOrderRequest(
                 symbol=ticker, qty=qty, side=order_side, time_in_force=tif,
+                **extra,
             )
 
         try:

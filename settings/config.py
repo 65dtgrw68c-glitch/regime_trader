@@ -91,20 +91,31 @@ STRATEGY = {
 # Change this ONLY on the basis of an experiment-grid result
 # (scripts/run_experiments.py) confirmed on a ticker you did not tune on.
 # An empty dict = the orchestrator's legacy defaults.
+# (main.py additionally injects max_exposure=RISK["max_position_size"];
+# an explicit key here would override that.)
 #
-# Pinned 2026-07-09 from the SPY+QQQ walk-forward grid ("tc_vol15"):
+# Pinned 2026-07-09 ("tc_vol15"), re-validated 2026-07-10 under the LIVE
+# configuration (exposure cap 0.50 inside the orchestrator target, costs
+# 2 bps slippage / zero commission charged to equity, daily breakers off) —
+# see experiments_report_{spy,qqq,iwm}_v2.md:
 #   * trend_core  — SMA-200 trend rule IS the allocation; the HMM regime
 #     tiers no longer drive it (they were measured to subtract value on
 #     both tickers, even as a mere risk overlay).
-#   * vol_target 0.15 — scale exposure down when realised vol exceeds 15%
-#     annualised; cut drawdowns on BOTH tickers (SPY -22%→-19%, QQQ
-#     -21%→-13%) and lifted QQQ Sharpe 0.68→0.93.
-# Result vs the old regime-driven defaults: SPY -6.7%→+30.2%,
-# QQQ +19.6%→+72.8% (1496/1495 bars, walk-forward, net of costs).
-# Out-of-sample check on IWM (never used for tuning): +0.1% — i.e. roughly
-# flat on a choppy ticker where PURE trend lost -23% and where even the
-# costless sma_200 benchmark badly lags buy&hold. The profile degrades
-# gracefully where trend has no edge; it does not manufacture one.
+#   * vol_target 0.15 — scales exposure down when realised 21d vol exceeds
+#     15% annualised.  NOTE: under the 0.50 cap it only binds when the
+#     vol-scale drops below 0.5 (realised vol > 30%), so it now trims only
+#     the worst episodes (QQQ DD -10.3%→-10.2%, IWM -14.4%→-14.2%, SPY
+#     unchanged).  Kept: never worse than plain trend_core on any ticker,
+#     and it restores the full DD protection automatically if the cap is
+#     ever raised.
+# v2 walk-forward results (net of costs, at the 0.50 cap):
+#   SPY  +23.0% / Sharpe 0.78 / DD -11.0%   (bench sma_200@100%: 0.77 / -20.6%)
+#   QQQ  +45.1% / Sharpe 1.01 / DD -10.2%   (bench sma_200@100%: 1.00 / -19.6%)
+#   IWM   +8.0% / Sharpe 0.24 / DD -14.2%   (never tuned on; degrades
+#     gracefully where trend has no edge — costless sma_200 bench: 0.30)
+# Candidate NOT pinned: tc_confirm3 (3-bar trend confirm) leads on QQQ/IWM
+# but trails on SPY — inconsistent ranking = no robust edge; re-test it
+# pre-registered on fresh data before ever switching.
 ORCHESTRATOR: dict = {
     "trend_core": True,
     "vol_target": 0.15,
@@ -143,7 +154,21 @@ RISK = {
     # ── EDIT THIS to change how much you risk on any single trade ──────────
     "max_risk_per_trade": 0.01,    # 1% of portfolio at risk per trade
 
-    # ── Hardcoded circuit-breaker trigger levels (non-negotiable) ──────────
+    # ── Hardcoded circuit-breaker trigger levels ────────────────────────────
+    # Daily HALVE/FLATTEN breakers on/off.  They measure CLOSE-to-close
+    # equity on a daily-bar system, i.e. they fire only after the loss is
+    # fully realised, sell the low, and the drift trigger re-buys the next
+    # bar.  Disabled 2026-07-10 on three independent measurements:
+    #   * cap 1.0 walk-forward (SPY): breakers cost -12pp return / -0.16
+    #     Sharpe with an IDENTICAL max drawdown,
+    #   * cap 0.5 grid (SPY/QQQ/IWM v2 reports): *_nocb rows identical —
+    #     the breakers never fire at half exposure, so disabling is free,
+    #   * synthetic -10..-15% crash injections (3 seeds): max DD and return
+    #     identical with breakers on vs off — the -10% HALT and the vol
+    #     target already provide the tail protection.
+    # The weekly breaker and the -10% HALT (tail protection, manual review)
+    # are NOT affected by this flag and stay active.
+    "cb_daily_enabled": False,
     # Single-day loss → halve all position sizes
     "cb_daily_halve_loss": 0.02,   # -2% intraday
     # Single-day loss → close ALL positions immediately
@@ -167,6 +192,11 @@ RISK = {
     # Rolling window (bars) used to estimate pairwise correlations
     "correlation_lookback": 60,
 
+    # ── Regime leverage caps ───────────────────────────────────────────────
+    # Apply REGIME_LEVERAGE_CAPS in validate_order?  False = parity with the
+    # backtester (which never modelled the caps); see REGIME_LEVERAGE_CAPS.
+    "use_regime_leverage_caps": False,
+
     # ── Lock file ──────────────────────────────────────────────────────────
     # Path to the halt lock file written on the 10% drawdown breaker.
     # The bot refuses to start while this file exists.
@@ -176,7 +206,13 @@ RISK = {
 # ---------------------------------------------------------------------------
 # Per-regime leverage caps (overrides RISK["max_leverage"] when a regime
 # is active).  Keyed by regime label string from hmm_engine._LABEL_MAPS.
-# ── EDIT THESE to tune how much leverage each regime is allowed ───────────
+#
+# DISABLED for the pinned trend-core profile (see RISK flag below): the
+# backtests that validated the profile never applied these caps (the
+# backtester does not call validate_order), so leaving them active live
+# made the demoted HMM an untested hard entry gate — a noisy "Bear"/"Weak"
+# label blocked every trend-core buy.  Re-enable ONLY together with a
+# backtest that actually models the gate.
 # ---------------------------------------------------------------------------
 REGIME_LEVERAGE_CAPS = {
     "Euphoria":    1.25,
@@ -197,18 +233,23 @@ BACKTEST = {
     "start_date": "2015-01-01",
     # Full historical end date (ISO format); None means today
     "end_date": None,
-    # Walk-forward training window (calendar days)
-    "train_window_days": 504,
-    # Walk-forward test window (calendar days)
-    "test_window_days": 63,
+    # Walk-forward windows in BARS — aligned with the Backtester defaults
+    # actually used by the harness (the old 504/63 "calendar days" values
+    # were read by nothing and disagreed with every published report).
+    "train_window_bars": 252,
+    "test_window_bars": 126,
     # Bar frequency: "1Day", "1Hour", etc. (Alpaca notation)
     "bar_timeframe": "1Day",
     # Initial paper capital for simulation
     "initial_capital": 100_000,
-    # Estimated round-trip commission per trade (fraction)
-    "commission": 0.001,
-    # Estimated slippage per trade (fraction)
-    "slippage": 0.0005,
+    # Commission per fill (fraction of notional).  Alpaca US equities are
+    # commission-free; the old 0.001 (10 bps) overstated costs ~10× and
+    # systematically biased variant selection toward low-turnover configs.
+    "commission": 0.0,
+    # Slippage per fill (fraction), charged against equity by the
+    # backtester: half-spread + impact + timing noise for SPY/QQQ-class
+    # liquidity.  Stress-test any variant choice at 2×/4× this value.
+    "slippage": 0.0002,
 }
 
 # ---------------------------------------------------------------------------

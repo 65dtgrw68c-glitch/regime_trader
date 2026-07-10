@@ -130,6 +130,22 @@ VARIANTS: list[tuple[str, dict, str]] = [
         {"strategy_overrides": {"trend_core": True, "vol_target": 0.15}},
         "trend core + 15% annualised vol target",
     ),
+    # ── Risk-layer A/B: daily HALVE/FLATTEN breakers on vs off ─────────────
+    # The daily breakers measure close-to-close equity on a daily system:
+    # they fire after the loss is realised, sell the low, and the drift
+    # trigger re-buys next bar.  These rows measure what that whipsaw costs.
+    (
+        "trend_core_nocb",
+        {"strategy_overrides": {"trend_core": True},
+         "risk_overrides": {"cb_daily_enabled": False}},
+        "pure SMA-200 core, daily -2%/-3% breakers OFF",
+    ),
+    (
+        "tc_vol15_nocb",
+        {"strategy_overrides": {"trend_core": True, "vol_target": 0.15},
+         "risk_overrides": {"cb_daily_enabled": False}},
+        "trend core + vol target, daily -2%/-3% breakers OFF",
+    ),
 ]
 
 
@@ -371,11 +387,17 @@ def main(argv: list[str] | None = None) -> int:
             rows.append({"variant": name, "error": str(exc)})
 
     rows.sort(key=lambda r: r.get("sharpe", float("-inf")), reverse=True)
+    from settings import config as _cfg
     meta = (
         f"Data: **{source}**, {len(data)} bars "
         f"({data.index[0].date()} … {data.index[-1].date()})  \n"
         f"Walk-forward: train={args.train_window} / test={args.test_window}, "
         f"seed={args.seed}  \n"
+        f"Costs: commission={_cfg.BACKTEST['commission']:.4f}, "
+        f"slippage={_cfg.BACKTEST['slippage']:.4f} per fill (charged to equity)  \n"
+        f"Exposure cap (RISK.max_position_size): "
+        f"{_cfg.RISK['max_position_size']:.2f} — strategy rows are capped at "
+        f"this fraction of equity, benchmarks run at 100%.  \n"
         f"⚠️ Benchmarks ignore costs. Do not tune until the best row looks "
         f"good — confirm any winner out-of-sample before going live."
     )

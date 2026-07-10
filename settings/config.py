@@ -165,13 +165,21 @@ RISK = {
     # Peak-to-trough drawdown limit triggering full halt (fraction)
     "max_drawdown_limit": 0.10,
     # Per-trade protective exits, simulated intraday by the backtester
-    # against each bar's low/high (0.0 = disabled).  DISABLED by default:
-    # for a daily-bar trend system the exit IS the signal (SMA-200 flip,
-    # vol targeting, portfolio breakers).  A tight stop re-creates the
-    # measured sell-low/rebuy-next-open whipsaw of the daily breakers, and
-    # a take-profit caps exactly the right-tail trades a trend follower
-    # lives on.  See the stop/TP sweep (experiments_report_stops.md)
-    # before ever turning these on.
+    # against each bar's low/high (0.0 = disabled).  DISABLED — measured,
+    # not assumed (experiments_report_stops.md, 28y SPY+QQQ, pinned
+    # profile, 2026-07-10):
+    #   * the legacy 2%/4% pair these keys used to advertise would have
+    #     cost 0.12-0.19 Sharpe AND worsened max drawdown on BOTH tickers
+    #     (SPY 0.84→0.72 / DD -10.5%→-13.2%; QQQ 0.84→0.65 / -14.7%→-17.7%)
+    #     at ~3x the trades;
+    #   * NO stop level (2/5/10/15%) improved anything consistently: every
+    #     config is <= baseline on QQQ, and SPY's best rows (+0.01/+0.02
+    #     Sharpe) are inside the noise band with worse DD or more trades;
+    #   * even a 15% "disaster stop" never fires on SPY and sold lows for
+    #     nothing on QQQ.
+    # For a daily-bar trend system the exit IS the signal (SMA-200 flip,
+    # vol targeting, portfolio breakers).  Turning these on requires a new
+    # sweep that beats baseline on a ticker you did not tune on.
     "stop_loss_pct": 0.0,
     "take_profit_pct": 0.0,
     # Volatility scaling: target annualised portfolio vol

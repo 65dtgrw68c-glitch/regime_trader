@@ -245,6 +245,37 @@ def fetch_yahoo(symbol: str, bars: int, range_str: str = "30y") -> pd.DataFrame:
     return out
 
 
+def fetch_tbill_yields(range_str: str = "30y") -> pd.Series:
+    """
+    Daily annualised 13-week T-bill yields (^IRX, decimals) from Yahoo.
+
+    Feeds the backtester's idle-cash credit with the REAL risk-free rate
+    instead of a flat approximation — bills paid ~5% pre-2008 and in
+    2023-24 but ~0% in 2020-21, which materially changes what long cash
+    stretches were worth.
+    """
+    import requests
+
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EIRX"
+    params = {"range": range_str, "interval": "1d"}
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    result = resp.json()["chart"]["result"][0]
+    ts = (
+        pd.to_datetime(result["timestamp"], unit="s", utc=True)
+        .tz_convert("America/New_York").tz_localize(None).normalize()
+    )
+    close = result["indicators"]["quote"][0]["close"]
+    ser = pd.Series(close, index=ts, name="tbill").dropna() / 100.0
+    ser = ser[~ser.index.duplicated(keep="last")].sort_index()
+    if len(ser) < 100:
+        raise ValueError(f"Only {len(ser)} ^IRX observations — too few.")
+    print(f"Got {len(ser)} ^IRX yields ({ser.index[0].date()} … "
+          f"{ser.index[-1].date()}, last={ser.iloc[-1]:.2%}).")
+    return ser
+
+
 def fetch_stooq(symbol: str) -> pd.DataFrame:
     """Download full daily history for `symbol` from Stooq."""
     if "." not in symbol and "^" not in symbol:
@@ -448,6 +479,19 @@ def main(argv: list[str] | None = None) -> int:
         data = fetch_alpaca(args.ticker, args.bars).iloc[-args.bars:]
         source = f"{args.ticker} via Alpaca (IEX feed)"
 
+    # Real risk-free series for the idle-cash credit; flat fallback offline.
+    if args.synthetic:
+        tbill, yield_note = None, "flat (synthetic run)"
+    else:
+        try:
+            tbill = fetch_tbill_yields()
+            yield_note = "^IRX daily series"
+        except Exception as exc:
+            tbill = None
+            yield_note = "flat fallback (^IRX fetch failed)"
+            print(f"^IRX fetch failed ({exc}) — using flat "
+                  f"cash_yield_annual from config.")
+
     rows: list[dict] = []
     benchmarks_row: list[dict] = []
     for name, kwargs, desc in VARIANTS:
@@ -459,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
                 train_window=args.train_window,
                 test_window=args.test_window,
                 random_seed=args.seed,
+                cash_yield_series=tbill,
                 **kwargs,
             )
             res = bt.run(data)
@@ -487,10 +532,11 @@ def main(argv: list[str] | None = None) -> int:
         f"seed={args.seed}  \n"
         f"Costs: commission={_cfg.BACKTEST['commission']:.4f}, "
         f"slippage={_cfg.BACKTEST['slippage']:.4f} per fill (charged to equity)  \n"
-        f"Execution: decisions on bar close fill at the NEXT bar's open; "
-        f"idle cash earns "
-        f"{_cfg.BACKTEST.get('cash_yield_annual', 0.0):.1%} p.a. (also credited "
-        f"to sma_200/random benchmarks' idle bars)  \n"
+        f"Execution: decisions on bar close fill at the NEXT bar's open "
+        f"(benchmarks use the SAME timing, costless); idle cash earns "
+        f"{yield_note} (flat fallback "
+        f"{_cfg.BACKTEST.get('cash_yield_annual', 0.0):.1%} p.a.), credited to "
+        f"strategy and sma_200/random benchmarks alike  \n"
         f"Exposure cap (RISK.max_position_size): "
         f"{_cfg.RISK['max_position_size']:.2f} — strategy rows are capped at "
         f"this fraction of equity, benchmarks run at 100%.  \n"

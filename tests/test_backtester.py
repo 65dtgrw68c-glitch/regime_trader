@@ -498,3 +498,50 @@ class TestCashYield:
         assert total_return(b5["buy_and_hold"]) == pytest.approx(
             total_return(b0["buy_and_hold"])
         )
+
+
+# ---------------------------------------------------------------------------
+# 12. Benchmark execution timing + T-bill yield series
+# ---------------------------------------------------------------------------
+
+class TestBenchmarkTimingAndYieldSeries:
+
+    def test_benchmark_timing_matches_close_fill_when_gapless(self):
+        """
+        Benchmarks now fill at the next open like the strategy.  On data
+        with NO overnight gaps (open_i == close_{i-1}) the next-open and
+        close-fill formulations are mathematically identical — a direct
+        check that the timing decomposition is wired correctly.
+        """
+        data = _make_ohlcv(420, seed=9)
+        data["open"] = data["close"].shift(1).fillna(data["close"].iloc[0])
+        bt = Backtester(ticker="T", train_window=120, test_window=60,
+                        random_seed=9, cash_yield_annual=0.0)
+        res = bt.run(data)
+        sma_bench = res.benchmark_returns["sma_200"]
+        close = data["close"]
+        invested = (close > close.rolling(200).mean()).shift(1).fillna(False)
+        ref = (close.pct_change().fillna(0.0) * invested.astype(float))
+        ref = ref.loc[sma_bench.index]
+        assert np.allclose(sma_bench.values, ref.values)
+
+    def test_cash_yield_series_equivalent_to_flat_rate(self):
+        """A constant yield series must reproduce the flat-rate path exactly."""
+        data = _make_ohlcv(420, seed=8)
+        ser = pd.Series(0.05, index=data.index)
+        common = dict(ticker="T", train_window=120, test_window=60,
+                      random_seed=8)
+        res_flat = Backtester(cash_yield_annual=0.05, **common).run(data)
+        res_ser = Backtester(cash_yield_annual=0.0, cash_yield_series=ser,
+                             **common).run(data)
+        assert np.allclose(res_flat.returns.values, res_ser.returns.values)
+
+    def test_yield_series_gaps_are_forward_filled(self):
+        """Sparse yield observations (weekly) must still cover every bar."""
+        data = _make_ohlcv(420, seed=8)
+        sparse = pd.Series(0.05, index=data.index[::5])   # every 5th bar only
+        bt = Backtester(ticker="T", train_window=120, test_window=60,
+                        random_seed=8, cash_yield_annual=0.0,
+                        cash_yield_series=sparse)
+        daily = bt._build_daily_yield(data.index)
+        assert (daily.iloc[1:] > 0).all()                 # ffilled everywhere

@@ -125,6 +125,7 @@ class Backtester:
         use_trend_filter: bool = True,
         strategy_overrides: Optional[dict] = None,
         risk_overrides: Optional[dict] = None,
+        cash_yield_series: Optional[pd.Series] = None,
     ) -> None:
         """
         use_trend_filter   : feed is_trend_confirmed() into the orchestrator
@@ -139,6 +140,12 @@ class Backtester:
                              so risk-layer settings can be A/B-tested with
                              the same walk-forward machinery.  Ignored when
                              an explicit risk_manager is injected.
+        cash_yield_series  : optional Series of ANNUALISED risk-free yields
+                             (decimals, DatetimeIndex, e.g. ^IRX/100) used
+                             for the idle-cash credit.  Dates are matched by
+                             calendar day and forward-filled; bars before
+                             the first yield observation fall back to the
+                             flat cash_yield_annual.  None = flat rate.
         """
         self.ticker        = ticker
         self.train_window  = train_window
@@ -153,6 +160,9 @@ class Backtester:
             cash_yield_annual if cash_yield_annual is not None
             else config.BACKTEST.get("cash_yield_annual", 0.0)
         )
+        self.cash_yield_series = cash_yield_series
+        # Per-bar daily yield aligned to the current run's data; built in run().
+        self._daily_yield: Optional[pd.Series] = None
         self.stop_loss_pct = (
             stop_loss_pct if stop_loss_pct is not None else config.RISK["stop_loss_pct"]
         )
@@ -210,6 +220,7 @@ class Backtester:
         data.columns = [c.lower() for c in data.columns]
         if inject_stress:
             data = self.inject_stress_events(data)
+        self._daily_yield = self._build_daily_yield(data.index)
 
         n_bars = len(data)
         splits = self.walk_forward_splits(n_bars)
@@ -347,12 +358,6 @@ class Backtester:
         # advantage the live bot can never have, systematically flattering
         # trend flips on crash days.)
         pending: Optional[dict] = None
-        # Idle cash earns a flat daily yield (T-bill approximation) so a
-        # strategy that spends long stretches in cash is compared fairly.
-        daily_yield = (
-            (1.0 + self.cash_yield_annual) ** (1.0 / 252) - 1.0
-            if self.cash_yield_annual > 0 else 0.0
-        )
 
         for i in range(split.test_start, split.test_end):
             bar_open  = float(data["open"].iloc[i])
@@ -394,7 +399,12 @@ class Backtester:
                 pending = None
 
             # ── 2) Mark-to-market: old position over the overnight gap,
-            #    new position over the intraday move, plus cash yield. ─────
+            #    new position over the intraday move, plus cash yield
+            #    (per-bar rate from the aligned T-bill series). ────────────
+            daily_yield = (
+                float(self._daily_yield.iloc[i])
+                if self._daily_yield is not None else 0.0
+            )
             pnl = (
                 pos_before * (bar_open - prev_close)
                 + position_shares * (bar_close - bar_open)
@@ -542,7 +552,7 @@ class Backtester:
         return {
             "buy_and_hold":   self._bench_buy_and_hold(oos_close),
             "sma_200":        self._bench_sma_trend(data, oos_index),
-            "random_entry":   self._bench_random_entry(oos_close),
+            "random_entry":   self._bench_random_entry(data, oos_index),
         }
 
     @staticmethod
@@ -552,41 +562,65 @@ class Backtester:
         rets.name = "buy_and_hold"
         return rets
 
-    def _daily_cash_yield(self) -> float:
-        """Per-bar yield credited on idle cash (0 when disabled)."""
-        if self.cash_yield_annual > 0:
-            return (1.0 + self.cash_yield_annual) ** (1.0 / 252) - 1.0
-        return 0.0
+    def _build_daily_yield(self, index: pd.Index) -> pd.Series:
+        """
+        Per-bar daily cash yield aligned to `index` (calendar-day matched,
+        forward-filled).  Uses the injected annualised-yield series when
+        given, otherwise the flat cash_yield_annual.
+        """
+        idx = pd.DatetimeIndex(index)
+        if self.cash_yield_series is not None and len(self.cash_yield_series):
+            ann = self.cash_yield_series.copy()
+            ann.index = pd.DatetimeIndex(ann.index).normalize()
+            ann = ann[~ann.index.duplicated(keep="last")].sort_index()
+            aligned = ann.reindex(idx.normalize(), method="ffill")
+            aligned = aligned.fillna(self.cash_yield_annual).clip(lower=0.0)
+        else:
+            aligned = pd.Series(self.cash_yield_annual, index=idx.normalize())
+        daily = (1.0 + aligned.astype(float)) ** (1.0 / 252) - 1.0
+        daily.index = idx
+        return daily
+
+    def _signal_bench_returns(self, data: pd.DataFrame, sig: pd.Series) -> pd.Series:
+        """
+        Per-bar returns for a long/flat signal series with the SAME
+        execution timing as the strategy: the signal known at close i takes
+        effect at open i+1.  Overnight into bar i is therefore held by
+        sig[i-2]'s position, intraday of bar i by sig[i-1]'s.  Idle bars
+        earn the per-bar cash yield.  Costless by design — benchmarks stay
+        the ideal reference, but no longer enjoy a timing advantage.
+        """
+        close, open_ = data["close"], data["open"]
+        pos_intra = sig.shift(1).fillna(0.0)
+        pos_over  = sig.shift(2).fillna(0.0)
+        r_over  = (open_ / close.shift(1) - 1.0).fillna(0.0)
+        r_intra = (close / open_ - 1.0).fillna(0.0)
+        yld = (
+            self._daily_yield if self._daily_yield is not None
+            else pd.Series(0.0, index=data.index)
+        )
+        return pos_over * r_over + pos_intra * r_intra + yld * (1.0 - pos_intra)
 
     def _bench_sma_trend(self, data: pd.DataFrame, oos_index: list) -> pd.Series:
-        """
-        Invested when close > 200-day SMA (computed causally), else cash.
-        Out-of-market bars earn the same cash yield as the strategy so the
-        comparison stays fair.  NOTE: the benchmark still fills at the
-        signal close (ideal, costless) while the strategy fills at the next
-        open with slippage — the strategy side is the conservative one.
-        """
+        """Long when close > 200-day SMA (causal), else cash — next-open fills."""
         close = data["close"]
         sma = close.rolling(200).mean()
-        invested = (close > sma).shift(1).fillna(False).astype(float)
-        asset_ret = close.pct_change().fillna(0.0)
-        rets = asset_ret * invested + self._daily_cash_yield() * (1.0 - invested)
-        bench = rets.loc[oos_index]
+        sig = (close > sma).astype(float)
+        bench = self._signal_bench_returns(data, sig).loc[oos_index]
         bench.name = "sma_200"
         return bench
 
-    def _bench_random_entry(self, oos_close: pd.Series) -> pd.Series:
+    def _bench_random_entry(self, data: pd.DataFrame, oos_index: list) -> pd.Series:
         """
-        Random long/flat entries (50/50) with the same per-bar return basis
-        (idle bars earn the cash yield).  Isolates whether the HMM adds
-        value beyond random timing.
+        Random long/flat entries (50/50) with the same execution timing and
+        cash yield.  Isolates whether the HMM adds value beyond random
+        timing.
         """
         rng = np.random.default_rng(self.random_seed + 1)
-        asset_ret = oos_close.pct_change().fillna(0.0)
-        signal = pd.Series(
-            rng.integers(0, 2, len(oos_close)), index=oos_close.index
-        ).shift(1).fillna(0.0).astype(float)
-        bench = asset_ret * signal + self._daily_cash_yield() * (1.0 - signal)
+        sig = pd.Series(
+            rng.integers(0, 2, len(data)).astype(float), index=data.index
+        )
+        bench = self._signal_bench_returns(data, sig).loc[oos_index]
         bench.name = "random_entry"
         return bench
 

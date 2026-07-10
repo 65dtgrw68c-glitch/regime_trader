@@ -109,13 +109,20 @@ STRATEGY = {
 #     worst episodes.  Kept: never worse than plain trend_core on any
 #     ticker, and it restores the full DD protection automatically if the
 #     cap is ever raised.
-# v3 walk-forward results for the tc_vol15 core (net of costs, 0.50 cap):
-#   SPY  +36.4% / Sharpe 1.14 / DD  -7.7%   (bench sma_200@100%: 0.92 / -18.3%)
-#   QQQ  +49.3% / Sharpe 1.09 / DD  -8.9%   (bench sma_200@100%: 1.01 / -19.1%)
-#   IWM  +21.3% / Sharpe 0.55 / DD -10.1%   (never tuned on; costless
-#     sma_200 bench: 0.46 — profile stays modestly ahead where trend is weak)
+# v4 walk-forward results for the PINNED profile (net of costs, 0.50 cap,
+# ^IRX cash yield, next-open fills for strategy AND benchmarks — see
+# experiments_report_{spy,qqq,iwm}_v4.md):
+#   SPY  +41.4% / Sharpe 1.27 / DD -7.7%   (bench sma_200@100%: 0.95 / -16.9%)
+#   QQQ  +61.5% / Sharpe 1.30 / DD -7.2%   (bench sma_200@100%: 1.02 / -18.9%)
+#   IWM  +30.0% / Sharpe 0.73 / DD -8.7%   (never tuned on; costless
+#     sma_200 bench: 0.52 — profile stays ahead where trend is weak)
+# JOINT BOOK (scripts/portfolio_check.py, 27y SPY+QQQ on shared equity):
+#   CAGR +9.1% / Sharpe 0.77 [0.45, 1.06] / DD -20.4%  vs  50/50 buy&hold
+#   +8.6% / 0.48 / DD -68.9% and costless 50/50 sma_200 +7.9% / 0.65 /
+#   -36.1%.  NOTE the joint DD is ~2x the single-name runs (SPY/QQQ draw
+#   down together) — see the cb_max_drawdown_halt comment in RISK.
 # HONESTY NOTE: the block-bootstrap 90% CIs on ~6y of data are wide (SPY
-# [0.42, 1.85]) and overlap almost completely across ALL trend-core
+# [0.50, 2.03]) and overlap almost completely across ALL trend-core
 # variants — short-window rankings alone are not decision-grade.
 #
 # trend_confirm_bars=3 added 2026-07-10 by a PRE-REGISTERED single-shot
@@ -191,7 +198,13 @@ RISK = {
     "cb_daily_flatten_loss": 0.03, # -3% intraday
     # Weekly loss → resize all remaining positions down
     "cb_weekly_resize_loss": 0.05, # -5% over a rolling week
-    # Peak-to-trough drawdown → stop the bot and write a lock file
+    # Peak-to-trough drawdown → stop the bot and write a lock file.
+    # KNOWN TRADE-OFF (2026-07-10 joint-book check): the two-ticker book's
+    # NORMAL max drawdown over 27 years is ~-20%, so this -10% halt WILL
+    # fire in every major bear market and stop the bot until the lock file
+    # is deleted by hand.  That is a defensible design (forced human review
+    # in crashes) but it is a choice, not a tail safeguard — raise toward
+    # ~0.20-0.25 only if you prefer the bot to ride bear markets through.
     "cb_max_drawdown_halt": 0.10,  # -10% from equity peak
 
     # Factor applied to position sizes when the "halve" breaker fires

@@ -214,7 +214,7 @@ def render_risk_panel(st, state: dict) -> None:                # pragma: no cove
         st.write(f"{light} {name.replace('_', ' ').title()}")
     dd = drawdown_pct(state.get("current_equity", 0.0), state.get("peak_equity", 0.0))
     st.metric("Drawdown", f"{dd:.2f}%",
-              f"limit -{config.RISK['max_drawdown_limit']*100:.0f}%")
+              f"limit -{config.RISK['cb_max_drawdown_halt']*100:.0f}%")
     st.metric("Leverage", f"{state.get('leverage', 0.0):.2f}x")
 
 

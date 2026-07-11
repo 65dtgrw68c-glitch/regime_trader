@@ -104,21 +104,22 @@ STRATEGY = {
 #     tiers no longer drive it (they were measured to subtract value on
 #     both tickers, even as a mere risk overlay).
 #   * vol_target 0.15 — scales exposure down when realised 21d vol exceeds
-#     15% annualised.  NOTE: under the 0.50 cap it only binds when the
-#     vol-scale drops below 0.5 (realised vol > 30%), so it trims only the
-#     worst episodes.  Kept: never worse than plain trend_core on any
-#     ticker, and it restores the full DD protection automatically if the
-#     cap is ever raised.
-# v4 walk-forward results for the PINNED profile (net of costs, 0.50 cap,
-# ^IRX cash yield, next-open fills for strategy AND benchmarks — see
-# experiments_report_{spy,qqq,iwm}_v4.md):
-#   SPY  +41.4% / Sharpe 1.27 / DD -7.7%   (bench sma_200@100%: 0.95 / -16.9%)
-#   QQQ  +61.5% / Sharpe 1.30 / DD -7.2%   (bench sma_200@100%: 1.02 / -18.9%)
-#   IWM  +30.0% / Sharpe 0.73 / DD -8.7%   (never tuned on; costless
+#     15% annualised.  Under the 0.50 cap it only binds when the vol-scale
+#     drops below 0.5 (realised vol > 30%) — but exactly those crash
+#     episodes are where it earns its keep: with the -20% halt (which no
+#     longer truncates crash windows) the 30y QQQ runs WITHOUT it blow out
+#     to DD -21.5% (confirm3 alone) / -27.2% (trend_core alone), while the
+#     pinned combo holds -14.7%.  The old -10% halt had masked this.
+# Walk-forward results for the PINNED profile (net of costs, 0.50 cap,
+# ^IRX cash yield, next-open fills for strategy AND benchmarks, -20% halt):
+#   SPY  +41.8% / Sharpe 1.27 / DD -7.7%   (bench sma_200@100%: 0.95 / -16.9%)
+#   QQQ  +61.7% / Sharpe 1.30 / DD -7.2%   (bench sma_200@100%: 1.02 / -18.9%)
+#   IWM  +29.7% / Sharpe 0.72 / DD -8.7%   (never tuned on; costless
 #     sma_200 bench: 0.52 — profile stays ahead where trend is weak)
+#   30y structural (per name): SPY 0.90 / -10.4%, QQQ 0.81 / -14.7%
 # JOINT BOOK (scripts/portfolio_check.py, 27y SPY+QQQ on shared equity):
-#   CAGR +9.1% / Sharpe 0.77 [0.45, 1.06] / DD -20.4%  vs  50/50 buy&hold
-#   +8.6% / 0.48 / DD -68.9% and costless 50/50 sma_200 +7.9% / 0.65 /
+#   CAGR +9.0% / Sharpe 0.75 [0.43, 1.04] / DD -20.8%  vs  50/50 buy&hold
+#   +8.6% / 0.49 / DD -68.9% and costless 50/50 sma_200 +7.9% / 0.65 /
 #   -36.1%.  NOTE the joint DD is ~2x the single-name runs (SPY/QQQ draw
 #   down together) — see the cb_max_drawdown_halt comment in RISK.
 # HONESTY NOTE: the block-bootstrap 90% CIs on ~6y of data are wide (SPY
@@ -160,18 +161,17 @@ RISK = {
     "max_position_size": 0.50,
     # Maximum gross leverage
     "max_leverage": 1.0,
-    # Daily drawdown limit triggering a circuit breaker (fraction)
-    "daily_drawdown_limit": 0.02,
-    # Peak-to-trough drawdown limit triggering full halt (fraction)
-    "max_drawdown_limit": 0.10,
+    # (The former daily_drawdown_limit / max_drawdown_limit keys were unused
+    # duplicates of cb_daily_halve_loss / cb_max_drawdown_halt — removed so
+    # there is a single source of truth for each threshold.)
     # Per-trade protective exits, simulated intraday by the backtester
     # against each bar's low/high (0.0 = disabled).  DISABLED — measured,
     # not assumed (experiments_report_stops.md, 28y SPY+QQQ, pinned
     # profile, 2026-07-10):
     #   * the legacy 2%/4% pair these keys used to advertise would have
     #     cost 0.12-0.19 Sharpe AND worsened max drawdown on BOTH tickers
-    #     (SPY 0.84→0.72 / DD -10.5%→-13.2%; QQQ 0.84→0.65 / -14.7%→-17.7%)
-    #     at ~3x the trades;
+    #     (SPY 0.84→0.72 / DD -10.3%→-13.9%; QQQ 0.81→0.62 / -14.7%→-16.7%)
+    #     at ~3-4x the trades;
     #   * NO stop level (2/5/10/15%) improved anything consistently: every
     #     config is <= baseline on QQQ, and SPY's best rows (+0.01/+0.02
     #     Sharpe) are inside the noise band with worse DD or more trades;
@@ -213,13 +213,21 @@ RISK = {
     # Weekly loss → resize all remaining positions down
     "cb_weekly_resize_loss": 0.05, # -5% over a rolling week
     # Peak-to-trough drawdown → stop the bot and write a lock file.
-    # KNOWN TRADE-OFF (2026-07-10 joint-book check): the two-ticker book's
-    # NORMAL max drawdown over 27 years is ~-20%, so this -10% halt WILL
-    # fire in every major bear market and stop the bot until the lock file
-    # is deleted by hand.  That is a defensible design (forced human review
-    # in crashes) but it is a choice, not a tail safeguard — raise toward
-    # ~0.20-0.25 only if you prefer the bot to ride bear markets through.
-    "cb_max_drawdown_halt": 0.10,  # -10% from equity peak
+    # RAISED 0.10 → 0.20 (owner decision 2026-07-10): the joint-book check
+    # showed the two-ticker book's NORMAL max drawdown over 27 years is
+    # ~-20% (2008, 2022), so a -10% halt sat inside the strategy's ordinary
+    # operating range and would have stopped the bot in every major bear
+    # market — the validated performance exists precisely because the
+    # trend rule trades THROUGH those phases and catches the recovery.
+    # At -20% the halt is a tail/malfunction safeguard rather than a
+    # scheduled bear-market shutdown.  The bot still de-risks in bears on
+    # its own (SMA-200 exit + vol target kept the joint DD near -20% vs
+    # -69% for 50/50 buy&hold).  CAVEAT (measured under this setting): the
+    # 27y joint-book DD is -20.8%, i.e. this halt would still have fired
+    # ONCE, at the very trough of the worst episode.  That is arguably
+    # exactly what a tail safeguard is for; raise to ~0.25 only if you
+    # want it strictly outside everything in 27 years of history.
+    "cb_max_drawdown_halt": 0.20,  # -20% from equity peak
 
     # Factor applied to position sizes when the "halve" breaker fires
     "cb_halve_factor": 0.50,

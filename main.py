@@ -792,17 +792,45 @@ class TradingSystem:
 # Entry points
 # ===========================================================================
 
+# Exit codes — meaningful to a supervisor (systemd) so it can distinguish a
+# transient crash (restart) from a state that needs a human (do NOT restart).
+EXIT_OK          = 0
+EXIT_STARTUP_ERR = 1   # transient/config startup failure → safe to retry
+EXIT_HALTED      = 3   # risk HALT lock present → needs manual review, NO restart
+
+
+def _halt_lock_present() -> bool:
+    """True when the risk-manager HALT lock file exists on disk."""
+    try:
+        from pathlib import Path
+        return Path(config.RISK["lock_file_path"]).exists()
+    except Exception:
+        return False
+
+
 def run_live() -> int:
     configure_logging()
+    # A present HALT lock means the -drawdown breaker fired and a human must
+    # review before resuming. Return a DISTINCT code so a Restart=always
+    # supervisor stops instead of restart-looping into the same wall.
+    if _halt_lock_present():
+        logger.critical("Risk HALT lock present (%s) — refusing to start. "
+                        "Review the incident and delete the file to resume.",
+                        config.RISK["lock_file_path"])
+        return EXIT_HALTED
     system = TradingSystem()
     if not system.startup():
+        # startup() also refuses on a lock that appeared between the check
+        # above and now; surface that as HALTED, everything else as retryable.
+        if _halt_lock_present():
+            return EXIT_HALTED
         logger.error("Startup failed — exiting.")
-        return 1
+        return EXIT_STARTUP_ERR
     try:
         system.run()
     except KeyboardInterrupt:
         system.shutdown(reason="keyboard interrupt")
-    return 0
+    return EXIT_OK
 
 
 def run_backtest() -> int:

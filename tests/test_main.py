@@ -28,7 +28,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.risk_manager import RiskManager
-from main import TradingSystem, ShutdownReport
+from main import (
+    TradingSystem, ShutdownReport, run_live,
+    EXIT_OK, EXIT_STARTUP_ERR, EXIT_HALTED, _halt_lock_present,
+)
 from monitoring.alerts import (
     AlertManager, SEVERITY_CRITICAL, SEVERITY_INFO, SEVERITY_WARNING,
 )
@@ -505,3 +508,56 @@ class TestModelRefit:
         started_system._refit_models("AAA", state)
         assert state.engine is old_engine
         assert state.feature_engineer is old_fe
+
+
+# ---------------------------------------------------------------------------
+# 6. run_live exit codes — a supervisor (systemd) must distinguish a
+#    transient crash (restart) from a HALT lock (needs a human, NO restart).
+# ---------------------------------------------------------------------------
+
+class TestRunLiveExitCodes:
+
+    def test_halt_lock_present_returns_exit_halted_without_startup(
+        self, tmp_path, monkeypatch
+    ):
+        """A present HALT lock must short-circuit to EXIT_HALTED BEFORE any
+        broker connection is attempted (so no network, no restart loop)."""
+        import main as main_mod
+        from settings import config
+
+        lock = tmp_path / "RISK_HALT.lock"
+        lock.write_text("{}")
+        monkeypatch.setitem(config.RISK, "lock_file_path", str(lock))
+
+        # If startup were reached it would try to build a real broker and hit
+        # the network; assert it is never constructed.
+        called = {"startup": False}
+        monkeypatch.setattr(
+            main_mod.TradingSystem, "startup",
+            lambda self: called.__setitem__("startup", True) or True,
+        )
+        monkeypatch.setattr(main_mod, "configure_logging", lambda *a, **k: None)
+
+        assert run_live() == EXIT_HALTED
+        assert called["startup"] is False
+
+    def test_startup_failure_without_lock_is_retryable(self, tmp_path, monkeypatch):
+        """A plain startup failure (no lock) returns the retryable code so the
+        supervisor DOES restart."""
+        import main as main_mod
+        from settings import config
+
+        monkeypatch.setitem(config.RISK, "lock_file_path",
+                            str(tmp_path / "absent.lock"))
+        monkeypatch.setattr(main_mod, "configure_logging", lambda *a, **k: None)
+        monkeypatch.setattr(main_mod.TradingSystem, "startup", lambda self: False)
+
+        assert run_live() == EXIT_STARTUP_ERR
+
+    def test_halt_lock_helper_reflects_disk(self, tmp_path, monkeypatch):
+        from settings import config
+        lock = tmp_path / "RISK_HALT.lock"
+        monkeypatch.setitem(config.RISK, "lock_file_path", str(lock))
+        assert _halt_lock_present() is False
+        lock.write_text("{}")
+        assert _halt_lock_present() is True

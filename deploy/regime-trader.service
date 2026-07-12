@@ -1,0 +1,48 @@
+[Unit]
+Description=regime_trader — HMM/trend-core paper trading bot
+Documentation=file:///opt/regime_trader/deploy/README.md
+# Only start once the network (and DNS) is actually up — the bot's first act
+# is to reach api.alpaca.markets.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=regime
+Group=regime
+WorkingDirectory=/opt/regime_trader
+# .env (Alpaca credentials) lives in the working dir and is loaded by
+# python-dotenv at startup; systemd also exports it so it is available even
+# before dotenv runs.
+EnvironmentFile=/opt/regime_trader/.env
+ExecStart=/opt/regime_trader/.venv/bin/python -u main.py
+# Unbuffered (-u) so `journalctl -f` shows log lines immediately.
+
+# ── Restart policy ─────────────────────────────────────────────────────────
+# Restart on any unexpected exit or crash, but back off so a hard failure
+# (e.g. bad credentials) does not hammer the API in a tight loop.
+Restart=always
+RestartSec=30
+# EXIT_HALTED (3): the -20% drawdown breaker fired and wrote the lock file.
+# The bot needs a human to review and delete it — do NOT restart into the
+# same wall. The service stops cleanly and shows as failed/exited instead.
+RestartPreventExitStatus=3
+# If it still crash-loops (5 starts in 5 min) give up rather than thrash;
+# `systemctl reset-failed regime-trader` clears this after you fix the cause.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# ── Sandboxing / hardening ─────────────────────────────────────────────────
+# The bot only needs to read its own dir and write logs/ + the lock file.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/regime_trader/logs /opt/regime_trader/data_cache
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

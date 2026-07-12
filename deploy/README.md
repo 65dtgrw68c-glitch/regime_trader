@@ -1,37 +1,38 @@
-# Deploying regime_trader as a 24/7 service (Oracle Cloud Free Tier)
+# Deploying regime_trader (Oracle Cloud Free Tier)
 
-This runs the bot as a hardened `systemd` service on an **Always-Free**
-Oracle Cloud Ampere (ARM) VM. It auto-restarts on crash, refuses to
-restart-loop into a risk-HALT, and survives host reboots.
+Runs the bot on an **Always-Free** Oracle Cloud Ampere (ARM) VM as a
+**scheduled once-a-day job**: a `systemd` timer fires shortly after the US
+open on trading days, the bot makes one decision per ticker, and exits. The
+host idles the rest of the time.
 
-> **Reality check.** The bot trades **daily bars** — it makes at most one
-> decision per ticker per day, shortly after the US open (~13:30 UTC). A 24/7
-> service is more than it strictly needs (a `systemd` timer firing once a day
-> would do), but you chose the always-on model, so this keeps a warm process
-> polling every 60s. It stays a **paper** account until you deliberately set
-> `PAPER=false` — don't do that until you've watched it trade for a while.
+> **Why scheduled, not always-on.** The strategy trades **daily bars** — it
+> makes at most one decision per ticker per day. `startup()` rebuilds all
+> state from scratch every run (history, HMM, position sync, stale-order
+> cancel), so a fresh ~15-second process each day is fully self-contained and
+> has no long-lived process to hang, leak, or babysit. (An always-on variant
+> is documented at the bottom if you ever want it.)
+>
+> It stays a **paper** account until you deliberately flip three switches
+> (see "Going live"). Don't, until you've watched it trade for a while.
 
 ---
 
 ## 1. Create the Free-Tier instance
 
 1. Oracle Cloud console → **Compute → Instances → Create Instance**.
-2. **Shape:** change to **Ampere / VM.Standard.A1.Flex**, 1 OCPU / 6 GB RAM
-   (well within Always-Free; the bot needs far less).
-3. **Image:** Canonical **Ubuntu 22.04** (or 24.04), aarch64.
-4. **SSH keys:** upload your public key (or let it generate one — save the
-   private key).
-5. Create, then note the instance's **public IP**.
+2. **Shape:** **Ampere / VM.Standard.A1.Flex**, 1 OCPU / 6 GB RAM
+   (well within Always-Free).
+3. **Image:** Canonical **Ubuntu 22.04** or 24.04, aarch64.
+4. **SSH keys:** upload your public key (or save the generated private key).
+5. Create; note the **public IP**.
 
-No inbound ports need opening — the bot only makes **outbound** HTTPS calls to
-Alpaca. Leave the default security list as-is (SSH in, everything out).
+No inbound ports needed — the bot only makes **outbound** HTTPS calls to
+Alpaca. Leave the default security list (SSH in, everything out).
 
 ## 2. First login & get the code
 
 ```bash
 ssh ubuntu@<PUBLIC_IP>
-
-# Clone your repo (or scp the directory up).
 sudo apt-get update -qq && sudo apt-get install -y git
 git clone <YOUR_REPO_URL> regime_trader
 cd regime_trader
@@ -43,13 +44,11 @@ cd regime_trader
 sudo bash deploy/setup.sh
 ```
 
-This creates the `regime` service user, copies the code to
-`/opt/regime_trader`, builds a venv with the **runtime** dependencies only,
-and installs + enables the `systemd` unit. Re-runnable any time.
+Creates the `regime` service user, copies code to `/opt/regime_trader`,
+builds a venv with **runtime** deps only, installs the service + timer, and
+enables the **timer**. Re-runnable any time.
 
 ## 4. Add your Alpaca credentials
-
-The setup script never touches secrets — you place them:
 
 ```bash
 sudo -u regime tee /opt/regime_trader/.env >/dev/null <<'EOF'
@@ -60,19 +59,23 @@ EOF
 sudo chmod 600 /opt/regime_trader/.env
 ```
 
-Use your **paper** keys from the Alpaca dashboard. `PAPER=true` keeps the bot
-on the paper endpoint regardless of anything else.
+Use your **paper** keys. `PAPER=true` pins the paper endpoint.
 
-## 5. Start it
+## 5. Arm the schedule & test once
 
 ```bash
-sudo systemctl start regime-trader
-journalctl -u regime-trader -f          # watch the 10-step startup live
+# Start the daily schedule
+sudo systemctl start regime-trader.timer
+systemctl list-timers regime-trader.timer      # confirm the next fire time
+
+# Run one cycle right now to prove it works end-to-end
+sudo systemctl start regime-trader.service
+journalctl -u regime-trader.service -f         # watch the 10-step startup + decision
 ```
 
-You should see `[startup 10/10] Startup complete.` and a `STATUS | ...` line.
-On a weekend/closed market it then goes quiet by design — the latest daily bar
-is already known, so each 60s poll is a no-op (`stale_bar`).
+The manual run does a full startup, one decision per ticker, then exits. On a
+weekend/holiday/closed market it is a clean no-op (`stale_bar` /
+`skipped_market_closed`) — that is expected.
 
 ## 6. Verify health
 
@@ -80,11 +83,12 @@ is already known, so each 60s poll is a no-op (`stale_bar`).
 bash /opt/regime_trader/deploy/healthcheck.sh
 ```
 
-All green = healthy. Wire it into cron for a heartbeat + alert:
+Wire it into cron as a daily heartbeat + alert (run it midday, after the
+morning fire):
 
 ```bash
 # /etc/cron.d/regime-trader-health
-*/15 * * * * root bash /opt/regime_trader/deploy/healthcheck.sh >/dev/null || \
+0 16 * * 1-5 root bash /opt/regime_trader/deploy/healthcheck.sh >/dev/null || \
   curl -fsS -X POST "$YOUR_WEBHOOK_URL" -d 'regime-trader UNHEALTHY'
 ```
 
@@ -94,27 +98,26 @@ All green = healthy. Wire it into cron for a heartbeat + alert:
 
 | Task | Command |
 |---|---|
-| Status | `systemctl status regime-trader` |
-| Live logs | `journalctl -u regime-trader -f` |
+| Next scheduled run | `systemctl list-timers regime-trader.timer` |
+| Last run's logs | `journalctl -u regime-trader.service -e` |
+| Follow a live run | `journalctl -u regime-trader.service -f` |
 | App log | `tail -f /opt/regime_trader/logs/app.log` |
-| Stop (graceful) | `sudo systemctl stop regime-trader` |
-| Restart | `sudo systemctl restart regime-trader` |
+| Run once now | `sudo systemctl start regime-trader.service` |
+| Pause the bot | `sudo systemctl stop regime-trader.timer` (+ `disable` to survive reboot) |
+| Resume | `sudo systemctl start regime-trader.timer` |
 | Update to latest code | `sudo bash deploy/update.sh` (from your checkout) |
 | Trades audit trail | `/opt/regime_trader/logs/trades.csv` |
 
 ### When the risk HALT fires (−20% drawdown)
 
-The bot writes `/opt/regime_trader/logs/RISK_HALT.lock`, stops, and exits with
-code **3**. `systemd` is configured (`RestartPreventExitStatus=3`) to **not**
-restart into it — the unit shows as failed/exited, which is correct: this
-state needs *you*.
+The bot writes `/opt/regime_trader/logs/RISK_HALT.lock` and every daily run
+becomes a no-op exit **3** (it checks the lock before doing anything). Nothing
+trades until you clear it:
 
 ```bash
 cat /opt/regime_trader/logs/RISK_HALT.lock     # read the incident report
-# ... review what happened ...
+# ... review ...
 sudo rm /opt/regime_trader/logs/RISK_HALT.lock # only after you've decided
-sudo systemctl reset-failed regime-trader
-sudo systemctl start regime-trader
 ```
 
 ### Going live (real money) — later, deliberately
@@ -124,20 +127,31 @@ sudo systemctl start regime-trader
 3. Set `BROKER["mode"] = "live"` in `settings/config.py`.
 4. `sudo bash deploy/update.sh`.
 
-Until all three are done it stays paper — there is no accidental path to real
-orders.
+Until all three are done it stays paper — no accidental path to real orders.
 
 ---
 
 ## Notes & caveats
 
-- **Data feed:** free Alpaca IEX daily bars are used (no SIP subscription
-  needed). If you ever see `subscription does not permit...` it means
-  something requested intraday SIP data — the daily path avoids it.
-- **Reboots:** the unit is `enabled`, so the bot comes back automatically
-  after an Oracle host reboot; `startup()` rebuilds all state (history, HMM,
-  positions) from scratch, and cancels any stale broker orders first.
-- **Clock:** the VM is pinned to UTC; the bot asks Alpaca for the market clock
-  rather than trusting local time, so DST is handled broker-side.
-- **This is not HA.** One VM, one process. For a paper daily-bar bot that is
-  entirely adequate. Don't add complexity you don't need.
+- **Firing time.** 09:35 ET, Mon-Fri, via `OnCalendar=Mon-Fri 09:35
+  America/New_York` — the explicit timezone means systemd tracks EST/EDT so
+  it stays 5 min after the open all year. Holidays fire but no-op.
+- **Decision vs fill timing.** The bot decides on today's fresh bar and
+  submits an immediate market order. The backtest models "decide on the
+  completed close, fill next open"; firing near the *close* and submitting
+  market-on-open orders for the next day would map that even more exactly —
+  a possible refinement, not required for a slow SMA-200 system.
+- **Missed runs.** `Persistent=true`: if the host was off at fire time it
+  runs on next boot rather than skipping the day.
+- **Reboots / data feed / clock:** free Alpaca IEX daily bars (no SIP sub);
+  `startup()` cancels stale broker orders first; the bot asks Alpaca for the
+  market clock rather than trusting local time.
+
+### Alternative: always-on daemon
+
+If you ever want a warm 24/7 process instead (e.g. moving to intraday bars),
+replace the oneshot `ExecStart` with `main.py` (no `--once`), set
+`Type=simple`, `Restart=always`, `RestartSec=30`,
+`RestartPreventExitStatus=3`, drop the timer, and `systemctl enable
+regime-trader.service` directly. The scheduled model above is the right
+default for daily bars.

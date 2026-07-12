@@ -1,39 +1,30 @@
 [Unit]
-Description=regime_trader — HMM/trend-core paper trading bot
+Description=regime_trader — one daily decision cycle (HMM/trend-core paper bot)
 Documentation=file:///opt/regime_trader/deploy/README.md
-# Only start once the network (and DNS) is actually up — the bot's first act
-# is to reach api.alpaca.markets.
+# The bot's first act is to reach api.alpaca.markets.
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# One decision cycle per ticker, then exit — driven by regime-trader.timer.
+# A daily-bar system only decides once a day, so the process runs for ~15s
+# and the host idles the rest of the day. This is NOT enabled directly;
+# enable regime-trader.timer instead.
+Type=oneshot
 User=regime
 Group=regime
 WorkingDirectory=/opt/regime_trader
-# .env (Alpaca credentials) lives in the working dir and is loaded by
-# python-dotenv at startup; systemd also exports it so it is available even
-# before dotenv runs.
 EnvironmentFile=/opt/regime_trader/.env
-ExecStart=/opt/regime_trader/.venv/bin/python -u main.py
-# Unbuffered (-u) so `journalctl -f` shows log lines immediately.
+ExecStart=/opt/regime_trader/.venv/bin/python -u main.py --once
 
-# ── Restart policy ─────────────────────────────────────────────────────────
-# Restart on any unexpected exit or crash, but back off so a hard failure
-# (e.g. bad credentials) does not hammer the API in a tight loop.
-Restart=always
-RestartSec=30
-# EXIT_HALTED (3): the -20% drawdown breaker fired and wrote the lock file.
-# The bot needs a human to review and delete it — do NOT restart into the
-# same wall. The service stops cleanly and shows as failed/exited instead.
-RestartPreventExitStatus=3
-# If it still crash-loops (5 starts in 5 min) give up rather than thrash;
-# `systemctl reset-failed regime-trader` clears this after you fix the cause.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# EXIT_HALTED (3): the -20% drawdown breaker fired. --once checks the lock
+# BEFORE any broker call and exits 3, so the next daily fire is a harmless
+# no-op until a human clears it. SuccessExitStatus keeps the unit from being
+# spammed as "failed" every day while halted (it is a known, surfaced state;
+# the healthcheck reports the lock separately).
+SuccessExitStatus=0 3
 
 # ── Sandboxing / hardening ─────────────────────────────────────────────────
-# The bot only needs to read its own dir and write logs/ + the lock file.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -44,5 +35,5 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section: this unit is triggered by the timer, not enabled
+# on its own.

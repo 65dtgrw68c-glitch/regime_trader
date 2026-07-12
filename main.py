@@ -833,6 +833,37 @@ def run_live() -> int:
     return EXIT_OK
 
 
+def run_once_daily() -> int:
+    """
+    One decision cycle for every ticker, then exit — the entry point for a
+    scheduled once-a-day run (systemd timer).  This is the natural cadence
+    for a DAILY-bar system: startup() rebuilds all state from scratch
+    (history, HMM, position sync, stale-order cancel), one poll cycle makes
+    at most one decision per ticker, then the process shuts down cleanly and
+    the host can idle until tomorrow.
+
+    Returns the same supervisor-friendly codes as run_live(): EXIT_HALTED
+    (3) when the risk lock is present so the timer's next fire is a harmless
+    no-op instead of trading into a halt that needs a human.
+    """
+    configure_logging()
+    if _halt_lock_present():
+        logger.critical("Risk HALT lock present (%s) — skipping daily run. "
+                        "Review the incident and delete the file to resume.",
+                        config.RISK["lock_file_path"])
+        return EXIT_HALTED
+    system = TradingSystem()
+    if not system.startup():
+        if _halt_lock_present():
+            return EXIT_HALTED
+        logger.error("Startup failed — exiting.")
+        return EXIT_STARTUP_ERR
+    # One poll cycle (no inter-iteration sleep); run() shuts itself down when
+    # the iteration budget is spent.
+    system.run(max_iterations=1, poll_interval=0)
+    return EXIT_HALTED if _halt_lock_present() else EXIT_OK
+
+
 def run_backtest() -> int:
     configure_logging()
     from core.backtester import Backtester
@@ -851,10 +882,18 @@ def run_backtest() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="regime_trader")
-    parser.add_argument("--backtest", action="store_true",
-                        help="run a historical backtest instead of live trading")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--backtest", action="store_true",
+                      help="run a historical backtest instead of live trading")
+    mode.add_argument("--once", action="store_true",
+                      help="run ONE decision cycle for every ticker then exit "
+                           "(scheduled once-a-day mode; see deploy/)")
     args = parser.parse_args()
-    return run_backtest() if args.backtest else run_live()
+    if args.backtest:
+        return run_backtest()
+    if args.once:
+        return run_once_daily()
+    return run_live()
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.risk_manager import RiskManager
 from main import (
-    TradingSystem, ShutdownReport, run_live,
+    TradingSystem, ShutdownReport, run_live, run_once_daily,
     EXIT_OK, EXIT_STARTUP_ERR, EXIT_HALTED, _halt_lock_present,
 )
 from monitoring.alerts import (
@@ -561,3 +561,60 @@ class TestRunLiveExitCodes:
         assert _halt_lock_present() is False
         lock.write_text("{}")
         assert _halt_lock_present() is True
+
+
+# ---------------------------------------------------------------------------
+# 7. run_once_daily — the scheduled (systemd timer) entry point runs exactly
+#    ONE poll cycle then exits, with the same halt-aware exit codes.
+# ---------------------------------------------------------------------------
+
+class TestRunOnceDaily:
+
+    def test_runs_one_cycle_then_exits_ok(self, tmp_path, monkeypatch):
+        import main as main_mod
+        from settings import config
+
+        monkeypatch.setitem(config.RISK, "lock_file_path",
+                            str(tmp_path / "absent.lock"))
+        monkeypatch.setattr(main_mod, "configure_logging", lambda *a, **k: None)
+
+        # Build a fake system that records how run() was invoked.
+        captured = {}
+        fake = MagicMock()
+        fake.startup.return_value = True
+        def _run(**kw): captured.update(kw)
+        fake.run.side_effect = _run
+        monkeypatch.setattr(main_mod, "TradingSystem", lambda *a, **k: fake)
+
+        assert run_once_daily() == EXIT_OK
+        fake.startup.assert_called_once()
+        # Exactly one poll cycle, no inter-iteration sleep.
+        assert captured.get("max_iterations") == 1
+        assert captured.get("poll_interval") == 0
+
+    def test_halt_lock_skips_before_startup(self, tmp_path, monkeypatch):
+        import main as main_mod
+        from settings import config
+
+        lock = tmp_path / "RISK_HALT.lock"
+        lock.write_text("{}")
+        monkeypatch.setitem(config.RISK, "lock_file_path", str(lock))
+        monkeypatch.setattr(main_mod, "configure_logging", lambda *a, **k: None)
+
+        built = {"n": 0}
+        monkeypatch.setattr(main_mod, "TradingSystem",
+                            lambda *a, **k: built.__setitem__("n", built["n"] + 1))
+        assert run_once_daily() == EXIT_HALTED
+        assert built["n"] == 0            # never constructed → no network
+
+    def test_startup_failure_is_retryable(self, tmp_path, monkeypatch):
+        import main as main_mod
+        from settings import config
+
+        monkeypatch.setitem(config.RISK, "lock_file_path",
+                            str(tmp_path / "absent.lock"))
+        monkeypatch.setattr(main_mod, "configure_logging", lambda *a, **k: None)
+        fake = MagicMock()
+        fake.startup.return_value = False
+        monkeypatch.setattr(main_mod, "TradingSystem", lambda *a, **k: fake)
+        assert run_once_daily() == EXIT_STARTUP_ERR

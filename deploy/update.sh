@@ -23,10 +23,14 @@ fi
 echo "==> git pull"
 git -C "$REPO_DIR" pull --ff-only
 
-echo "==> re-running setup (syncs code + deps)"
+echo "==> re-running setup (syncs code + deps, reinstalls units)"
 bash "$REPO_DIR/deploy/setup.sh"
 
-echo "==> restarting $SERVICE"
-systemctl restart "$SERVICE"
-sleep 3
-systemctl --no-pager --lines=15 status "$SERVICE" || true
+# Scheduled model: nothing long-running to restart — setup already did
+# daemon-reload and re-enabled the timer, so the NEXT daily fire runs the new
+# code. Just confirm the schedule is armed.
+echo "==> timer status"
+systemctl --no-pager list-timers "$SERVICE.timer" || true
+echo
+echo "Update applied. It takes effect on the next scheduled run"
+echo "(run 'sudo systemctl start $SERVICE.service' to exercise it now)."

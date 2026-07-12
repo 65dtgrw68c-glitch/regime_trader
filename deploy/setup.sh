@@ -76,11 +76,16 @@ else
     echo "     BEFORE starting the service (see deploy/README.md)."
 fi
 
-# ── 6) systemd unit ─────────────────────────────────────────────────────────
-log "Installing systemd unit"
+# ── 6) systemd unit + timer ─────────────────────────────────────────────────
+# Scheduled model: the TIMER is enabled (fires once per trading day and
+# triggers the oneshot service); the service itself is NOT enabled directly.
+log "Installing systemd service + timer"
 install -m 644 "$APP_DIR/deploy/$SERVICE.service" "/etc/systemd/system/$SERVICE.service"
+install -m 644 "$APP_DIR/deploy/$SERVICE.timer"   "/etc/systemd/system/$SERVICE.timer"
 systemctl daemon-reload
-systemctl enable "$SERVICE"
+# Drop any always-on enablement from a previous (daemon-mode) install.
+systemctl disable "$SERVICE.service" 2>/dev/null || true
+systemctl enable "$SERVICE.timer"
 
 log "Done."
 cat <<EOF
@@ -90,7 +95,9 @@ Next steps:
          ALPACA_API_KEY=...
          ALPACA_SECRET_KEY=...
          PAPER=true
-  2. Start it:      sudo systemctl start $SERVICE
-  3. Watch it:      journalctl -u $SERVICE -f
-  4. Health check:  bash $APP_DIR/deploy/healthcheck.sh
+  2. Start the schedule:   sudo systemctl start $SERVICE.timer
+  3. Next fire time:       systemctl list-timers $SERVICE.timer
+  4. Run once now to test: sudo systemctl start $SERVICE.service
+                           journalctl -u $SERVICE.service -f
+  5. Health check:         bash $APP_DIR/deploy/healthcheck.sh
 EOF

@@ -63,9 +63,14 @@ fi
 log "Syncing code to $APP_DIR"
 mkdir -p "$APP_DIR"
 # Copy the repo (excluding the venv and local secrets) into place.
+# --delete keeps $APP_DIR in sync with the repo, but MUST NOT remove the
+# operator-provided .env (credentials) or the runtime logs/ and data_cache/
+# — excluding the directories entirely also stops --delete from touching
+# them. (An earlier version deleted .env on every update.sh run.)
 rsync -a --delete \
     --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
-    --exclude '.git' --exclude 'logs/*' \
+    --exclude '.git' --exclude '.env' \
+    --exclude 'logs' --exclude 'data_cache' \
     "$REPO_DIR"/ "$APP_DIR"/
 mkdir -p "$APP_DIR/logs" "$APP_DIR/data_cache"
 

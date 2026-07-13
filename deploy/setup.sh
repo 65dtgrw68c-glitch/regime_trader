@@ -97,16 +97,20 @@ else
     echo "     BEFORE starting the service (see deploy/README.md)."
 fi
 
-# ── 6) systemd unit + timer ─────────────────────────────────────────────────
+# ── 6) systemd units + timers ────────────────────────────────────────────────
 # Scheduled model: the TIMER is enabled (fires once per trading day and
 # triggers the oneshot service); the service itself is NOT enabled directly.
-log "Installing systemd service + timer"
-install -m 644 "$APP_DIR/deploy/$SERVICE.service" "/etc/systemd/system/$SERVICE.service"
-install -m 644 "$APP_DIR/deploy/$SERVICE.timer"   "/etc/systemd/system/$SERVICE.timer"
+# A second timer runs the health monitor every 30 min (webhook alerts).
+log "Installing systemd services + timers"
+for unit in "$SERVICE.service" "$SERVICE.timer" \
+            "$SERVICE-monitor.service" "$SERVICE-monitor.timer"; do
+    install -m 644 "$APP_DIR/deploy/$unit" "/etc/systemd/system/$unit"
+done
 systemctl daemon-reload
 # Drop any always-on enablement from a previous (daemon-mode) install.
 systemctl disable "$SERVICE.service" 2>/dev/null || true
 systemctl enable "$SERVICE.timer"
+systemctl enable "$SERVICE-monitor.timer"
 
 log "Done."
 cat <<EOF
@@ -116,9 +120,14 @@ Next steps:
          ALPACA_API_KEY=...
          ALPACA_SECRET_KEY=...
          PAPER=true
-  2. Start the schedule:   sudo systemctl start $SERVICE.timer
-  3. Next fire time:       systemctl list-timers $SERVICE.timer
+  2. Start the schedules:  sudo systemctl start $SERVICE.timer
+                           sudo systemctl start $SERVICE-monitor.timer
+  3. Next fire time:       systemctl list-timers '$SERVICE*'
   4. Run once now to test: sudo systemctl start $SERVICE.service
                            journalctl -u $SERVICE.service -f
   5. Health check:         bash $APP_DIR/deploy/healthcheck.sh
+
+  Optional — webhook alerts: add a line to $APP_DIR/.env
+        ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/...   (or Slack)
+     then test it:          sudo bash $APP_DIR/deploy/monitor.sh --test
 EOF

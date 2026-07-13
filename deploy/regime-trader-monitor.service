@@ -1,0 +1,17 @@
+[Unit]
+Description=regime_trader health monitor — alert to webhook on status change
+Documentation=file:///opt/regime_trader/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs the health check and notifies a webhook only when the status changes.
+# Triggered by regime-trader-monitor.timer; runs as root so it can read the
+# 600-perm .env (for the webhook URL) and query systemd. Not enabled on its
+# own.
+Type=oneshot
+ExecStart=/bin/bash /opt/regime_trader/deploy/monitor.sh
+
+# The monitor must never itself become a failure that needs monitoring:
+# a webhook hiccup exits 0 by design, but keep it lenient regardless.
+SuccessExitStatus=0 1

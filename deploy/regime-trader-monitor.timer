@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the regime_trader health monitor every 30 minutes
+Documentation=file:///opt/regime_trader/deploy/README.md
+
+[Timer]
+# Every 30 minutes, around the clock. Alerts fire only on a status CHANGE
+# (see monitor.sh), so this cadence just sets detection latency, not noise.
+# The :05/:35 offset lands one check shortly after the 13:35 UTC trading run
+# so a broken run is caught within minutes.
+OnCalendar=*:05/30
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

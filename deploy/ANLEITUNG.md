@@ -348,9 +348,35 @@ cat /opt/regime_trader/logs/RISK_HALT.lock
 sudo rm /opt/regime_trader/logs/RISK_HALT.lock
 ```
 
-Der `healthcheck.sh` zeigt dir diesen Zustand als `risk_halt PRESENT`. Wenn du
-willst, richte ich dir eine automatische Benachrichtigung (z.B. per
-Slack/Discord) ein, damit du es sofort erfährst.
+Der `healthcheck.sh` zeigt dir diesen Zustand als `risk_halt PRESENT`.
+
+### Automatische Benachrichtigung (Discord/Slack)
+
+Der Server prüft sich alle 30 Minuten selbst (`regime-trader-monitor.timer`)
+und schickt dir eine Nachricht, **sobald etwas nicht grün ist** (z.B. der
+Not-Aus feuert oder ein Lauf fehlschlägt) — und eine Entwarnung, wenn's
+wieder gut ist. Es wird nur bei einer *Änderung* gemeldet, also kein Spam.
+
+Einrichten (Beispiel Discord — Slack geht genauso):
+
+1. In deinem Discord-Server: **Servereinstellungen → Integrationen → Webhooks
+   → „Neuer Webhook"** → Kanal wählen → **„Webhook-URL kopieren"**.
+2. Diese URL in die `.env` auf dem Server eintragen (per nano):
+   ```bash
+   sudo -u regime nano /opt/regime_trader/.env
+   ```
+   Eine Zeile ergänzen (die anderen Zeilen unangetastet lassen):
+   ```
+   ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/DEINE_URL
+   ```
+   Speichern (Strg+O, Enter, Strg+X).
+3. Testen — sollte sofort eine Nachricht in Discord auslösen:
+   ```bash
+   sudo bash /opt/regime_trader/deploy/monitor.sh --test
+   ```
+
+Ohne `ALERT_WEBHOOK_URL` passiert nichts (der Monitor läuft, schickt aber
+nichts) — die Benachrichtigung ist also rein optional.
 
 **Code aktualisieren** (wenn wir am Bot etwas verbessern): auf dem Server im
 `regime_trader`-Ordner `sudo bash deploy/update.sh` ausführen — das holt die

@@ -78,7 +78,8 @@ fi
 # Runtime deps only (no streamlit/pytest/pyfolio dashboards on the server).
 "$APP_DIR/.venv/bin/pip" install -q \
     "numpy>=1.26" "pandas>=2.2" "scipy>=1.13" "hmmlearn>=0.3" \
-    "alpaca-py>=0.20" "python-dotenv>=1.0" "requests>=2.32"
+    "alpaca-py>=0.20" "python-dotenv>=1.0" "requests>=2.32" \
+    "pyarrow>=15"   # pandas to_parquet/read_parquet for the data cache
 
 # ── 5) Ownership + .env permissions ─────────────────────────────────────────
 log "Setting ownership"

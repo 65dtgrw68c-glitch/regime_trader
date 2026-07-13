@@ -26,6 +26,21 @@ fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ── 0) Swap safety net on low-memory hosts (e.g. the 1 GB E2.1.Micro) ────────
+# Installing scipy/pandas/numpy wheels and fitting the HMM can spike memory
+# past 1 GB; a small swap file prevents an out-of-memory kill (the process
+# just gets "Killed") on the smallest free shapes. No-op if swap already
+# exists or the host has >= 2 GB RAM.
+MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+if (( MEM_MB < 2048 )) && ! swapon --show | grep -q .; then
+    log "Low memory (${MEM_MB} MB) — creating a 2 GB swap file"
+    fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 # ── 1) System packages ──────────────────────────────────────────────────────
 # build-essential/python3-dev are a safety net: numpy/scipy/pandas/hmmlearn
 # ship aarch64 wheels, but if pip ever falls back to a source build it needs

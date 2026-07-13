@@ -618,3 +618,27 @@ class TestRunOnceDaily:
         fake.startup.return_value = False
         monkeypatch.setattr(main_mod, "TradingSystem", lambda *a, **k: fake)
         assert run_once_daily() == EXIT_STARTUP_ERR
+
+
+# ---------------------------------------------------------------------------
+# 8. HMM warm-up — the scheduled once-a-day model must confirm a regime at
+#    startup, or run_once bails at "waiting_for_stable_regime" every run.
+# ---------------------------------------------------------------------------
+
+class TestHMMWarmup:
+
+    def test_startup_leaves_a_confirmed_regime(self, tmp_path):
+        sys_ = _make_system(tmp_path)
+        assert sys_.startup() is True
+        engine = sys_._states["AAA"].engine
+        # -1 would mean the stability filter never confirmed → the bot would
+        # never get past the regime gate in run_once.
+        assert engine.current_regime() >= 0
+
+    def test_first_run_once_reaches_a_decision(self, started_system):
+        """A single fresh bar must produce a real decision, not the
+        'waiting_for_stable_regime' early-return (the scheduled-model bug)."""
+        bar = _bars_after(1, seed=5).iloc[-1]
+        decision = started_system.run_once("AAA", bar)
+        assert decision["action"] != "waiting_for_stable_regime"
+        assert "regime" in decision   # regime context was attached

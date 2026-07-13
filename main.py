@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 # and keeps the per-bar feature recompute O(1) instead of growing forever.
 _MAX_HISTORY_BARS = 800
 
+# Bars replayed through the HMM at startup so its stability filter has a
+# confirmed regime immediately (must exceed the 3-bar confirmation window;
+# matches the periodic-refit warm-up).
+_HMM_WARMUP_BARS = 30
+
 
 # ===========================================================================
 # Per-ticker live state
@@ -195,6 +200,16 @@ class TradingSystem:
                     min_history_bars=min(config.HMM["min_history_bars"], len(feats)),
                 )
                 engine.fit(feats)
+                # Warm the forward pass + stability filter so a regime is
+                # CONFIRMED before the first live bar. The HMM only confirms a
+                # regime after _CONFIRM_BARS (3) consecutive updates; the
+                # scheduled --once model feeds just ONE new bar per process, so
+                # without this warm-up current_regime() stays -1 forever and
+                # run_once bails out at "waiting_for_stable_regime" every day —
+                # i.e. the bot would never trade. (Also removes the 3-bar
+                # cold-start delay in the continuous loop.)
+                for row in feats.iloc[-_HMM_WARMUP_BARS:].values:
+                    engine.update(row)
             except Exception as exc:
                 logger.error("HMM training failed for %s: %s", ticker, exc)
                 continue

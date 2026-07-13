@@ -97,7 +97,23 @@ Hier erstellst du den kostenlosen Rechner, auf dem der Bot wohnt.
      > Das ist die "Always Free"-Hardware — dauerhaft kostenlos. Der Bot
      > braucht viel weniger, aber das ist das kleinste bequeme Paket.
 
-   **c) SSH-Schlüssel** (dein digitaler Türschlüssel zum Server): Im Abschnitt
+   **c) Networking / Netzwerk:** Bei einem **neuen Konto** gibt es noch kein
+   Netzwerk, deshalb zeigt Oracle hier oft **"2 Errors"**. Das ist normal —
+   lass Oracle das Netzwerk einfach neu anlegen:
+   - Bei **"Primary network"**: wähle **"Create new virtual cloud network"**
+     (statt "Select existing"). Namen kannst du so lassen.
+   - Bei **"Subnet"**: wähle **"Create new public subnet"** (statt "Select
+     existing"). Namen so lassen.
+   - Bei **"Public IPv4 address assignment"**: schalte
+     **"Automatically assign public IPv4 address" auf AN**. Diese öffentliche
+     Adresse brauchst du, um dich per SSH zu verbinden.
+   - `IPv6` und "Advanced options" ignorieren.
+   > Danach sind die Fehler weg. Ein "virtual cloud network" ist das private
+   > Netz deines Servers; die öffentliche IP ist die Adresse, unter der du ihn
+   > erreichst. Sicher bleibt es trotzdem — die Firewall lässt standardmäßig
+   > nur SSH herein, und dein Bot ruft ohnehin nur nach außen.
+
+   **d) SSH-Schlüssel** (dein digitaler Türschlüssel zum Server): Im Abschnitt
    "Add SSH keys" ist meist **"Generate a key pair for me"** vorausgewählt.
    - Klicke **"Save private key"** und **"Save public key"** und speichere
      beide Dateien an einem Ort, den du wiederfindest (z.B. Ordner
@@ -335,9 +351,15 @@ neueste Version und übernimmt sie zum nächsten Lauf.
 
 ## 10. Wenn etwas nicht klappt (Fehlersuche)
 
+**Oracle-Instanz-Erstellung zeigt "2 Errors" im Networking-Teil**
+→ Neues Konto ohne Netzwerk. Bei "Primary network" **"Create new virtual
+cloud network"**, bei "Subnet" **"Create new public subnet"** wählen und
+**"Automatically assign public IPv4 address"** einschalten (siehe Schritt 2c).
+
 **`ssh`: "Connection timed out"**
 → Falsche IP, oder der Server ist noch nicht fertig hochgefahren (1–2 Min
-warten), oder deine Internetverbindung blockiert SSH.
+warten), oder du hast in Schritt 2 keine öffentliche IP zugewiesen, oder deine
+Internetverbindung blockiert SSH.
 
 **`ssh`: "Permission denied (publickey)"**
 → Falsche Schlüsseldatei nach `-i`, oder du hast `ubuntu@` vergessen. Der

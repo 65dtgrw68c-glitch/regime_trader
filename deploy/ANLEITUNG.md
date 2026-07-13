@@ -95,7 +95,16 @@ Hier erstellst du den kostenlosen Rechner, auf dem der Bot wohnt.
    - **Shape:** Klicke "Change shape" → Reiter **"Ampere"** → wähle
      **VM.Standard.A1.Flex**. Stelle **1 OCPU** und **6 GB RAM** ein.
      > Das ist die "Always Free"-Hardware — dauerhaft kostenlos. Der Bot
-     > braucht viel weniger, aber das ist das kleinste bequeme Paket.
+     > braucht viel weniger, aber das ist das komfortabelste kostenlose Paket.
+     >
+     > **Falls "Out of capacity for shape VM.Standard.A1.Flex" kommt:** Die
+     > kostenlosen ARM-Server sind in deiner Region gerade ausgebucht (sehr
+     > häufig bei Oracle). Nimm stattdessen einfach den anderen kostenlosen
+     > Shape: "Change shape" → Reiter **"AMD"** → **VM.Standard.E2.1.Micro**
+     > ("Always Free-eligible"). Der hat nur 1 GB RAM statt 6, ist aber für
+     > diesen Bot (läuft ~15 s/Tag) mehr als genug, und er ist fast immer
+     > verfügbar. Das Setup läuft darauf identisch. Alternativ: andere
+     > "Availability Domain" (AD-2/AD-3) probieren oder später nochmal.
 
    **c) Networking / Netzwerk:** Bei einem **neuen Konto** gibt es noch kein
    Netzwerk, deshalb zeigt Oracle hier oft **"2 Errors"**. Das ist normal —
@@ -355,6 +364,11 @@ neueste Version und übernimmt sie zum nächsten Lauf.
 → Neues Konto ohne Netzwerk. Bei "Primary network" **"Create new virtual
 cloud network"**, bei "Subnet" **"Create new public subnet"** wählen und
 **"Automatically assign public IPv4 address"** einschalten (siehe Schritt 2c).
+
+**"Out of capacity for shape VM.Standard.A1.Flex"**
+→ Kostenlose ARM-Server in deiner Region ausgebucht. Nimm den AMD-Shape
+**VM.Standard.E2.1.Micro** ("Change shape" → "AMD"), oder eine andere
+Availability Domain, oder versuche es später (siehe Schritt 2b).
 
 **`ssh`: "Connection timed out"**
 → Falsche IP, oder der Server ist noch nicht fertig hochgefahren (1–2 Min

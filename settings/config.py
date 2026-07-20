@@ -268,6 +268,7 @@ RISK = {
     # ── Correlation control ────────────────────────────────────────────────
     # Reject a new position if its correlation with any existing open
     # position exceeds this threshold (absolute value).
+    "enable_correlation_check": True,
     "max_position_correlation": 0.80,
     # Rolling window (bars) used to estimate pairwise correlations
     "correlation_lookback": 60,

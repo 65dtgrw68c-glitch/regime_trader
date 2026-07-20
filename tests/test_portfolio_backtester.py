@@ -7,10 +7,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.backtester import PortfolioBacktester
+from core.portfolio_backtester import PortfolioBacktester
+from settings import config
 
 
-def _make_data(n: int = 240) -> pd.DataFrame:
+def _make_data(n: int = 260) -> pd.DataFrame:
     idx = pd.bdate_range("2021-01-01", periods=n, freq="B")
     close = 100.0 * (1.0005 ** pd.Series(range(n), index=idx))
     return pd.DataFrame(
@@ -25,10 +26,21 @@ def _make_data(n: int = 240) -> pd.DataFrame:
     )
 
 
-def test_portfolio_backtester_builds_weighted_returns():
-    bt = PortfolioBacktester(tickers=["AAA", "BBB"], weights=[0.5, 0.5], train_window=60, test_window=30)
-    result = bt.run({"AAA": _make_data(240), "BBB": _make_data(240)})
+def test_portfolio_backtester_builds_dynamic_weighted_returns():
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
+
+    bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
+    result = bt.run()
 
     assert result.returns is not None
     assert len(result.returns) > 0
     assert result.equity_curve.iloc[-1] >= result.initial_capital * 0.9
+    assert not result.weights.empty
+
+    gross_cap = float(config.RISK.get("gross_cap", 1.0))
+    gross_exposure = result.weights.abs().sum(axis=1)
+
+    assert (gross_exposure <= gross_cap + 1e-9).all()

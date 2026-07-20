@@ -908,17 +908,49 @@ def run_once_daily() -> int:
 
 def run_backtest() -> int:
     configure_logging()
-    from core.backtester import Backtester
-    from core.performance import PerformanceAnalyser
+    from core.portfolio_backtester import PortfolioBacktester
     from data.market_data import MarketDataFeed
 
     tickers = config.TICKERS or ["SPY"]
     feed = MarketDataFeed()
-    ticker = tickers[0]
-    data = feed.get_training_data(ticker, years=4.0)
-    bt = Backtester(ticker=ticker)
-    result = bt.run(data)
-    print(PerformanceAnalyser.from_backtest_result(result).report())
+
+    histories = {}
+    for ticker in tickers:
+        data = feed.get_training_data(ticker, years=4.0)
+        if data is None or data.empty:
+            logger.warning("Skipping %s: no training data returned.", ticker)
+            continue
+        histories[ticker] = data
+
+    if not histories:
+        logger.error("No training data available for portfolio backtest.")
+        return EXIT_STARTUP_ERR
+
+    bt = PortfolioBacktester(histories=histories)
+    result = bt.run()
+
+    if result.returns.empty:
+        logger.error("Portfolio backtest produced no returns: %s", result.metadata)
+        return EXIT_STARTUP_ERR
+
+    total_return = (result.equity_curve.iloc[-1] / result.initial_capital) - 1.0
+    max_drawdown = (result.equity_curve / result.equity_curve.cummax() - 1.0).min()
+    avg_gross = result.weights.abs().sum(axis=1).mean() if not result.weights.empty else 0.0
+    max_gross = result.weights.abs().sum(axis=1).max() if not result.weights.empty else 0.0
+
+    print("Portfolio backtest")
+    print("==================")
+    print(f"Tickers:        {sorted(histories.keys())}")
+    print(f"Initial equity: ${result.initial_capital:,.2f}")
+    print(f"Final equity:   ${result.equity_curve.iloc[-1]:,.2f}")
+    print(f"Total return:   {total_return:.2%}")
+    print(f"Max drawdown:   {max_drawdown:.2%}")
+    print(f"Avg gross exp.: {avg_gross:.2%}")
+    print(f"Max gross exp.: {max_gross:.2%}")
+    print("")
+    print("Last target weights:")
+    print(result.weights.tail(1).T.to_string(header=False))
+
     return 0
 
 

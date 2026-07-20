@@ -53,9 +53,11 @@ class PortfolioBacktester:
         self,
         histories: Dict[str, pd.DataFrame],
         initial_capital: float = 100_000.0,
+        transaction_cost_bps: float = 0.0,
     ):
         self.histories = histories
         self.initial_capital = float(initial_capital)
+        self.transaction_cost_bps = float(transaction_cost_bps)
 
     def _common_index(self) -> pd.DatetimeIndex:
         indexes = []
@@ -162,6 +164,7 @@ class PortfolioBacktester:
 
             weights = self.compute_daily_targets(decision_date)
             turnover = self._calculate_turnover(previous_weights, weights)
+            turnover_cost = turnover * self.transaction_cost_bps / 10_000.03
 
             portfolio_ret = 0.0
             for ticker, weight in weights.items():
@@ -176,6 +179,7 @@ class PortfolioBacktester:
                     asset_ret = (curr_close / prev_close) - 1.0
                     portfolio_ret += float(weight) * asset_ret
 
+            portfolio_ret -= turnover_cost
             portfolio_returns.append(portfolio_ret)
             return_dates.append(current_date)
             weight_rows.append(weights)
@@ -211,6 +215,8 @@ class PortfolioBacktester:
                 "turnover_convention": "sum_abs_weight_change",
                 "total_turnover": float(turnover.sum()) if len(turnover) else 0.0,
                 "average_turnover": float(turnover.mean()) if len(turnover) else 0.0,
+                "transaction_cost_bps": self.transaction_cost_bps,
+                "transaction_cost_model": "turnover_times_bps",
                 "execution_model": "close_to_close_approximation",
             },
         )

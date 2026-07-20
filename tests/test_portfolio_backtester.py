@@ -80,7 +80,49 @@ def test_portfolio_turnover_increases_when_weights_change():
     turnover = PortfolioBacktester._calculate_turnover(previous_weights, current_weights)
 
     assert turnover == pytest.approx(2.0)
+    
+def test_zero_transaction_cost_matches_default_behavior():
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
 
+    default_bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
+    zero_cost_bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        transaction_cost_bps=0.0,
+    )
+
+    default_result = default_bt.run()
+    zero_cost_result = zero_cost_bt.run()
+
+    pd.testing.assert_series_equal(default_result.returns, zero_cost_result.returns)
+
+
+def test_portfolio_transaction_costs_reduce_returns():
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
+
+    no_cost_bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        transaction_cost_bps=0.0,
+    )
+    cost_bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        transaction_cost_bps=25.0,
+    )
+
+    no_cost_result = no_cost_bt.run()
+    cost_result = cost_bt.run()
+
+    assert cost_result.metadata["transaction_cost_bps"] == pytest.approx(25.0)
+    assert cost_result.metadata["transaction_cost_model"] == "turnover_times_bps"
+    assert cost_result.equity_curve.iloc[-1] <= no_cost_result.equity_curve.iloc[-1]
 
 def test_tradable_universe_contains_validated_diversifiers():
     from core.universe import tradable_universe

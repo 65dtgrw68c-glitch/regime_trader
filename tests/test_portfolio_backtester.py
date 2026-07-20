@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -44,6 +45,41 @@ def test_portfolio_backtester_builds_dynamic_weighted_returns():
     gross_exposure = result.weights.abs().sum(axis=1)
 
     assert (gross_exposure <= gross_cap + 1e-9).all()
+
+
+def test_portfolio_backtester_records_turnover_series():
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
+
+    bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
+    result = bt.run()
+
+    assert result.turnover is not None
+    assert len(result.turnover) == len(result.returns)
+    assert (result.turnover >= 0.0).all()
+    assert "total_turnover" in result.metadata
+    assert "average_turnover" in result.metadata
+    assert result.metadata["turnover_convention"] == "sum_abs_weight_change"
+
+
+def test_portfolio_turnover_is_zero_when_weights_unchanged():
+    previous_weights = {"SPY": 0.6, "GLD": 0.4}
+    current_weights = {"SPY": 0.6, "GLD": 0.4}
+
+    turnover = PortfolioBacktester._calculate_turnover(previous_weights, current_weights)
+
+    assert turnover == pytest.approx(0.0)
+
+
+def test_portfolio_turnover_increases_when_weights_change():
+    previous_weights = {"SPY": 1.0}
+    current_weights = {"QQQ": 1.0}
+
+    turnover = PortfolioBacktester._calculate_turnover(previous_weights, current_weights)
+
+    assert turnover == pytest.approx(2.0)
 
 
 def test_tradable_universe_contains_validated_diversifiers():

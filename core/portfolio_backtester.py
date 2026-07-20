@@ -2,8 +2,16 @@
 
 This backtester uses the validated universe, trend views and allocator to
 compute daily target weights, then applies yesterday's target weights to the
-next close-to-close return.  It is intentionally lightweight but it produces a
-real portfolio return series, equity curve and weight history.
+next close-to-close return. It is intentionally lightweight but it produces a
+real portfolio return series, equity curve, weight history and turnover series.
+
+Current execution model:
+- decision at T-1 close
+- portfolio return from T-1 close to T close
+
+This is a close-to-close approximation. The single-asset backtester has the
+more realistic next-open execution model; portfolio next-open execution remains
+a separate future hardening step.
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ class PortfolioBacktestResult:
     returns: pd.Series
     equity_curve: pd.Series
     weights: pd.DataFrame
+    turnover: pd.Series
     metadata: dict
 
 
@@ -36,7 +45,8 @@ class PortfolioBacktester:
     1. derives SMA-200 trend per asset,
     2. builds AssetView objects only for validated assets,
     3. calls the allocator for class-budgeted inverse-vol weights,
-    4. applies target weights to the next bar's close-to-close returns.
+    4. applies target weights to the next bar's close-to-close returns,
+    5. records daily portfolio turnover as sum(abs(new_weight - old_weight)).
     """
 
     def __init__(
@@ -62,6 +72,32 @@ class PortfolioBacktester:
 
         return common.sort_values()
 
+    @staticmethod
+    def _calculate_turnover(
+        previous_weights: Dict[str, float],
+        current_weights: Dict[str, float],
+    ) -> float:
+        """Return one-period portfolio turnover.
+
+        Turnover is measured as the total absolute change in target weights.
+        Example:
+        - 100% SPY -> 100% SPY = 0.0
+        - 100% SPY -> 50% SPY / 50% GLD = 1.0
+        - 100% SPY -> 100% QQQ = 2.0
+
+        This convention reflects total traded notional as a fraction of equity:
+        selling 100% SPY and buying 100% QQQ means 200% traded notional.
+        """
+        keys = set(previous_weights) | set(current_weights)
+        turnover = 0.0
+
+        for key in keys:
+            old = float(previous_weights.get(key, 0.0))
+            new = float(current_weights.get(key, 0.0))
+            turnover += abs(new - old)
+
+        return float(turnover)
+
     def compute_daily_targets(self, date) -> Dict[str, float]:
         """Compute target weights using only data available up to `date`."""
         trend_states = {}
@@ -86,7 +122,11 @@ class PortfolioBacktester:
         views = select_decorrelated_views(views, sliced_histories)
         return target_weights(views)
 
-    def run(self, start_date: Optional[pd.Timestamp] = None, end_date: Optional[pd.Timestamp] = None) -> PortfolioBacktestResult:
+    def run(
+        self,
+        start_date: Optional[pd.Timestamp] = None,
+        end_date: Optional[pd.Timestamp] = None,
+    ) -> PortfolioBacktestResult:
         idx = self._common_index()
 
         if start_date is not None:
@@ -97,25 +137,31 @@ class PortfolioBacktester:
         if len(idx) < 201:
             empty_returns = pd.Series(dtype=float, name="returns")
             empty_equity = pd.Series(dtype=float, name="equity")
+            empty_turnover = pd.Series(dtype=float, name="turnover")
             empty_weights = pd.DataFrame()
             return PortfolioBacktestResult(
                 initial_capital=self.initial_capital,
                 returns=empty_returns,
                 equity_curve=empty_equity,
                 weights=empty_weights,
+                turnover=empty_turnover,
                 metadata={"reason": "not_enough_history"},
             )
 
         portfolio_returns = []
         return_dates = []
         weight_rows = []
+        turnover_rows = []
 
-        # Need at least 200 bars for SMA-200.  Decision at t-1 applies to return at t.
+        previous_weights: Dict[str, float] = {}
+
+        # Need at least 200 bars for SMA-200. Decision at t-1 applies to return at t.
         for i in range(200, len(idx)):
             decision_date = idx[i - 1]
             current_date = idx[i]
 
             weights = self.compute_daily_targets(decision_date)
+            turnover = self._calculate_turnover(previous_weights, weights)
 
             portfolio_ret = 0.0
             for ticker, weight in weights.items():
@@ -133,20 +179,38 @@ class PortfolioBacktester:
             portfolio_returns.append(portfolio_ret)
             return_dates.append(current_date)
             weight_rows.append(weights)
+            turnover_rows.append(turnover)
 
-        returns = pd.Series(portfolio_returns, index=pd.DatetimeIndex(return_dates), name="returns")
+            previous_weights = dict(weights)
+
+        returns = pd.Series(
+            portfolio_returns,
+            index=pd.DatetimeIndex(return_dates),
+            name="returns",
+        )
         equity_curve = self.initial_capital * (1.0 + returns).cumprod()
         equity_curve.name = "equity"
 
         weights_df = pd.DataFrame(weight_rows, index=pd.DatetimeIndex(return_dates)).fillna(0.0)
+
+        turnover = pd.Series(
+            turnover_rows,
+            index=pd.DatetimeIndex(return_dates),
+            name="turnover",
+        )
 
         return PortfolioBacktestResult(
             initial_capital=self.initial_capital,
             returns=returns,
             equity_curve=equity_curve,
             weights=weights_df,
+            turnover=turnover,
             metadata={
                 "tickers": sorted(self.histories.keys()),
                 "dynamic_weights": True,
+                "turnover_convention": "sum_abs_weight_change",
+                "total_turnover": float(turnover.sum()) if len(turnover) else 0.0,
+                "average_turnover": float(turnover.mean()) if len(turnover) else 0.0,
+                "execution_model": "close_to_close_approximation",
             },
         )

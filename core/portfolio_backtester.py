@@ -14,6 +14,7 @@ import pandas as pd
 
 from core.universe import build_views, AssetView
 from core.allocator import target_weights
+from core.selector import select_decorrelated_views
 
 
 @dataclass
@@ -82,6 +83,7 @@ class PortfolioBacktester:
                 trend_states[ticker] = False
 
         views: List[AssetView] = build_views(sliced_histories, trend_states)
+        views = select_decorrelated_views(views, sliced_histories)
         return target_weights(views)
 
     def run(self, start_date: Optional[pd.Timestamp] = None, end_date: Optional[pd.Timestamp] = None) -> PortfolioBacktestResult:

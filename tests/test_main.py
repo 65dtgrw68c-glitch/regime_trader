@@ -322,6 +322,68 @@ class TestBarHygiene:
         assert len(started_system._states["AAA"].history) <= 345
 
 
+
+# ---------------------------------------------------------------------------
+# 2d. Portfolio batch loop safety
+# ---------------------------------------------------------------------------
+
+class TestPortfolioBatchLoop:
+
+    def test_run_portfolio_once_skips_stale_batch_without_rebalance(self, tmp_path):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"))
+        assert sys_.startup() is True
+
+        bars = _bars_after(1, seed=101).iloc[-1]
+        batch = {"AAA": bars, "BBB": bars}
+
+        # First delivery may update histories and may rebalance.
+        sys_.run_portfolio_once(batch)
+        sys_._executor.rebalance.reset_mock()
+        before = sys_._bars_processed
+
+        # Same timestamps again must be stale and must not rebalance.
+        decisions = sys_.run_portfolio_once(batch)
+
+        assert decisions["AAA"]["action"] == "stale_bar"
+        assert decisions["BBB"]["action"] == "stale_bar"
+        assert sys_._bars_processed == before
+        sys_._executor.rebalance.assert_not_called()
+
+    def test_run_portfolio_once_submits_one_shared_rebalance(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True)
+        assert sys_.startup() is True
+
+        # Keep this test focused on the portfolio batch loop itself:
+        # target-book calculation, market gate and book validation are covered elsewhere.
+        monkeypatch.setattr(
+            sys_,
+            "_compute_live_target_book",
+            lambda: {"AAA": 0.50, "BBB": 0.50},
+        )
+        monkeypatch.setattr(
+            sys_,
+            "_target_positions_from_weights",
+            lambda target_weights, prices, equity: {"AAA": 10, "BBB": 20},
+        )
+        monkeypatch.setattr(sys_, "_market_is_open", lambda: True)
+
+        approved = MagicMock()
+        approved.approved = True
+        approved.reason = ""
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: approved)
+
+        sys_._executor.rebalance.return_value = ["oid-aaa", "oid-bbb"]
+
+        bars = _bars_after(1, seed=202).iloc[-1]
+        decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        sys_._executor.rebalance.assert_called_once_with({"AAA": 10, "BBB": 20})
+
+        assert decisions["AAA"]["action"] == "portfolio_rebalance_submitted"
+        assert decisions["BBB"]["action"] == "portfolio_rebalance_submitted"
+        assert decisions["AAA"]["target_position"] == 10
+        assert decisions["BBB"]["target_position"] == 20
+
 # ---------------------------------------------------------------------------
 # 2c. Pause recovery
 # ---------------------------------------------------------------------------

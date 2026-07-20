@@ -124,6 +124,58 @@ def test_portfolio_transaction_costs_reduce_returns():
     assert cost_result.metadata["transaction_cost_model"] == "turnover_times_bps"
     assert cost_result.equity_curve.iloc[-1] <= no_cost_result.equity_curve.iloc[-1]
 
+
+class _HalfInvestedPortfolioBacktester(PortfolioBacktester):
+    """Test helper: keep exactly 50% invested and 50% cash."""
+
+    def compute_daily_targets(self, date):
+        return {"SPY": 0.5}
+
+
+def test_portfolio_cash_yield_zero_matches_default_behavior():
+    histories = {
+        "SPY": _make_data(260),
+    }
+
+    default_bt = _HalfInvestedPortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+    )
+    zero_yield_bt = _HalfInvestedPortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        cash_yield_annual=0.0,
+    )
+
+    default_result = default_bt.run()
+    zero_yield_result = zero_yield_bt.run()
+
+    pd.testing.assert_series_equal(default_result.returns, zero_yield_result.returns)
+
+
+def test_portfolio_cash_yield_credits_idle_cash():
+    histories = {
+        "SPY": _make_data(260),
+    }
+
+    no_yield_bt = _HalfInvestedPortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        cash_yield_annual=0.0,
+    )
+    yield_bt = _HalfInvestedPortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        cash_yield_annual=0.05,
+    )
+
+    no_yield_result = no_yield_bt.run()
+    yield_result = yield_bt.run()
+
+    assert yield_result.metadata["cash_yield_annual"] == pytest.approx(0.05)
+    assert yield_result.metadata["cash_yield_model"] == "annual_rate_divided_by_252_trading_days"
+    assert yield_result.equity_curve.iloc[-1] > no_yield_result.equity_curve.iloc[-1]
+
 def test_tradable_universe_contains_validated_diversifiers():
     from core.universe import tradable_universe
 

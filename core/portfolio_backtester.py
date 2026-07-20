@@ -23,6 +23,7 @@ import pandas as pd
 from core.universe import build_views, AssetView
 from core.allocator import target_weights
 from core.selector import select_decorrelated_views
+from core.regime_strategies import is_trend_confirmed
 
 
 @dataclass
@@ -115,12 +116,9 @@ class PortfolioBacktester:
             hist_to_date = df.loc[:date].copy()
             sliced_histories[ticker] = hist_to_date
 
-            closes = hist_to_date["close"].dropna()
-            if len(closes) >= 200:
-                sma = closes.iloc[-200:].mean()
-                trend_states[ticker] = float(closes.iloc[-1]) > float(sma)
-            else:
-                trend_states[ticker] = False
+            # Mirror the live portfolio path: use the shared trend confirmation
+            # function instead of a local close>SMA shortcut.
+            trend_states[ticker] = is_trend_confirmed(hist_to_date["close"])
 
         views: List[AssetView] = build_views(sliced_histories, trend_states)
         views = select_decorrelated_views(views, sliced_histories)

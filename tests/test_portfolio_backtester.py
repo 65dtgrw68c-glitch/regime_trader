@@ -176,6 +176,39 @@ def test_portfolio_cash_yield_credits_idle_cash():
     assert yield_result.metadata["cash_yield_model"] == "annual_rate_divided_by_252_trading_days"
     assert yield_result.equity_curve.iloc[-1] > no_yield_result.equity_curve.iloc[-1]
 
+
+def test_portfolio_backtester_matches_live_target_weight_path():
+    from core.universe import build_views
+    from core.selector import select_decorrelated_views
+    from core.allocator import target_weights
+    from core.regime_strategies import is_trend_confirmed
+
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
+    date = histories["SPY"].index[220]
+
+    bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
+    backtest_weights = bt.compute_daily_targets(date)
+
+    sliced_histories = {
+        ticker: df.loc[:date].copy()
+        for ticker, df in histories.items()
+    }
+    trend_states = {
+        ticker: is_trend_confirmed(hist["close"])
+        for ticker, hist in sliced_histories.items()
+    }
+
+    views = build_views(sliced_histories, trend_states)
+    selected_views = select_decorrelated_views(views, sliced_histories)
+    live_like_weights = target_weights(selected_views)
+
+    assert set(backtest_weights) == set(live_like_weights)
+    for ticker, weight in live_like_weights.items():
+        assert backtest_weights[ticker] == pytest.approx(weight)
+
 def test_tradable_universe_contains_validated_diversifiers():
     from core.universe import tradable_universe
 

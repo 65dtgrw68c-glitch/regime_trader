@@ -737,3 +737,58 @@ class Backtester:
         if self._result is None:
             raise RuntimeError("Call run() first.")
         return self._result.trade_log
+
+
+class PortfolioBacktester:
+    """Very small multi-asset backtester for simple weighted-book evaluations."""
+
+    def __init__(
+        self,
+        tickers: Optional[list[str]] = None,
+        weights: Optional[list[float]] = None,
+        train_window: int = 252,
+        test_window: int = 126,
+        initial_capital: float = 100_000.0,
+    ) -> None:
+        self.tickers = tickers or ["SPY", "QQQ"]
+        self.weights = weights or [1.0 / len(self.tickers)] * len(self.tickers)
+        self.train_window = train_window
+        self.test_window = test_window
+        self.initial_capital = initial_capital
+        self._result: Optional[BacktestResult] = None
+
+    def run(self, histories: dict[str, pd.DataFrame]) -> BacktestResult:
+        aligned: dict[str, pd.DataFrame] = {}
+        for ticker in self.tickers:
+            if ticker not in histories:
+                raise KeyError(f"Missing history for {ticker}")
+            aligned[ticker] = histories[ticker].copy()
+
+        if not aligned:
+            raise ValueError("No histories supplied for portfolio backtest")
+
+        series = []
+        for ticker in self.tickers:
+            close = aligned[ticker]["close"].pct_change().fillna(0.0)
+            # ensure each series column is named by ticker for alignment
+            close = close.rename(ticker)
+            series.append(close)
+
+        returns = pd.concat(series, axis=1).dot(pd.Series(self.weights, index=self.tickers))
+        returns = returns.rename("strategy")
+        equity_curve = self.initial_capital * (1.0 + returns).cumprod()
+        equity_curve.name = "equity"
+
+        result = BacktestResult(
+            returns=returns,
+            equity_curve=equity_curve,
+            trade_log=pd.DataFrame(),
+            regime_labels=pd.Series(index=returns.index, dtype=object),
+            confidence=pd.Series(index=returns.index, dtype=float),
+            splits=[],
+            benchmark_returns={},
+            initial_capital=self.initial_capital,
+            metadata={"tickers": self.tickers, "weights": self.weights},
+        )
+        self._result = result
+        return result

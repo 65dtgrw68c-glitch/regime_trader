@@ -373,10 +373,18 @@ class TradingSystem:
         regime_idx, regime_label, proba, high_unc = self._safe_regime(state, obs)
         decision.update(regime=regime_label, confidence=float(max(proba) if len(proba) else 0))
 
-        # 4 — Only act on a stable (confirmed) regime
+        # 4 — Only act on a stable (confirmed) regime unless explicitly
+        # disabled in config.  The pinned trend-core profile can safely fall
+        # back to the last stable regime while the HMM warms up.
         if regime_idx < 0:
-            decision["action"] = "waiting_for_stable_regime"
-            return decision
+            if config.HMM.get("required", True):
+                decision["action"] = "waiting_for_stable_regime"
+                return decision
+            regime_idx = state.last_stable_regime if state.last_stable_regime >= 0 else 0
+            if not regime_label or regime_label == "Unknown":
+                regime_label = state.last_stable_label or "Unknown"
+            if len(proba) == 0:
+                proba = pd.Series([1.0]).to_numpy()
         state.last_stable_regime = regime_idx
         state.last_stable_label = regime_label
 
@@ -437,6 +445,25 @@ class TradingSystem:
         #     every bar — as this loop once did — silently accumulates
         #     positions; only the DELTA may trade.)
         target_weight = sum(strat_signal.target_weights.values())
+        candidate_weights = {}
+        for asset in self._states:
+            if asset == ticker:
+                candidate_weights[asset] = target_weight
+            else:
+                qty = self._position_qty(asset)
+                if qty:
+                    price_for_asset = self._states[asset].history["close"].iloc[-1]
+                    candidate_weights[asset] = (qty * float(price_for_asset) / equity) if equity > 0 else 0.0
+                else:
+                    candidate_weights[asset] = 0.0
+        candidate_weights[ticker] = target_weight
+        book_validation = self._risk.validate_book(candidate_weights)
+        if not book_validation.approved:
+            decision["action"] = "rejected_by_risk"
+            decision["reason"] = book_validation.reason
+            logger.info("Portfolio risk rejected %s target: %s", ticker, book_validation.reason)
+            return decision
+
         target_qty = int(shares_for_target_weight(
             target_weight, price, equity,
             cb_scaling=self._risk.size_scaling_factor(),

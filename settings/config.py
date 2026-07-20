@@ -6,18 +6,30 @@ source of truth instead of scattering magic numbers across the codebase.
 """
 
 # ---------------------------------------------------------------------------
-# Tickers
+# Tickers / universe
 # ---------------------------------------------------------------------------
-# List of symbols the system is allowed to trade.
-# Only tickers the pinned strategy profile (see ORCHESTRATOR below) has been
-# validated on — SPY and QQQ passed the walk-forward grid; on the never-tuned
-# IWM the profile stayed ~flat while pure trend lost -23%, i.e. it degrades
-# gracefully where trend has no edge. AAPL/MSFT/NVDA were removed 2026-07-09:
-# single-name trend following was never backtested here — run the experiment
-# grid on a name BEFORE adding it back.
+# The runtime universe is now driven by a validated-asset map.  Only entries
+# marked as validated are traded; other assets remain available for future
+# harness validation without being activated by default.
+UNIVERSE = {
+    "assets": {
+        "SPY": {"asset_class": "equity", "validated": True},
+        "QQQ": {"asset_class": "equity", "validated": True},
+        "GLD": {"asset_class": "gold", "validated": False},
+        "IEF": {"asset_class": "bonds", "validated": False},
+        "DBC": {"asset_class": "commod", "validated": False},
+    },
+    "class_caps": {
+        "equity": 0.70,
+        "gold": 0.20,
+        "bonds": 0.25,
+        "commod": 0.10,
+    },
+    "vol_lookback": 63,
+}
 TICKERS = [
-    "SPY",
-    "QQQ",
+    ticker for ticker, meta in UNIVERSE["assets"].items()
+    if meta.get("validated", False)
 ]
 
 # ---------------------------------------------------------------------------
@@ -52,6 +64,10 @@ HMM = {
     "min_history_bars": 252,
     # How often to refit the model (in bars)
     "refit_interval_bars": 21,
+    # Whether a stable HMM regime is required before trading.  The pinned
+    # trend-core profile is robust enough to continue with the last stable
+    # regime when the model is unavailable or still warming up.
+    "required": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -158,7 +174,20 @@ RISK = {
     # collapsed effective exposure to ~2% and kept the bot in cash; it was
     # briefly 1.00 while the bot traded a single symbol.)
     # No leverage (sum > 1.0) without also raising max_leverage.
+    # max_position_size remains as a backwards-compatible alias for the
+    # portfolio-level per-name cap used by the sizing layer.
     "max_position_size": 0.50,
+    # Hard per-name cap for target weights in the book validator.
+    "per_name_cap": 0.50,
+    # Maximum gross leverage / gross target-book exposure.
+    "gross_cap": 1.0,
+    # Portfolio-level caps per asset class.
+    "class_caps": {
+        "equity": 0.70,
+        "gold": 0.20,
+        "bonds": 0.25,
+        "commod": 0.10,
+    },
     # Maximum gross leverage
     "max_leverage": 1.0,
     # (The former daily_drawdown_limit / max_drawdown_limit keys were unused

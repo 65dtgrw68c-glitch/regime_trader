@@ -26,6 +26,9 @@ BASE_CFG = {
     "max_position_size":        0.10,
     "max_leverage":             1.0,
     "max_risk_per_trade":       0.01,
+    "per_name_cap":             0.40,
+    "gross_cap":                1.00,
+    "class_caps":               {"equity": 0.65, "gold": 0.20},
     "cb_daily_halve_loss":      0.02,
     "cb_daily_flatten_loss":    0.03,
     "cb_weekly_resize_loss":    0.05,
@@ -246,6 +249,16 @@ class TestLeverageEnforcement:
 
 class TestOrderValidation:
 
+    def test_validate_book_rejects_gross_exposure(self, rm):
+        validation = rm.validate_book({"SPY": 0.60, "QQQ": 0.50})
+        assert validation.approved is False
+        assert "gross" in validation.reason.lower()
+
+    def test_validate_book_rejects_per_name_exposure(self, rm):
+        validation = rm.validate_book({"SPY": 0.50})
+        assert validation.approved is False
+        assert "per-name" in validation.reason.lower()
+
     def test_valid_order_approved(self, rm):
         rm.start_new_day(100_000)
         rm.update_equity(100_000)
@@ -307,6 +320,7 @@ class TestOrderValidation:
 class TestCorrelationChecks:
 
     def test_highly_correlated_position_rejected(self, rm):
+        rm._cfg["enable_correlation_check"] = True
         rm.start_new_day(100_000)
         rm.update_equity(100_000)
         base = np.linspace(0, 1, 60) + np.random.default_rng(0).normal(0, 0.001, 60)

@@ -299,6 +299,49 @@ class RiskManager:
     # Order validation (the gate every order must pass)
     # ------------------------------------------------------------------
 
+    def _effective_per_name_cap(self) -> float:
+        """Resolve the per-name exposure cap while keeping legacy aliases intact."""
+        max_position_size = float(self._cfg.get("max_position_size", 1.0))
+        per_name_cap = self._cfg.get("per_name_cap")
+        if per_name_cap is None:
+            return max_position_size
+        return min(float(per_name_cap), max_position_size)
+
+    def validate_book(self, target_weights: dict[str, float]) -> OrderValidation:
+        """Validate the target-book weights before new orders are submitted."""
+        if not target_weights:
+            return OrderValidation(True, "empty book")
+
+        gross = sum(abs(float(weight)) for weight in target_weights.values())
+        gross_cap = self._cfg.get("gross_cap", self._cfg.get("max_leverage", 1.0))
+        if gross > gross_cap + 1e-9:
+            return OrderValidation(False, f"gross {gross:.2f} exceeds cap {gross_cap:.2f}")
+
+        per_name_cap = self._effective_per_name_cap()
+        for ticker, weight in target_weights.items():
+            if abs(weight) > per_name_cap + 1e-9:
+                return OrderValidation(
+                    False,
+                    f"per-name {ticker} weight {weight:.2f} exceeds cap {per_name_cap:.2f}",
+                )
+
+        class_caps = self._cfg.get("class_caps", {})
+        by_class: dict[str, float] = {}
+        for ticker, weight in target_weights.items():
+            meta = getattr(config, "UNIVERSE", {}).get("assets", {}).get(ticker, {})
+            asset_class = meta.get("asset_class", "equity")
+            by_class[asset_class] = by_class.get(asset_class, 0.0) + abs(float(weight))
+
+        for asset_class, weight in by_class.items():
+            cap = class_caps.get(asset_class)
+            if cap is not None and weight > cap + 1e-9:
+                return OrderValidation(
+                    False,
+                    f"class {asset_class} weight {weight:.2f} exceeds cap {cap:.2f}",
+                )
+
+        return OrderValidation(True, "approved")
+
     def validate_order(
         self,
         ticker: str,
@@ -328,7 +371,8 @@ class RiskManager:
         notional = abs(qty) * price
 
         # 2 — Position size cap
-        max_notional = portfolio_value * self._cfg["max_position_size"]
+        per_name_cap = self._effective_per_name_cap()
+        max_notional = portfolio_value * per_name_cap
         if notional > max_notional + 1e-6:
             return OrderValidation(
                 False,
@@ -351,8 +395,13 @@ class RiskManager:
                 f"insufficient buying power: need {notional:.0f}, have {buying_power:.0f}",
             )
 
-        # 5 — Correlation check
-        if existing_returns and new_returns is not None:
+        # 5 — Optional correlation check (disabled by default; the current
+        # portfolio design uses class caps and gross-cap controls instead.)
+        if (
+            self._cfg.get("enable_correlation_check", False)
+            and existing_returns
+            and new_returns is not None
+        ):
             corr = self._max_correlation(new_returns, existing_returns)
             if corr > self._cfg["max_position_correlation"]:
                 return OrderValidation(

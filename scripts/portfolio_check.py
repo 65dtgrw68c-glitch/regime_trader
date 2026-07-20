@@ -1,37 +1,38 @@
 """
-Portfolio check — evaluate the LIVE two-ticker book (SPY+QQQ, each capped at
-RISK.max_position_size of shared equity) as a JOINT portfolio instead of two
+Portfolio check — evaluate a multi-asset book as a JOINT portfolio instead of
 isolated single-name backtests.
 
 Why this exists
 ---------------
-The experiment grid validates each name in isolation at the 0.50 cap.  Live,
-both names trade against ONE equity: their drawdowns coincide (SPY/QQQ daily
-correlation ~0.9), so the joint max drawdown is deeper than either single-name
-run suggests.  This script quantifies that.
+The experiment grid validates each name in isolation at the RISK cap.  Live,
+all names trade against ONE equity: their drawdowns may coincide, so the joint
+max drawdown can be deeper than single-name runs suggest.  This script
+quantifies the joint behavior.
 
 Method (and its stated approximations)
 --------------------------------------
 Each name is backtested with the pinned ORCHESTRATOR profile on date-aligned
 data; the joint per-bar return is composed as
 
-    r_joint = r_A + r_B - y_daily
+    r_joint = Σ r_i - y_daily * (len(tickers) - 1)
 
 where y_daily is the cash yield.  The subtraction corrects the double-counted
 idle-cash credit: each single-name run credits y*(1 - w_i), so the sum
-credits y*(2 - w_A - w_B) = y + y*(1 - w_A - w_B), one y too many.
+credits y*(Σ(1 - w_i)) = len(tickers) * y - Σw_i, which is one y too many
+per name.
 
 Valid because position sizing is equity-proportional (weights, not dollar
 amounts), so per-name returns compose linearly.  Ignored, and in which
 direction they bias the result:
   * joint circuit breakers (weekly / -10% HALT act on joint equity live) —
     composition shows the UN-protected joint path, i.e. conservative on DD;
-  * daily compounding cross-terms — O(r_A * r_B) per bar, negligible.
+  * daily compounding cross-terms — O(Π r_i) per bar, negligible.
 
 Usage
 -----
-    python scripts/portfolio_check.py                # SPY+QQQ, 30y via Yahoo
-    python scripts/portfolio_check.py --bars 2000    # recent span only
+    python scripts/portfolio_check.py                       # SPY+QQQ, 30y via Yahoo
+    python scripts/portfolio_check.py --tickers SPY GLD IEF # 3-asset portfolio
+    python scripts/portfolio_check.py --bars 2000           # recent span only
 """
 
 from __future__ import annotations
@@ -72,18 +73,32 @@ def _row(name: str, rets: pd.Series) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Joint-book check for the live ticker set")
-    ap.add_argument("--tickers", nargs=2, default=["SPY", "QQQ"])
+    ap = argparse.ArgumentParser(description="Joint-book check for multiple assets")
+    ap.add_argument("--tickers", nargs="+", default=["SPY", "QQQ"])
     ap.add_argument("--bars", type=int, default=7000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="experiments_report_portfolio.md")
     args = ap.parse_args(argv)
 
-    t_a, t_b = args.tickers
-    data = {t: fetch_yahoo(t, args.bars) for t in (t_a, t_b)}
-    common = data[t_a].index.intersection(data[t_b].index)[-args.bars:]
+    tickers = list(args.tickers)
+    if len(tickers) < 1:
+        print("ERROR: must specify at least one ticker")
+        return 1
+
+    data = {t: fetch_yahoo(t, args.bars) for t in tickers}
+    # Align all tickers to a common index
+    common = data[tickers[0]].index
+    for t in tickers[1:]:
+        common = common.intersection(data[t].index)
+    common = common[-args.bars:]
+    
+    if len(common) < 100:
+        print(f"ERROR: insufficient common data ({len(common)} bars)")
+        return 1
+
     data = {t: df.loc[common] for t, df in data.items()}
     print(f"Aligned span: {common[0].date()} … {common[-1].date()} ({len(common)} bars)")
+    print(f"Tickers: {', '.join(tickers)}")
 
     try:
         tbill = fetch_tbill_yields()
@@ -93,35 +108,57 @@ def main(argv: list[str] | None = None) -> int:
 
     profile = dict(getattr(config, "ORCHESTRATOR", {}))
     results = {}
-    for t in (t_a, t_b):
+    for t in tickers:
         print(f"Running pinned profile on {t} ...")
         bt = Backtester(ticker=t, train_window=252, test_window=126,
                         random_seed=args.seed, strategy_overrides=profile,
                         cash_yield_series=tbill)
         results[t] = bt.run(data[t])
 
-    r_a, r_b = results[t_a].returns, results[t_b].returns
-    assert (r_a.index == r_b.index).all(), "OOS indices diverged — alignment bug"
+    # Verify all returns are aligned
+    base_idx = results[tickers[0]].returns.index
+    for t in tickers[1:]:
+        if not (results[t].returns.index == base_idx).all():
+            print(f"ERROR: indices diverged for {t} — alignment bug")
+            return 1
 
     # Per-bar cash yield on the OOS index (same construction the backtester
-    # uses), for the double-count correction and the 50/50 benchmark.
-    yld = Backtester(cash_yield_series=tbill)._build_daily_yield(r_a.index)
+    # uses), for the double-count correction.
+    yld = Backtester(cash_yield_series=tbill)._build_daily_yield(base_idx)
 
-    r_joint = r_a + r_b - yld
+    # Compose the joint return: sum individual returns, subtract the extra
+    # cash yield that would be counted len(tickers) times instead of once.
+    r_joint = sum(results[t].returns for t in tickers) - yld * (len(tickers) - 1)
 
-    # Benchmarks over the same OOS bars.
-    bench_a = results[t_a].benchmark_returns
-    bench_b = results[t_b].benchmark_returns
-    bh_5050 = 0.5 * bench_a["buy_and_hold"] + 0.5 * bench_b["buy_and_hold"]
-    sma_5050 = 0.5 * bench_a["sma_200"] + 0.5 * bench_b["sma_200"]
+    # Benchmarks over the same OOS bars
+    bench_5050 = None
+    bench_sma = None
+    if len(tickers) == 2:
+        # For 2 tickers, show 50/50 benchmarks
+        bench_5050 = (
+            0.5 * results[tickers[0]].benchmark_returns["buy_and_hold"]
+            + 0.5 * results[tickers[1]].benchmark_returns["buy_and_hold"]
+        )
+        bench_sma = (
+            0.5 * results[tickers[0]].benchmark_returns["sma_200"]
+            + 0.5 * results[tickers[1]].benchmark_returns["sma_200"]
+        )
+    else:
+        # For N tickers, show equal-weight benchmarks
+        n = len(tickers)
+        bench_5050 = sum(results[t].benchmark_returns["buy_and_hold"] for t in tickers) / n
+        bench_sma = sum(results[t].benchmark_returns["sma_200"] for t in tickers) / n
 
     rows = [
-        _row(f"JOINT BOOK {t_a}+{t_b} (live profile)", r_joint),
-        _row(f"{t_a} alone @cap {config.RISK['max_position_size']:.2f}", r_a),
-        _row(f"{t_b} alone @cap {config.RISK['max_position_size']:.2f}", r_b),
-        _row("bench: 50/50 buy&hold (daily rebal.)", bh_5050),
-        _row("bench: 50/50 sma_200 (costless)", sma_5050),
+        _row(f"JOINT BOOK {'+'.join(tickers)} (live profile)", r_joint),
     ]
+    for t in tickers:
+        rows.append(_row(
+            f"{t} alone @cap {config.RISK['max_position_size']:.2f}",
+            results[t].returns,
+        ))
+    rows.append(_row("bench: equal-weight buy&hold (daily rebal.)", bench_5050))
+    rows.append(_row("bench: equal-weight sma_200 (costless)", bench_sma))
 
     header = ("| Portfolio | Total return | CAGR | Sharpe | Sharpe 90% CI | Max DD |\n"
               "|---|---:|---:|---:|---:|---:|\n")
@@ -131,19 +168,20 @@ def main(argv: list[str] | None = None) -> int:
         for r in rows
     ]
     meta = (
-        f"Joint-book composition of the live ticker set under the pinned "
+        f"Joint-book composition of {', '.join(tickers)} under the pinned "
         f"profile `{profile}`, cap {config.RISK['max_position_size']:.2f} per "
         f"name.  \nData: Yahoo adjusted, {len(common)} aligned bars "
         f"({common[0].date()} … {common[-1].date()}); cash yield: "
         f"{'^IRX series' if tbill is not None else 'flat fallback'}.  \n"
-        f"Method: r_joint = r_A + r_B − y (cash-credit double-count "
-        f"correction); joint breakers not modelled (conservative on DD) — "
+        f"Method: r_joint = Σ r_i − y*(n−1) (cash-credit corrected); "
+        f"joint breakers not modelled (conservative on DD) — "
         f"see scripts/portfolio_check.py docstring.\n"
     )
     report = f"# Joint-book portfolio check\n\n{meta}\n{header}" + "\n".join(lines) + "\n"
     Path(args.out).write_text(report, encoding="utf-8")
     print("\n" + report + f"Report written to {Path(args.out).resolve()}")
     return 0
+
 
 
 if __name__ == "__main__":

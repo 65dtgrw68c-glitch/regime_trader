@@ -319,14 +319,165 @@ class TradingSystem:
                 break   # source exhausted / shutdown requested
 
             if not self._paused:
-                for ticker, bar in bars.items():
-                    self.run_once(ticker, bar)
+                if config.BROKER.get("portfolio_batch_loop", True):
+                    self.run_portfolio_once(bars)
+                else:
+                    for ticker, bar in bars.items():
+                        self.run_once(ticker, bar)
 
             iterations += 1
             if bar_source is None and interval:
                 time.sleep(interval)
 
         self.shutdown(reason="loop ended")
+
+    def run_portfolio_once(self, bars):
+        """Process one portfolio bar batch and rebalance to one target book.
+
+        This is the portfolio-oriented live path:
+        - update all ticker histories first
+        - compute one shared target weight book
+        - validate the whole book
+        - convert weights to target share counts
+        - submit one portfolio rebalance
+        """
+        decisions = {}
+        updated_tickers = []
+        prices = {}
+
+        # 1. Update all histories first so the selector sees one coherent book.
+        for ticker, bar in bars.items():
+            decision = {"ticker": ticker, "action": "none"}
+            state = self._states.get(ticker)
+
+            if state is None:
+                decisions[ticker] = decision
+                continue
+
+            prev_len = len(state.history)
+            state.history = self._append_bar(state.history, bar)
+
+            if len(state.history) <= prev_len:
+                decision["action"] = "stale_bar"
+                decisions[ticker] = decision
+                continue
+
+            if len(state.history) > _MAX_HISTORY_BARS:
+                state.history = state.history.iloc[-_MAX_HISTORY_BARS:]
+
+            state.bar_count += 1
+            self._bars_processed += 1
+            updated_tickers.append(ticker)
+
+            price = float(bar.get("close", state.history["close"].iloc[-1]))
+            prices[ticker] = price
+
+            decision["action"] = "bar_updated"
+            decisions[ticker] = decision
+
+        if not updated_tickers:
+            return decisions
+
+        equity = self._current_equity()
+
+        # 2. Roll risk day and apply circuit breakers once for the portfolio.
+        try:
+            latest_dates = [
+                pd.Timestamp(self._states[t].history.index[-1]).date()
+                for t in updated_tickers
+            ]
+            bar_day = max(latest_dates) if latest_dates else None
+        except (TypeError, ValueError):
+            bar_day = None
+
+        if bar_day is not None and bar_day != self._risk_day:
+            if self._risk_day is not None:
+                self._risk.end_of_day(equity)
+            self._risk.start_new_day(equity)
+            self._risk_day = bar_day
+
+        cb = self._risk.update_equity(
+            equity,
+            regime_label="portfolio",
+            open_positions=self._open_positions_dict(),
+        )
+
+        if cb >= CBLevel.HALT or self._risk.is_halted():
+            for ticker in updated_tickers:
+                decisions[ticker]["action"] = "halted"
+            self._alert(
+                f"Trading halted by circuit breaker ({cb.name}).",
+                SEVERITY_CRITICAL,
+                key="cb_halt",
+            )
+            self._flatten_all()
+            return decisions
+
+        if self._risk.should_flatten():
+            for ticker in updated_tickers:
+                decisions[ticker]["action"] = "flatten"
+            self._flatten_all()
+            return decisions
+
+        # 3. Compute one shared target book.
+        target_weights = self._compute_live_target_book()
+
+        for ticker in self._states:
+            decisions.setdefault(ticker, {"ticker": ticker, "action": "none"})
+            decisions[ticker]["target_weight"] = float(target_weights.get(ticker, 0.0))
+
+        validation = self._risk.validate_book(target_weights)
+        if not validation.approved:
+            for ticker in updated_tickers:
+                decisions[ticker]["action"] = "rejected_by_risk"
+                decisions[ticker]["reason"] = validation.reason
+            logger.info("Portfolio risk rejected target book: %s", validation.reason)
+            return decisions
+
+        # 4. Do not submit market orders while the market is closed.
+        if config.BROKER.get("trade_only_when_open", True) and not self._market_is_open():
+            for ticker in updated_tickers:
+                decisions[ticker]["action"] = "skipped_market_closed"
+            logger.info("Market closed — portfolio rebalance observed but not submitted.")
+            return decisions
+
+        # 5. Convert target weights to absolute target share counts.
+        for ticker, state in self._states.items():
+            if ticker not in prices and state.history is not None and not state.history.empty:
+                prices[ticker] = float(state.history["close"].iloc[-1])
+
+        target_positions = self._target_positions_from_weights(
+            target_weights,
+            prices,
+            equity,
+        )
+
+        # 6. Submit one portfolio rebalance.
+        order_ids = self._safe_call(self._executor.rebalance, target_positions) or []
+        try:
+            submitted = len(order_ids)
+        except TypeError:
+            submitted = 0
+
+        self._orders_submitted += submitted
+
+        for ticker in updated_tickers:
+            decisions[ticker]["target_position"] = int(target_positions.get(ticker, 0))
+            if submitted:
+                decisions[ticker]["action"] = "portfolio_rebalance_submitted"
+            else:
+                decisions[ticker]["action"] = "no_change"
+
+        self._safe_call(self._positions.refresh)
+
+        logger.info(
+            "Portfolio decision: weights=%s positions=%s orders=%d",
+            target_weights,
+            target_positions,
+            submitted,
+        )
+
+        return decisions
 
     def run_once(self, ticker: str, bar: pd.Series) -> dict:
         """
@@ -778,6 +929,64 @@ class TradingSystem:
             return int(pos.qty) if pos else 0
         except Exception:
             return 0
+
+    def _compute_live_target_book(self):
+        """Compute portfolio target weights from the current live state.
+
+        This mirrors the portfolio backtester path:
+        histories -> trend states -> AssetViews -> correlation selector -> allocator.
+        It returns weights, not share counts.
+        """
+        from core.universe import build_views
+        from core.selector import select_decorrelated_views
+        from core.allocator import target_weights
+
+        histories = {}
+        trend_states = {}
+
+        for asset, state in self._states.items():
+            hist = getattr(state, "history", None)
+            if hist is None or hist.empty or "close" not in hist:
+                continue
+
+            histories[asset] = hist
+            trend_states[asset] = is_trend_confirmed(hist["close"])
+
+        views = build_views(histories, trend_states)
+        selected_views = select_decorrelated_views(views, histories)
+        target_book = target_weights(selected_views)
+
+        # Include every live state explicitly. Missing tickers are target zero.
+        for asset in self._states:
+            target_book.setdefault(asset, 0.0)
+
+        return target_book
+
+    def _target_positions_from_weights(self, target_weights, prices, equity):
+        """Convert portfolio target weights into absolute target share counts.
+
+        OrderExecutor.rebalance expects target share counts, not weights.
+        Missing tickers or invalid prices are mapped to zero target shares.
+        """
+        target_positions = {}
+        cb_scaling = self._risk.size_scaling_factor() if self._risk else 1.0
+
+        for ticker in self._states:
+            weight = float(target_weights.get(ticker, 0.0) or 0.0)
+            price = prices.get(ticker)
+
+            if equity <= 0 or price is None or float(price) <= 0 or weight <= 0:
+                target_positions[ticker] = 0
+                continue
+
+            target_positions[ticker] = int(shares_for_target_weight(
+                weight,
+                float(price),
+                float(equity),
+                cb_scaling=cb_scaling,
+            ))
+
+        return target_positions
 
     def _flatten_all(self) -> None:
         if self._executor is not None:

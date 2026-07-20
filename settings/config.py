@@ -15,8 +15,8 @@ UNIVERSE = {
     "assets": {
         "SPY": {"asset_class": "equity", "validated": True},
         "QQQ": {"asset_class": "equity", "validated": True},
-        "GLD": {"asset_class": "gold", "validated": False},
-        "IEF": {"asset_class": "bonds", "validated": False},
+        "GLD": {"asset_class": "gold", "validated": True},
+        "IEF": {"asset_class": "bonds", "validated": True},
         "DBC": {"asset_class": "commod", "validated": False},
     },
     "class_caps": {

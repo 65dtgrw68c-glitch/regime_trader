@@ -44,3 +44,17 @@ def test_portfolio_backtester_builds_dynamic_weighted_returns():
     gross_exposure = result.weights.abs().sum(axis=1)
 
     assert (gross_exposure <= gross_cap + 1e-9).all()
+
+
+def test_tradable_universe_contains_validated_diversifiers():
+    from core.universe import tradable_universe
+
+    universe = tradable_universe()
+
+    assert "SPY" in universe
+    assert "QQQ" in universe
+    assert "GLD" in universe
+    assert "IEF" in universe
+
+    # DBC bleibt optional und soll aktuell noch nicht live gehandelt werden.
+    assert "DBC" not in universe

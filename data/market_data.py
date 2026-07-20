@@ -15,6 +15,7 @@ unit-testable without the SDK or network access.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -173,9 +174,12 @@ class MarketDataFeed:
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         from alpaca.data.enums import Adjustment, DataFeed
 
+        api_key = getattr(self._client, "api_key", "") or os.getenv("ALPACA_API_KEY", "")
+        secret_key = getattr(self._client, "secret_key", "") or os.getenv("ALPACA_SECRET_KEY", "")
+
         data_client = getattr(self._client, "data", None) or StockHistoricalDataClient(
-            getattr(self._client, "api_key", ""),
-            getattr(self._client, "secret_key", ""),
+            api_key,
+            secret_key,
         )
         tf = self._parse_timeframe(timeframe, TimeFrame, TimeFrameUnit)
         request = StockBarsRequest(

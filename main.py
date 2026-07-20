@@ -445,6 +445,48 @@ class TradingSystem:
         #     every bar — as this loop once did — silently accumulates
         #     positions; only the DELTA may trade.)
         target_weight = sum(strat_signal.target_weights.values())
+
+        # Portfolio selector gate:
+        # The live loop is still ticker-driven, but this gate applies the same
+        # decorrelation selector used by the portfolio backtester. If the
+        # current ticker is rejected by the portfolio selector, its target is
+        # forced to zero. If a position is already open, force a rebalance so
+        # the duplicate exposure can be reduced.
+        portfolio_forced_rebalance = False
+        try:
+            from core.universe import build_views
+            from core.selector import select_decorrelated_views
+
+            histories = {
+                asset: st.history
+                for asset, st in self._states.items()
+                if st.history is not None and not st.history.empty
+            }
+            trend_states = {
+                asset: is_trend_confirmed(st.history["close"])
+                for asset, st in self._states.items()
+                if st.history is not None and not st.history.empty
+            }
+
+            views = build_views(histories, trend_states)
+            selected_views = select_decorrelated_views(views, histories)
+            selected_tickers = {v.ticker for v in selected_views}
+
+            decision["portfolio_selected"] = ticker in selected_tickers
+            decision["portfolio_selected_tickers"] = sorted(selected_tickers)
+
+            if ticker not in selected_tickers:
+                if target_weight:
+                    logger.info(
+                        "Portfolio selector suppresses %s target. selected=%s",
+                        ticker,
+                        sorted(selected_tickers),
+                    )
+                target_weight = 0.0
+                portfolio_forced_rebalance = current_qty != 0
+        except Exception as exc:
+            logger.warning("Portfolio selector gate failed for %s: %s", ticker, exc)
+
         candidate_weights = {}
         for asset in self._states:
             if asset == ticker:
@@ -473,7 +515,7 @@ class TradingSystem:
         # 7 — Trade only on a rebalance trigger (regime change / drift /
         #     staleness) and only while the exchange is open; a market
         #     order placed after hours would just queue until the next open.
-        if not strat_signal.should_rebalance:
+        if not strat_signal.should_rebalance and not portfolio_forced_rebalance:
             decision["action"] = "hold"
             decision["reason"] = "no_rebalance_trigger"
         elif delta == 0:

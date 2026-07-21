@@ -169,6 +169,75 @@ def test_portfolio_slippage_reduces_returns():
     assert slippage_result.metadata["slippage_model"] == "turnover_times_bps"
     assert slippage_result.equity_curve.iloc[-1] <= no_slippage_result.equity_curve.iloc[-1]
 
+
+class _FullInvestedPortfolioBacktester(PortfolioBacktester):
+    """Test helper: keep exactly 100% invested in SPY."""
+
+    def compute_daily_targets(self, date):
+        return {"SPY": 1.0}
+
+
+def _make_gap_data(n: int = 201) -> pd.DataFrame:
+    idx = pd.bdate_range("2021-01-01", periods=n, freq="B")
+    df = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 121.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1_000_000.0,
+        },
+        index=idx,
+    )
+
+    # First tradable test bar after the 200-bar warmup:
+    # close-to-close return: 121 / 100 - 1 = 21%
+    # next-open return:      121 / 110 - 1 = 10%
+    df.iloc[200, df.columns.get_loc("open")] = 110.0
+    df.iloc[200, df.columns.get_loc("close")] = 121.0
+    return df
+
+
+def test_portfolio_next_open_execution_ignores_overnight_gap():
+    data = _make_gap_data(201)
+    histories = {"SPY": data}
+    end_date = data.index[200]
+
+    bt = _FullInvestedPortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        execution_model="next_open",
+    )
+
+    result = bt.run(end_date=end_date)
+
+    assert result.metadata["execution_model"] == "next_open"
+    assert len(result.returns) == 1
+    assert result.returns.iloc[0] == pytest.approx(0.10)
+
+
+def test_portfolio_close_to_close_execution_kept_for_comparison():
+    data = _make_gap_data(201)
+    histories = {"SPY": data}
+    end_date = data.index[200]
+
+    bt = _FullInvestedPortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        execution_model="close_to_close",
+    )
+
+    result = bt.run(end_date=end_date)
+
+    assert result.metadata["execution_model"] == "close_to_close"
+    assert len(result.returns) == 1
+    assert result.returns.iloc[0] == pytest.approx(0.21)
+
+
+def test_portfolio_invalid_execution_model_rejected():
+    with pytest.raises(ValueError):
+        PortfolioBacktester(histories={}, execution_model="same_close")
+
 class _HalfInvestedPortfolioBacktester(PortfolioBacktester):
     """Test helper: keep exactly 50% invested and 50% cash."""
 

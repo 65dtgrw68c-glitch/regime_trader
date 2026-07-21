@@ -5,13 +5,13 @@ compute daily target weights, then applies yesterday's target weights to the
 next close-to-close return. It is intentionally lightweight but it produces a
 real portfolio return series, equity curve, weight history and turnover series.
 
-Current execution model:
+Current default execution model:
 - decision at T-1 close
-- portfolio return from T-1 close to T close
+- execution at T open
+- mark-to-market at T close
 
-This is a close-to-close approximation. The single-asset backtester has the
-more realistic next-open execution model; portfolio next-open execution remains
-a separate future hardening step.
+The legacy close-to-close approximation is still available via
+execution_model="close_to_close" for comparison and regression tests.
 """
 from __future__ import annotations
 
@@ -57,12 +57,19 @@ class PortfolioBacktester:
         transaction_cost_bps: float = 0.0,
         slippage_bps: float = 0.0,
         cash_yield_annual: float = 0.0,
+        execution_model: str = "next_open",
     ):
         self.histories = histories
         self.initial_capital = float(initial_capital)
         self.transaction_cost_bps = float(transaction_cost_bps)
         self.slippage_bps = float(slippage_bps)
         self.cash_yield_annual = float(cash_yield_annual)
+        self.execution_model = str(execution_model)
+
+        if self.execution_model not in {"next_open", "close_to_close"}:
+            raise ValueError(
+                "execution_model must be 'next_open' or 'close_to_close'"
+            )
 
     def _common_index(self) -> pd.DatetimeIndex:
         indexes = []
@@ -183,8 +190,18 @@ class PortfolioBacktester:
                 prev_close = float(df.loc[decision_date, "close"])
                 curr_close = float(df.loc[current_date, "close"])
 
-                if prev_close > 0:
-                    asset_ret = (curr_close / prev_close) - 1.0
+                if self.execution_model == "next_open":
+                    if "open" in df.columns:
+                        entry_price = float(df.loc[current_date, "open"])
+                    else:
+                        entry_price = prev_close
+                    exit_price = curr_close
+                else:
+                    entry_price = prev_close
+                    exit_price = curr_close
+
+                if entry_price > 0:
+                    asset_ret = (exit_price / entry_price) - 1.0
                     portfolio_ret += float(weight) * asset_ret
 
             portfolio_ret += cash_return
@@ -231,6 +248,6 @@ class PortfolioBacktester:
                 "slippage_model": "turnover_times_bps",
                 "cash_yield_annual": self.cash_yield_annual,
                 "cash_yield_model": "annual_rate_divided_by_252_trading_days",
-                "execution_model": "close_to_close_approximation",
+                "execution_model": self.execution_model,
             },
         )

@@ -44,6 +44,10 @@ Branch: improve-bot-risk-return
 - Portfolio batch loop halt test
 - Portfolio batch loop market-closed test
 - Portfolio batch loop executor-failure test
+- Portfolio batch loop risk-rejection test
+- Portfolio batch loop halt test
+- Portfolio batch loop market-closed test
+- Portfolio batch loop executor-failure test
 
 ### Deployment
 - Oracle Cloud systemd deployment

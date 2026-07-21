@@ -384,6 +384,35 @@ class TestPortfolioBatchLoop:
         assert decisions["AAA"]["target_position"] == 10
         assert decisions["BBB"]["target_position"] == 20
 
+
+    def test_run_portfolio_once_rejects_invalid_book_without_rebalance(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True)
+        assert sys_.startup() is True
+
+        monkeypatch.setattr(
+            sys_,
+            "_compute_live_target_book",
+            lambda: {"AAA": 0.75, "BBB": 0.75},
+        )
+
+        rejected = MagicMock()
+        rejected.approved = False
+        rejected.reason = "gross exposure exceeded"
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: rejected)
+
+        sys_._executor.rebalance.reset_mock()
+
+        bars = _bars_after(1, seed=303).iloc[-1]
+        decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        assert decisions["AAA"]["action"] == "rejected_by_risk"
+        assert decisions["BBB"]["action"] == "rejected_by_risk"
+        assert decisions["AAA"]["reason"] == "gross exposure exceeded"
+        assert decisions["BBB"]["reason"] == "gross exposure exceeded"
+
+        sys_._executor.rebalance.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 2c. Pause recovery
 # ---------------------------------------------------------------------------

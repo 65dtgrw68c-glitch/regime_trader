@@ -520,7 +520,7 @@ class TestBenchmarkTimingAndYieldSeries:
         res = bt.run(data)
         sma_bench = res.benchmark_returns["sma_200"]
         close = data["close"]
-        invested = (close > close.rolling(200).mean()).shift(1).fillna(False)
+        invested = (close > close.rolling(200).mean()).shift(1).fillna(False).astype(bool)
         ref = (close.pct_change().fillna(0.0) * invested.astype(float))
         ref = ref.loc[sma_bench.index]
         assert np.allclose(sma_bench.values, ref.values)

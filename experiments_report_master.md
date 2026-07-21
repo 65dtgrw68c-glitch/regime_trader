@@ -21,7 +21,7 @@ Branch: improve-bot-risk-return
 - Portfolio turnover tracking
 - Portfolio transaction costs
 - Idle cash yield
-- Execution model documented as close-to-close approximation
+- Portfolio execution supports next-open as default and close-to-close for comparison
 - Live/backtest trend logic alignment
 - Target-weight parity test with live path
 
@@ -64,7 +64,7 @@ Branch: improve-bot-risk-return
 
 ## Experimental / Needs More Evidence
 
-- Portfolio next-open execution
+- Portfolio next-open execution implemented
 - Portfolio slippage model
 - Live-vs-backtest full decision parity beyond target weights
 - Portfolio batch loop halt/risk rejection edge cases
@@ -79,11 +79,10 @@ Branch: improve-bot-risk-return
 - Turnover is measured as sum(abs(new_weight - old_weight)).
 - Transaction costs are turnover * transaction_cost_bps / 10000.
 - Idle cash receives cash_yield_annual / 252 per trading day.
-- Current portfolio execution model remains close-to-close approximation.
+- Current portfolio execution model defaults to next-open execution, with close-to-close retained for comparison.
 
 ## Open Risks
 
-1. Portfolio backtester still does not use next-open execution.
 2. Portfolio slippage model is not yet implemented.
 3. There are two PortfolioBacktester classes:
    - core/portfolio_backtester.py

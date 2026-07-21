@@ -51,16 +51,18 @@ class PortfolioBacktester:
     """
 
     def __init__(
-            self,
-            histories: Dict[str, pd.DataFrame],
-            initial_capital: float = 100_000.0,
-            transaction_cost_bps: float = 0.0,
-            cash_yield_annual: float = 0.0,
+        self,
+        histories: Dict[str, pd.DataFrame],
+        initial_capital: float = 100_000.0,
+        transaction_cost_bps: float = 0.0,
+        slippage_bps: float = 0.0,
+        cash_yield_annual: float = 0.0,
     ):
-            self.histories = histories
-            self.initial_capital = float(initial_capital)
-            self.transaction_cost_bps = float(transaction_cost_bps)
-            self.cash_yield_annual = float(cash_yield_annual)
+        self.histories = histories
+        self.initial_capital = float(initial_capital)
+        self.transaction_cost_bps = float(transaction_cost_bps)
+        self.slippage_bps = float(slippage_bps)
+        self.cash_yield_annual = float(cash_yield_annual)
 
     def _common_index(self) -> pd.DatetimeIndex:
         indexes = []
@@ -164,7 +166,8 @@ class PortfolioBacktester:
 
             weights = self.compute_daily_targets(decision_date)
             turnover = self._calculate_turnover(previous_weights, weights)
-            turnover_cost = turnover * self.transaction_cost_bps / 10_000.03
+            turnover_cost = turnover * self.transaction_cost_bps / 10_000.0
+            slippage_cost = turnover * self.slippage_bps / 10_000.0
 
             gross_exposure = sum(abs(float(w)) for w in weights.values())
             cash_weight = max(0.0, 1.0 - gross_exposure)
@@ -186,6 +189,7 @@ class PortfolioBacktester:
 
             portfolio_ret += cash_return
             portfolio_ret -= turnover_cost
+            portfolio_ret -= slippage_cost
             portfolio_returns.append(portfolio_ret)
             return_dates.append(current_date)
             weight_rows.append(weights)
@@ -223,6 +227,8 @@ class PortfolioBacktester:
                 "average_turnover": float(turnover.mean()) if len(turnover) else 0.0,
                 "transaction_cost_bps": self.transaction_cost_bps,
                 "transaction_cost_model": "turnover_times_bps",
+                "slippage_bps": self.slippage_bps,
+                "slippage_model": "turnover_times_bps",
                 "cash_yield_annual": self.cash_yield_annual,
                 "cash_yield_model": "annual_rate_divided_by_252_trading_days",
                 "execution_model": "close_to_close_approximation",

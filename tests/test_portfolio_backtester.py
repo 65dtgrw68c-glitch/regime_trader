@@ -125,6 +125,50 @@ def test_portfolio_transaction_costs_reduce_returns():
     assert cost_result.equity_curve.iloc[-1] <= no_cost_result.equity_curve.iloc[-1]
 
 
+
+def test_zero_slippage_matches_default_behavior():
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
+
+    default_bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
+    zero_slippage_bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        slippage_bps=0.0,
+    )
+
+    default_result = default_bt.run()
+    zero_slippage_result = zero_slippage_bt.run()
+
+    pd.testing.assert_series_equal(default_result.returns, zero_slippage_result.returns)
+
+
+def test_portfolio_slippage_reduces_returns():
+    histories = {
+        "SPY": _make_data(260),
+        "QQQ": _make_data(260),
+    }
+
+    no_slippage_bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        slippage_bps=0.0,
+    )
+    slippage_bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=100_000,
+        slippage_bps=25.0,
+    )
+
+    no_slippage_result = no_slippage_bt.run()
+    slippage_result = slippage_bt.run()
+
+    assert slippage_result.metadata["slippage_bps"] == pytest.approx(25.0)
+    assert slippage_result.metadata["slippage_model"] == "turnover_times_bps"
+    assert slippage_result.equity_curve.iloc[-1] <= no_slippage_result.equity_curve.iloc[-1]
+
 class _HalfInvestedPortfolioBacktester(PortfolioBacktester):
     """Test helper: keep exactly 50% invested and 50% cash."""
 

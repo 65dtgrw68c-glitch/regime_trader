@@ -442,6 +442,35 @@ class TestPortfolioBatchLoop:
         sys_._executor.rebalance.assert_not_called()
 
 
+
+    def test_run_portfolio_once_skips_rebalance_when_market_closed(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=False)
+        assert sys_.startup() is True
+
+        monkeypatch.setattr(
+            sys_,
+            "_compute_live_target_book",
+            lambda: {"AAA": 0.50, "BBB": 0.50},
+        )
+
+        approved = MagicMock()
+        approved.approved = True
+        approved.reason = ""
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: approved)
+
+        monkeypatch.setattr(sys_, "_market_is_open", lambda: False)
+
+        sys_._executor.rebalance.reset_mock()
+
+        bars = _bars_after(1, seed=505).iloc[-1]
+        decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        assert decisions["AAA"]["action"] == "skipped_market_closed"
+        assert decisions["BBB"]["action"] == "skipped_market_closed"
+
+        sys_._executor.rebalance.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 2c. Pause recovery
 # ---------------------------------------------------------------------------

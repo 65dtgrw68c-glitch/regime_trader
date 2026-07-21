@@ -80,6 +80,7 @@ Branch: improve-bot-risk-return
 3. There are two PortfolioBacktester classes:
    - core/portfolio_backtester.py
    - core/backtester.py
+   Legacy check: current grep found active usage in main.py/tests for the new portfolio backtester path, but no direct import from core.backtester.PortfolioBacktester.
 4. Portfolio batch loop needs more tests for:
    - drawdown halt
    - rejected target book

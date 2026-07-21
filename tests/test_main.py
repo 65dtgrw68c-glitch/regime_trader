@@ -507,6 +507,39 @@ class TestPortfolioBatchLoop:
         assert decisions["BBB"]["target_position"] == 20
 
 
+
+    def test_run_portfolio_once_awaits_rebalance_fills(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True)
+        assert sys_.startup() is True
+
+        monkeypatch.setattr(
+            sys_,
+            "_compute_live_target_book",
+            lambda: {"AAA": 0.50, "BBB": 0.50},
+        )
+        monkeypatch.setattr(
+            sys_,
+            "_target_positions_from_weights",
+            lambda target_weights, prices, equity: {"AAA": 10, "BBB": 20},
+        )
+        monkeypatch.setattr(sys_, "_market_is_open", lambda: True)
+
+        approved = MagicMock()
+        approved.approved = True
+        approved.reason = ""
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: approved)
+
+        sys_._executor.rebalance.return_value = ["oid-aaa", "oid-bbb"]
+
+        bars = _bars_after(1, seed=707).iloc[-1]
+        sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        sys_._executor.await_fills.assert_called_once_with(
+            ["oid-aaa", "oid-bbb"],
+            timeout=15,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 2c. Pause recovery
 # ---------------------------------------------------------------------------

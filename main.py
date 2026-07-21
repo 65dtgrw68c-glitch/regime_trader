@@ -461,6 +461,19 @@ class TradingSystem:
 
         self._orders_submitted += submitted
 
+        if submitted:
+            try:
+                self._executor.await_fills(order_ids, timeout=15)
+            except TimeoutError:
+                self._alert(
+                    "Portfolio rebalance orders not filled within 15s — "
+                    "position snapshot may lag.",
+                    SEVERITY_WARNING,
+                    key="slow_fill_portfolio_rebalance",
+                )
+            except Exception as exc:
+                logger.warning("await_fills failed for portfolio rebalance: %s", exc)
+
         for ticker in updated_tickers:
             decisions[ticker]["target_position"] = int(target_positions.get(ticker, 0))
             if submitted:

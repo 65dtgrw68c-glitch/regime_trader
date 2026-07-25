@@ -462,12 +462,17 @@ class TradingSystem:
         self._orders_submitted += submitted
 
         if submitted:
+            # Portfolio rebalances are the full target book. Do not immediately
+            # cancel still-pending rebalance orders during normal oneshot
+            # shutdown, otherwise positions may never reach the target book.
+            self._preserve_open_orders_on_shutdown = True
             try:
-                self._executor.await_fills(order_ids, timeout=15)
+                self._executor.await_fills(order_ids, timeout=90)
+                self._preserve_open_orders_on_shutdown = False
             except TimeoutError:
                 self._alert(
-                    "Portfolio rebalance orders not filled within 15s — "
-                    "position snapshot may lag.",
+                    "Portfolio rebalance orders not filled within 90s — "
+                    "leaving pending orders open instead of cancelling at shutdown.",
                     SEVERITY_WARNING,
                     key="slow_fill_portfolio_rebalance",
                 )
@@ -873,10 +878,16 @@ class TradingSystem:
         self._running = False
         logger.info("Shutting down (%s)...", reason or "normal")
 
-        # Cancel all pending orders
+        # Cancel all pending orders unless a portfolio rebalance intentionally
+        # leaves orders open after a fill timeout.
         if self._executor is not None:
             try:
-                self._executor.cancel_all_open_orders()
+                if getattr(self, "_preserve_open_orders_on_shutdown", False):
+                    logger.warning(
+                        "Preserving open portfolio rebalance orders during shutdown."
+                    )
+                else:
+                    self._executor.cancel_all_open_orders()
             except Exception as exc:
                 logger.warning("Failed to cancel orders on shutdown: %s", exc)
 

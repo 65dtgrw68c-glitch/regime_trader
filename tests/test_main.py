@@ -536,9 +536,44 @@ class TestPortfolioBatchLoop:
 
         sys_._executor.await_fills.assert_called_once_with(
             ["oid-aaa", "oid-bbb"],
-            timeout=15,
+            timeout=90,
         )
 
+
+
+    def test_shutdown_preserves_pending_portfolio_rebalance_orders(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True)
+        assert sys_.startup() is True
+
+        monkeypatch.setattr(
+            sys_,
+            "_compute_live_target_book",
+            lambda: {"AAA": 0.50, "BBB": 0.50},
+        )
+        monkeypatch.setattr(
+            sys_,
+            "_target_positions_from_weights",
+            lambda target_weights, prices, equity: {"AAA": 10, "BBB": 20},
+        )
+        monkeypatch.setattr(sys_, "_market_is_open", lambda: True)
+
+        approved = MagicMock()
+        approved.approved = True
+        approved.reason = ""
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: approved)
+
+        sys_._executor.rebalance.return_value = ["oid-aaa", "oid-bbb"]
+        sys_._executor.await_fills.side_effect = TimeoutError
+
+        bars = _bars_after(1, seed=808).iloc[-1]
+        sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        assert getattr(sys_, "_preserve_open_orders_on_shutdown") is True
+
+        sys_._executor.cancel_all_open_orders.reset_mock()
+        sys_.shutdown(reason="test shutdown")
+
+        sys_._executor.cancel_all_open_orders.assert_not_called()
 
 # ---------------------------------------------------------------------------
 # 2c. Pause recovery

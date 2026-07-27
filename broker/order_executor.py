@@ -143,35 +143,104 @@ class OrderExecutor:
         logger.info("Cancelled all open orders.")
 
     def await_fills(self, order_ids: list[str], timeout: int = 30) -> dict:
-        """Wartet auf Fills. Bei Timeout werden hängende Orders automatisch storniert."""
+        """
+        Poll until every order reaches a terminal status or `timeout`
+        seconds elapse. Returns a dict of order_id -> {status, filled_qty}.
+
+        Timeout handling:
+        - recheck each still-pending order before cancelling;
+        - cancel only orders that are still non-terminal;
+        - treat "already filled" cancel errors as filled instead of failure.
+        """
         deadline = time.time() + timeout
         results: dict[str, dict] = {}
         pending = set(order_ids)
 
         while pending and time.time() < deadline:
             for oid in list(pending):
+                order = self._client.trading.get_order_by_id(oid)
+                status = str(getattr(order, "status", "")).lower()
+                filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+                results[oid] = {"status": status, "filled_qty": filled_qty}
+
+                if status in _TERMINAL_STATUSES:
+                    pending.discard(oid)
+                    if status == "filled" and self._trade_logger:
+                        self._trade_logger.log_fill({
+                            "ticker": str(getattr(order, "symbol", "")),
+                            "qty": filled_qty,
+                            "fill_price": float(getattr(order, "filled_avg_price", 0) or 0),
+                            "order_id": oid,
+                        })
+
+            if pending:
+                time.sleep(1)
+
+        if pending:
+            logger.warning(
+                "Timeout reached with %d pending order(s). Rechecking before cancel...",
+                len(pending),
+            )
+
+            still_pending = set()
+
+            for oid in list(pending):
                 try:
                     order = self._client.trading.get_order_by_id(oid)
                     status = str(getattr(order, "status", "")).lower()
                     filled_qty = float(getattr(order, "filled_qty", 0) or 0)
                     results[oid] = {"status": status, "filled_qty": filled_qty}
-                    if status in _TERMINAL_STATUSES:
-                        pending.discard(oid)
-                except Exception as exc:
-                    logger.error("Error checking status for order %s: %s", oid, exc)
-            if pending:
-                time.sleep(1)
 
-        if pending:
-            logger.warning("Timeout bei %d Order(s). Storniere verbleibende Orders...", len(pending))
-            for oid in pending:
+                    if status in _TERMINAL_STATUSES:
+                        logger.info(
+                            "Order %s reached terminal status after timeout: %s",
+                            oid,
+                            status,
+                        )
+                        continue
+
+                    still_pending.add(oid)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not recheck timed-out order %s before cancel: %s",
+                        oid,
+                        exc,
+                    )
+                    still_pending.add(oid)
+
+            for oid in list(still_pending):
                 try:
                     self._client.trading.cancel_order_by_id(oid)
-                    logger.info("Order %s wegen Timeout storniert", oid)
-                    results[oid] = {"status": "canceled_on_timeout", "filled_qty": results.get(oid, {}).get("filled_qty", 0.0)}
+                    logger.info("Cancelled timed-out order %s", oid)
+                    results[oid] = {
+                        "status": "canceled_on_timeout",
+                        "filled_qty": results.get(oid, {}).get("filled_qty", 0.0),
+                    }
                 except Exception as exc:
-                    logger.error("Fehler beim Stornieren der Timeout-Order %s: %s", oid, exc)
-            
-            raise TimeoutError(f"{len(pending)} order(s) timed out and were cancelled: {pending}")
+                    msg = str(exc).lower()
+                    if "already" in msg and "filled" in msg:
+                        logger.info(
+                            "Timed-out order %s was already filled when cancel was attempted.",
+                            oid,
+                        )
+                        results[oid] = {
+                            "status": "filled",
+                            "filled_qty": results.get(oid, {}).get("filled_qty", 0.0),
+                        }
+                        still_pending.discard(oid)
+                    else:
+                        logger.error("Failed to cancel timed-out order %s: %s", oid, exc)
+
+            unresolved = {
+                oid
+                for oid in still_pending
+                if results.get(oid, {}).get("status") not in _TERMINAL_STATUSES
+                and results.get(oid, {}).get("status") != "canceled_on_timeout"
+            }
+
+            if unresolved:
+                raise TimeoutError(
+                    f"{len(unresolved)} order(s) not terminal after timeout/cancel: {unresolved}"
+                )
 
         return results

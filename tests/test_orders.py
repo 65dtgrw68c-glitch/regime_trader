@@ -258,8 +258,12 @@ class TestAwaitFills:
             "oid-1", status="accepted", filled_qty=0
         )
         ex = OrderExecutor(client, _tracker_with({}))
-        with pytest.raises(TimeoutError):
-            ex.await_fills(["oid-1"], timeout=1)
+
+        result = ex.await_fills(["oid-1"], timeout=0)
+
+        assert result["oid-1"]["status"] == "canceled_on_timeout"
+        assert result["oid-1"]["filled_qty"] == 0.0
+        client.trading.cancel_order_by_id.assert_called_once_with("oid-1")
 
     def test_await_fills_reports_partial(self):
         client = _make_client()
@@ -292,3 +296,43 @@ class TestClientOrderId:
         ex.submit_order("SPY", 5, "buy")
         request = client.trading.submit_order.call_args.args[0]
         assert not hasattr(request, "client_order_id")
+
+
+def test_await_fills_treats_already_filled_cancel_error_as_filled():
+    from broker.order_executor import OrderExecutor
+
+    class FakeOrder:
+        def __init__(self, status="new", filled_qty=0):
+            self.status = status
+            self.filled_qty = filled_qty
+            self.symbol = "SPY"
+            self.filled_avg_price = 100.0
+
+    class FakeTrading:
+        def __init__(self):
+            self.cancel_calls = 0
+
+        def get_order_by_id(self, oid):
+            return FakeOrder(status="new", filled_qty=0)
+
+        def cancel_order_by_id(self, oid):
+            self.cancel_calls += 1
+            raise RuntimeError(
+                '{"code":42210000,"message":"order is already in \\"filled\\" state"}'
+            )
+
+    class FakeClient:
+        def __init__(self):
+            self.trading = FakeTrading()
+
+    class FakePositions:
+        def diff(self, target):
+            return {}
+
+    client = FakeClient()
+    executor = OrderExecutor(client=client, position_tracker=FakePositions())
+
+    result = executor.await_fills(["oid-1"], timeout=0)
+
+    assert result["oid-1"]["status"] == "filled"
+    assert client.trading.cancel_calls == 1

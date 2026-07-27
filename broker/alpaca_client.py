@@ -1,37 +1,44 @@
 """
-Alpaca Client — authenticated API wrapper for Alpaca Markets.
-
-Import-safety
--------------
-The `alpaca-py` SDK is imported lazily inside `connect()` so that this module
-(and everything that depends on it) imports cleanly in environments where the
-SDK is not installed — e.g. unit tests that inject a mock client.
-
-Credentials are read from the environment (.env) via python-dotenv:
-    ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, PAPER
+Alpaca Client — authenticated API wrapper for Alpaca Markets with built-in retry resilience.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
+from functools import wraps
 from typing import Any, Optional
 
 from settings import config
-
 from broker.base import BaseBroker
 
 logger = logging.getLogger(__name__)
 
 
+def with_retry(max_retries: int = 3, delay: float = 1.0):
+    """Decorator für automatisches Retry bei temporären Netzwerkausfällen oder API-Rate-Limits."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning("API Call %s fehlgeschlagen (Versuch %d/%d): %s", func.__name__, attempt, max_retries, exc)
+                    if attempt < max_retries:
+                        time.sleep(delay * (2 ** (attempt - 1)))
+            logger.error("API Call %s nach %d Versuchen fehlgeschlagen.", func.__name__, max_retries)
+            raise last_exc
+        return wrapper
+    return decorator
+
+
 class AlpacaClient(BaseBroker):
     """
     Thin wrapper around alpaca-py's trading + historical data clients.
-
-    Usage:
-        client = AlpacaClient()
-        client.connect()                 # lazily builds the SDK clients
-        if client.is_market_open(): ...
     """
 
     def __init__(
@@ -41,11 +48,10 @@ class AlpacaClient(BaseBroker):
         base_url: Optional[str] = None,
         paper: Optional[bool] = None,
     ) -> None:
-        # Load .env if python-dotenv is available (optional dependency).
         try:
             from dotenv import load_dotenv
             load_dotenv()
-        except Exception:                # pragma: no cover - env dependent
+        except Exception:
             pass
 
         self.api_key    = api_key    or os.getenv("ALPACA_API_KEY", "")
@@ -56,12 +62,8 @@ class AlpacaClient(BaseBroker):
 
         self._trading: Any = None
         self._data: Any = None
-        self._max_retries = config.BROKER["max_retries"]
-        self._retry_delay = config.BROKER["retry_delay"]
-
-    # ------------------------------------------------------------------
-    # Connection
-    # ------------------------------------------------------------------
+        self._max_retries = config.BROKER.get("max_retries", 3)
+        self._retry_delay = config.BROKER.get("retry_delay", 1.0)
 
     def connect(self) -> None:
         """Instantiate the alpaca-py clients (lazy SDK import)."""
@@ -78,11 +80,7 @@ class AlpacaClient(BaseBroker):
         logger.info("AlpacaClient connected (paper=%s).", self.paper)
 
     def verify_connection(self) -> bool:
-        """
-        Confirm the connection works and the account is active.
-        Returns True on success; logs and returns False on auth/network
-        failure instead of raising, so callers can degrade gracefully.
-        """
+        """Confirm the connection works and the account is active."""
         try:
             if self._trading is None:
                 self.connect()
@@ -96,10 +94,6 @@ class AlpacaClient(BaseBroker):
             logger.warning("Alpaca account status is '%s' (expected ACTIVE).", status)
         return ok
 
-    # ------------------------------------------------------------------
-    # Client accessors
-    # ------------------------------------------------------------------
-
     @property
     def trading(self) -> Any:
         if self._trading is None:
@@ -112,12 +106,9 @@ class AlpacaClient(BaseBroker):
             self.connect()
         return self._data
 
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
-
+    @with_retry(max_retries=3, delay=1.0)
     def get_account(self) -> dict:
-        """Return account info as a plain dict."""
+        """Return account info as a plain dict (mit Retry-Schutz)."""
         acct = self.trading.get_account()
         return {
             "buying_power":   float(getattr(acct, "buying_power", 0.0)),
@@ -127,8 +118,9 @@ class AlpacaClient(BaseBroker):
             "status":         str(getattr(acct, "status", "")),
         }
 
+    @with_retry(max_retries=3, delay=1.0)
     def get_clock(self) -> dict:
-        """Return the market clock as a plain dict."""
+        """Return the market clock as a plain dict (mit Retry-Schutz)."""
         clock = self.trading.get_clock()
         return {
             "is_open":    bool(getattr(clock, "is_open", False)),

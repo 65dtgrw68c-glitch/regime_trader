@@ -109,6 +109,11 @@ class OrderExecutor:
 
         status = str(getattr(order, "status", "")).lower()
         oid = str(getattr(order, "id", ""))
+
+        if status == "rejected":
+            logger.error("Order rejected for %s %s x%.4f (id=%s)", side, ticker, qty, oid)
+            return ""
+
         logger.info("Submitted %s %s %s x%.4f (id=%s, status=%s)",
                     order_type, side, ticker, rounded_qty, oid, status)
         return oid

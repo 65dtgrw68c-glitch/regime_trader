@@ -91,7 +91,7 @@ def test_await_fills_cancels_pending_orders_on_timeout():
     tracker = PositionTracker()
     executor = OrderExecutor(client, tracker)
 
-    with pytest.raises(TimeoutError):
-        executor.await_fills(["pending-1"], timeout=0)
+    result = executor.await_fills(["pending-1"], timeout=0)
 
+    assert result["pending-1"]["status"] == "canceled_on_timeout"
     assert "pending-1" in client.trading.cancelled

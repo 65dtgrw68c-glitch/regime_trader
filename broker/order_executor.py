@@ -25,14 +25,37 @@ class OrderExecutor:
         self._trade_logger = trade_logger
         self._submitted_ids: list[str] = []
 
+    def _call_with_retry(self, fn, *args, max_retries: int = 3, delay: float = 1.0, **kwargs):
+        """Retry transient broker API calls with exponential backoff.
+
+        Used for status/cancel calls and only for idempotent order submissions
+        where a stable client_order_id is provided.
+        """
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Broker call %s failed attempt %d/%d: %s",
+                    getattr(fn, "__name__", str(fn)),
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                if attempt < max_retries:
+                    time.sleep(delay * (2 ** (attempt - 1)))
+        raise last_exc
+
     def cancel_open_orders_for_ticker(self, ticker: str) -> None:
         """Storniert alle offenen Orders für ein Symbol vor dem Rebalancing (Schutz vor verwaisten Stops)."""
         try:
-            orders = self._client.trading.get_orders()
+            orders = self._call_with_retry(self._client.trading.get_orders)
             for o in orders:
                 if str(getattr(o, "symbol", "")) == ticker:
                     oid = str(getattr(o, "id", ""))
-                    self._client.trading.cancel_order_by_id(oid)
+                    self._call_with_retry(self._client.trading.cancel_order_by_id, oid)
                     logger.info("Cancelled open order %s for %s prior to rebalance", oid, ticker)
         except Exception as exc:
             logger.error("Failed to cancel open orders for %s: %s", ticker, exc)
@@ -102,7 +125,10 @@ class OrderExecutor:
             )
 
         try:
-            order = self._client.trading.submit_order(request)
+            if client_order_id:
+                order = self._call_with_retry(self._client.trading.submit_order, request)
+            else:
+                order = self._client.trading.submit_order(request)
         except Exception as exc:
             logger.error("Order REJECTED for %s %s x%.4f: %s", side, ticker, qty, exc)
             return ""
@@ -135,7 +161,7 @@ class OrderExecutor:
         return new_id
 
     def cancel_order(self, order_id: str) -> None:
-        self._client.trading.cancel_order_by_id(order_id)
+        self._call_with_retry(self._client.trading.cancel_order_by_id, order_id)
         logger.info("Cancelled order %s", order_id)
 
     def cancel_all_open_orders(self) -> None:
@@ -158,7 +184,7 @@ class OrderExecutor:
 
         while pending and time.time() < deadline:
             for oid in list(pending):
-                order = self._client.trading.get_order_by_id(oid)
+                order = self._call_with_retry(self._client.trading.get_order_by_id, oid)
                 status = str(getattr(order, "status", "")).lower()
                 filled_qty = float(getattr(order, "filled_qty", 0) or 0)
                 results[oid] = {"status": status, "filled_qty": filled_qty}
@@ -186,7 +212,7 @@ class OrderExecutor:
 
             for oid in list(pending):
                 try:
-                    order = self._client.trading.get_order_by_id(oid)
+                    order = self._call_with_retry(self._client.trading.get_order_by_id, oid)
                     status = str(getattr(order, "status", "")).lower()
                     filled_qty = float(getattr(order, "filled_qty", 0) or 0)
                     results[oid] = {"status": status, "filled_qty": filled_qty}
@@ -210,6 +236,9 @@ class OrderExecutor:
 
             for oid in list(still_pending):
                 try:
+                    # Do not retry this timeout-cleanup cancel. Certain broker
+                    # responses such as "already filled" are terminal, not
+                    # transient, and should be classified immediately.
                     self._client.trading.cancel_order_by_id(oid)
                     logger.info("Cancelled timed-out order %s", oid)
                     results[oid] = {

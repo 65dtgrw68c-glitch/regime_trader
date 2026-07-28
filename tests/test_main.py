@@ -575,6 +575,53 @@ class TestPortfolioBatchLoop:
 
         sys_._executor.cancel_all_open_orders.assert_not_called()
 
+
+    def test_run_portfolio_once_records_post_rebalance_drift(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True)
+        assert sys_.startup() is True
+
+        monkeypatch.setattr(
+            sys_,
+            "_compute_live_target_book",
+            lambda: {"AAA": 0.50, "BBB": 0.00},
+        )
+        monkeypatch.setattr(
+            sys_,
+            "_target_positions_from_weights",
+            lambda target_weights, prices, equity: {"AAA": 10, "BBB": 0},
+        )
+        monkeypatch.setattr(sys_, "_market_is_open", lambda: True)
+
+        approved = MagicMock()
+        approved.approved = True
+        approved.reason = ""
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: approved)
+
+        sys_._executor.rebalance.return_value = ["oid-aaa", "oid-bbb"]
+        sys_._executor.await_fills.return_value = {
+            "oid-aaa": {"status": "filled", "filled_qty": 10},
+            "oid-bbb": {"status": "filled", "filled_qty": 0},
+        }
+
+        class LivePosition:
+            def __init__(self, qty):
+                self.qty = qty
+
+        monkeypatch.setattr(sys_._positions, "refresh", MagicMock())
+        monkeypatch.setattr(
+            sys_._positions,
+            "get_positions",
+            lambda: {"AAA": LivePosition(10), "BBB": LivePosition(20)},
+        )
+
+        bars = _bars_after(1, seed=909).iloc[-1]
+        decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        assert decisions["AAA"].get("position_drift") is None
+        assert decisions["BBB"]["position_drift"]["target"] == pytest.approx(0.0)
+        assert decisions["BBB"]["position_drift"]["actual"] == pytest.approx(20.0)
+        assert decisions["BBB"]["position_drift"]["diff"] == pytest.approx(20.0)
+
 # ---------------------------------------------------------------------------
 # 2c. Pause recovery
 # ---------------------------------------------------------------------------

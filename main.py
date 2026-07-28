@@ -488,6 +488,19 @@ class TradingSystem:
 
         self._safe_call(self._positions.refresh)
 
+        position_drift = self._check_portfolio_drift(target_positions)
+        for ticker, drift in position_drift.items():
+            decisions.setdefault(ticker, {"ticker": ticker, "action": "none"})
+            decisions[ticker]["position_drift"] = drift
+
+        if position_drift:
+            logger.warning("Portfolio drift after rebalance: %s", position_drift)
+            self._alert(
+                f"Portfolio drift after rebalance: {position_drift}",
+                SEVERITY_WARNING,
+                key="portfolio_drift",
+            )
+
         logger.info(
             "Portfolio decision: weights=%s positions=%s orders=%d",
             target_weights,
@@ -985,6 +998,47 @@ class TradingSystem:
             target_book.setdefault(asset, 0.0)
 
         return target_book
+
+
+    def _check_portfolio_drift(self, target_positions, tolerance: float = 0.01):
+        """Compare target positions with the refreshed live position snapshot.
+
+        Returns a dict of tickers where actual position differs materially from
+        target. This is a post-rebalance safety check only; it does not trade.
+        """
+        if self._positions is None:
+            return {}
+
+        try:
+            live_positions = self._positions.get_positions()
+        except Exception as exc:
+            logger.warning("Could not read positions for portfolio drift check: %s", exc)
+            return {}
+
+        drift = {}
+
+        for ticker, target_qty in target_positions.items():
+            try:
+                target = float(target_qty or 0.0)
+            except (TypeError, ValueError):
+                target = 0.0
+
+            pos = live_positions.get(ticker) if live_positions else None
+            try:
+                actual = float(pos.qty) if pos else 0.0
+            except (TypeError, ValueError, AttributeError):
+                actual = 0.0
+
+            diff = actual - target
+
+            if abs(diff) >= tolerance:
+                drift[ticker] = {
+                    "target": target,
+                    "actual": actual,
+                    "diff": diff,
+                }
+
+        return drift
 
     def _target_positions_from_weights(self, target_weights, prices, equity):
         """Convert portfolio target weights into absolute target share counts.

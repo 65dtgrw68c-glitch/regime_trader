@@ -72,6 +72,99 @@ def _row(name: str, rets: pd.Series) -> dict:
     }
 
 
+def _simulate_joint_breakers(
+    raw_rets: pd.Series,
+    cash_yield: pd.Series,
+    risk_cfg: dict,
+) -> tuple[pd.Series, dict]:
+    """Approximate portfolio-level circuit breakers on the composed joint book.
+
+    This is intentionally a report-only approximation. It does not replace the
+    live RiskManager. The simulation applies breaker effects from the next bar:
+
+    - daily halve / flatten only if cb_daily_enabled is true;
+    - weekly resize if rolling 5-bar equity loss breaches the configured level;
+    - max drawdown halt is sticky and moves the book to cash yield afterward.
+
+    The approximation is conservative for live-readiness review: it does not
+    assume discretionary re-entry after HALT.
+    """
+    raw_rets = raw_rets.fillna(0.0)
+    cash_yield = cash_yield.reindex(raw_rets.index).fillna(0.0)
+
+    daily_enabled = bool(risk_cfg.get("cb_daily_enabled", True))
+    daily_halve_loss = float(risk_cfg.get("cb_daily_halve_loss", 0.02))
+    daily_flatten_loss = float(risk_cfg.get("cb_daily_flatten_loss", 0.03))
+    weekly_resize_loss = float(risk_cfg.get("cb_weekly_resize_loss", 0.05))
+    max_dd_halt = float(risk_cfg.get("cb_max_drawdown_halt", 0.20))
+    halve_factor = float(risk_cfg.get("cb_halve_factor", 0.50))
+    weekly_factor = float(risk_cfg.get("cb_weekly_resize_factor", 0.50))
+
+    equity = 1.0
+    peak = 1.0
+    next_scale = 1.0
+    halted = False
+
+    adj_rets = []
+    equity_hist = []
+    events = []
+
+    for ts, raw_ret in raw_rets.items():
+        y = float(cash_yield.loc[ts])
+
+        if halted:
+            scale = 0.0
+            adj_ret = y
+        else:
+            scale = float(next_scale)
+            adj_ret = scale * float(raw_ret) + (1.0 - scale) * y
+
+        equity *= 1.0 + adj_ret
+        peak = max(peak, equity)
+        equity_hist.append(equity)
+        adj_rets.append(adj_ret)
+
+        drawdown = equity / peak - 1.0
+
+        if len(equity_hist) >= 6:
+            weekly_ret = equity / equity_hist[-6] - 1.0
+        else:
+            weekly_ret = None
+
+        new_scale = 1.0
+
+        if daily_enabled and adj_ret <= -daily_flatten_loss:
+            new_scale = 0.0
+            events.append((ts, "DAILY_FLATTEN", adj_ret, weekly_ret, drawdown))
+        elif daily_enabled and adj_ret <= -daily_halve_loss:
+            new_scale = min(new_scale, halve_factor)
+            events.append((ts, "DAILY_HALVE", adj_ret, weekly_ret, drawdown))
+
+        if weekly_ret is not None and weekly_ret <= -weekly_resize_loss:
+            new_scale = min(new_scale, weekly_factor)
+            events.append((ts, "WEEKLY_RESIZE", adj_ret, weekly_ret, drawdown))
+
+        if drawdown <= -max_dd_halt:
+            halted = True
+            new_scale = 0.0
+            events.append((ts, "MAX_DRAWDOWN_HALT", adj_ret, weekly_ret, drawdown))
+
+        next_scale = new_scale
+
+    adjusted = pd.Series(adj_rets, index=raw_rets.index, name="joint_breaker_sim")
+
+    stats = {
+        "events": events,
+        "event_count": len(events),
+        "halted": halted,
+        "halt_date": next(
+            (str(ts.date()) for ts, name, *_ in events if name == "MAX_DRAWDOWN_HALT"),
+            "n/a",
+        ),
+    }
+    return adjusted, stats
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Joint-book check for multiple assets")
     ap.add_argument("--tickers", nargs="+", default=["SPY", "QQQ"])
@@ -130,6 +223,12 @@ def main(argv: list[str] | None = None) -> int:
     # cash yield that would be counted len(tickers) times instead of once.
     r_joint = sum(results[t].returns for t in tickers) - yld * (len(tickers) - 1)
 
+    r_joint_breakers, breaker_stats = _simulate_joint_breakers(
+        r_joint,
+        yld,
+        getattr(config, "RISK", {}),
+    )
+
     # Benchmarks over the same OOS bars
     bench_5050 = None
     bench_sma = None
@@ -150,7 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         bench_sma = sum(results[t].benchmark_returns["sma_200"] for t in tickers) / n
 
     rows = [
-        _row(f"JOINT BOOK {'+'.join(tickers)} (live profile)", r_joint),
+        _row(f"JOINT BOOK {'+'.join(tickers)} (raw live profile)", r_joint),
+        _row(f"JOINT BOOK {'+'.join(tickers)} (simulated breakers)", r_joint_breakers),
     ]
     for t in tickers:
         rows.append(_row(
@@ -173,9 +273,12 @@ def main(argv: list[str] | None = None) -> int:
         f"name.  \nData: Yahoo adjusted, {len(common)} aligned bars "
         f"({common[0].date()} … {common[-1].date()}); cash yield: "
         f"{'^IRX series' if tbill is not None else 'flat fallback'}.  \n"
-        f"Method: r_joint = Σ r_i − y*(n−1) (cash-credit corrected); "
-        f"joint breakers not modelled (conservative on DD) — "
-        f"see scripts/portfolio_check.py docstring.\n"
+        f"Method: r_joint = Σ r_i − y*(n−1) (cash-credit corrected). "
+        f"The raw row does not apply joint breakers; the simulated-breaker row "
+        f"approximates next-bar daily/weekly scaling and sticky max-drawdown HALT.  \n"
+        f"Breaker simulation: events={breaker_stats['event_count']}, "
+        f"halted={breaker_stats['halted']}, "
+        f"halt_date={breaker_stats['halt_date']}.\n"
     )
     report = f"# Joint-book portfolio check\n\n{meta}\n{header}" + "\n".join(lines) + "\n"
     Path(args.out).write_text(report, encoding="utf-8")

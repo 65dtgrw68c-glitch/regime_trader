@@ -60,7 +60,12 @@ from run_experiments import (                               # noqa: E402
 from settings import config                                 # noqa: E402
 
 
-def _row(name: str, rets: pd.Series) -> dict:
+def _row(
+    name: str,
+    rets: pd.Series,
+    turnover_x: float | None = None,
+    trades: int | None = None,
+) -> dict:
     lo, hi = sharpe_block_bootstrap_ci(rets)
     return {
         "name": name,
@@ -69,7 +74,38 @@ def _row(name: str, rets: pd.Series) -> dict:
         "sharpe": sharpe_ratio(rets),
         "sharpe_ci": f"[{lo:.2f}, {hi:.2f}]",
         "max_dd": max_drawdown(rets),
+        "turnover_x": turnover_x,
+        "trades": trades,
     }
+
+
+def _result_trade_count(result) -> int:
+    """Return number of fills/trades recorded by a BacktestResult."""
+    trade_log = getattr(result, "trade_log", None)
+    if trade_log is None or getattr(trade_log, "empty", True):
+        return 0
+    return int(len(trade_log))
+
+
+def _result_turnover_x(result, initial_capital: float = 100_000.0) -> float:
+    """Approximate turnover as traded notional divided by initial capital.
+
+    Backtester.trade_log columns are expected to include:
+    qty and fill_price.
+    """
+    trade_log = getattr(result, "trade_log", None)
+    if trade_log is None or getattr(trade_log, "empty", True):
+        return 0.0
+
+    if "qty" not in trade_log.columns or "fill_price" not in trade_log.columns:
+        return 0.0
+
+    notional = (
+        trade_log["qty"].astype(float).abs()
+        * trade_log["fill_price"].astype(float).abs()
+    ).sum()
+
+    return float(notional / initial_capital) if initial_capital else 0.0
 
 
 def _simulate_joint_breakers(
@@ -248,25 +284,54 @@ def main(argv: list[str] | None = None) -> int:
         bench_5050 = sum(results[t].benchmark_returns["buy_and_hold"] for t in tickers) / n
         bench_sma = sum(results[t].benchmark_returns["sma_200"] for t in tickers) / n
 
+    per_name_turnover = {t: _result_turnover_x(results[t]) for t in tickers}
+    per_name_trades = {t: _result_trade_count(results[t]) for t in tickers}
+
+    joint_turnover = sum(per_name_turnover.values())
+    joint_trades = sum(per_name_trades.values())
+
     rows = [
-        _row(f"JOINT BOOK {'+'.join(tickers)} (raw live profile)", r_joint),
-        _row(f"JOINT BOOK {'+'.join(tickers)} (simulated breakers)", r_joint_breakers),
+        _row(
+            f"JOINT BOOK {'+'.join(tickers)} (raw live profile)",
+            r_joint,
+            turnover_x=joint_turnover,
+            trades=joint_trades,
+        ),
+        _row(
+            f"JOINT BOOK {'+'.join(tickers)} (simulated breakers)",
+            r_joint_breakers,
+            turnover_x=joint_turnover,
+            trades=breaker_stats.get("event_count"),
+        ),
     ]
+
     for t in tickers:
         rows.append(_row(
             f"{t} alone @cap {config.RISK['max_position_size']:.2f}",
             results[t].returns,
+            turnover_x=per_name_turnover[t],
+            trades=per_name_trades[t],
         ))
+
     rows.append(_row("bench: equal-weight buy&hold (daily rebal.)", bench_5050))
     rows.append(_row("bench: equal-weight sma_200 (costless)", bench_sma))
 
-    header = ("| Portfolio | Total return | CAGR | Sharpe | Sharpe 90% CI | Max DD |\n"
-              "|---|---:|---:|---:|---:|---:|\n")
-    lines = [
-        f"| {r['name']} | {r['total_return']:+.1%} | {r['cagr']:+.1%} "
-        f"| {r['sharpe']:.2f} | {r['sharpe_ci']} | {r['max_dd']:.1%} |"
-        for r in rows
-    ]
+    header = (
+        "| Portfolio | Total return | CAGR | Sharpe | Sharpe 90% CI | Max DD | Turnover× | Trades/Events |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|\n"
+    )
+    lines = []
+    for r in rows:
+        turnover = r.get("turnover_x")
+        trades = r.get("trades")
+        turnover_s = f"{turnover:.1f}" if turnover is not None else "n/a"
+        trades_s = str(trades) if trades is not None else "n/a"
+        lines.append(
+            f"| {r['name']} | {r['total_return']:+.1%} | {r['cagr']:+.1%} "
+            f"| {r['sharpe']:.2f} | {r['sharpe_ci']} | {r['max_dd']:.1%} "
+            f"| {turnover_s} | {trades_s} |"
+        )
+
     meta = (
         f"Joint-book composition of {', '.join(tickers)} under the pinned "
         f"profile `{profile}`, cap {config.RISK['max_position_size']:.2f} per "
@@ -278,7 +343,11 @@ def main(argv: list[str] | None = None) -> int:
         f"approximates next-bar daily/weekly scaling and sticky max-drawdown HALT.  \n"
         f"Breaker simulation: events={breaker_stats['event_count']}, "
         f"halted={breaker_stats['halted']}, "
-        f"halt_date={breaker_stats['halt_date']}.\n"
+        f"halt_date={breaker_stats['halt_date']}.  \n"
+        f"Turnover× is approximated from Backtester.trade_log as traded notional "
+        f"divided by initial capital, matching scripts/run_experiments.py. "
+        f"For the simulated-breaker row, Trades/Events reports breaker events, "
+        f"not fills.\n"
     )
     report = f"# Joint-book portfolio check\n\n{meta}\n{header}" + "\n".join(lines) + "\n"
     Path(args.out).write_text(report, encoding="utf-8")

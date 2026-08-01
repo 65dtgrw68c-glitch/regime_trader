@@ -224,6 +224,22 @@ class TestOrderOps:
         assert oid.startswith("oid-")
         assert client.trading.submit_order.call_count == 1
 
+    def test_stop_order_rejects_fractional_qty(self):
+        """Alpaca only supports fractional qty on market/limit DAY orders —
+        a fractional stop must fail fast instead of round-tripping to the broker."""
+        client = _make_client()
+        ex = OrderExecutor(client, _tracker_with({}))
+        oid = ex.submit_stop_loss("NVDA", 1.5, stop_price=90.0)
+        assert oid == ""
+        assert client.trading.submit_order.call_count == 0
+
+    def test_stop_order_accepts_whole_qty(self):
+        client = _make_client()
+        ex = OrderExecutor(client, _tracker_with({}))
+        oid = ex.submit_stop_loss("NVDA", 2.0, stop_price=90.0)
+        assert oid.startswith("oid-")
+        assert client.trading.submit_order.call_count == 1
+
     def test_cancel_order_calls_client(self):
         client = _make_client()
         ex = OrderExecutor(client, _tracker_with({}))

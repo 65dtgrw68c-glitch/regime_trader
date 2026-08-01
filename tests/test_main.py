@@ -277,6 +277,32 @@ class TestMainLoop:
             assert decision2["qty"] < target
 
 
+class TestFractionalShares:
+    """The live path no longer truncates share counts to whole numbers —
+    _position_qty, target sizing, and the order/decision qty must all carry
+    fractional precision through untouched."""
+
+    def test_position_qty_preserves_fractional_holding(self, started_system, monkeypatch):
+        class LivePosition:
+            qty = 12.375
+
+        monkeypatch.setattr(
+            started_system._positions, "get_positions",
+            lambda: {"AAA": LivePosition()},
+        )
+        qty = started_system._position_qty("AAA")
+        assert qty == pytest.approx(12.375)
+        assert not float(qty).is_integer()
+
+    def test_target_positions_from_weights_not_truncated(self, started_system):
+        target_positions = started_system._target_positions_from_weights(
+            {"AAA": 0.37}, {"AAA": 101.0}, 100_000.0,
+        )
+        # 0.37 * 100_000 / 101.0 = 366.34... — must not be floored to 366.
+        assert target_positions["AAA"] == pytest.approx(366.336633, rel=1e-4)
+        assert not float(target_positions["AAA"]).is_integer()
+
+
 # ---------------------------------------------------------------------------
 # 2b. Bar hygiene — the live loop must act once per NEW bar
 # ---------------------------------------------------------------------------

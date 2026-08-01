@@ -114,6 +114,15 @@ class OrderExecutor:
         elif order_type == "stop":
             if stop_price is None:
                 raise ValueError("stop order requires stop_price")
+            if not float(rounded_qty).is_integer():
+                # Alpaca rejects stop/stop-limit orders on fractional qty
+                # (fractional trading only supports market/limit DAY orders).
+                # Fail here instead of round-tripping a doomed request to the broker.
+                logger.error(
+                    "Stop order rejected for %s: fractional qty %.4f not "
+                    "supported by broker for stop orders.", ticker, rounded_qty,
+                )
+                return ""
             request = StopOrderRequest(
                 symbol=ticker, qty=rounded_qty, side=order_side,
                 time_in_force=tif, stop_price=stop_price, **extra,

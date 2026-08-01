@@ -480,7 +480,7 @@ class TradingSystem:
                 logger.warning("await_fills failed for portfolio rebalance: %s", exc)
 
         for ticker in updated_tickers:
-            decisions[ticker]["target_position"] = int(target_positions.get(ticker, 0))
+            decisions[ticker]["target_position"] = float(target_positions.get(ticker, 0))
             if submitted:
                 decisions[ticker]["action"] = "portfolio_rebalance_submitted"
             else:
@@ -688,10 +688,10 @@ class TradingSystem:
             logger.info("Portfolio risk rejected %s target: %s", ticker, book_validation.reason)
             return decision
 
-        target_qty = int(shares_for_target_weight(
+        target_qty = shares_for_target_weight(
             target_weight, price, equity,
             cb_scaling=self._risk.size_scaling_factor(),
-        ))
+        )
         delta = target_qty - current_qty
 
         # 7 — Trade only on a rebalance trigger (regime change / drift /
@@ -700,13 +700,16 @@ class TradingSystem:
         if not strat_signal.should_rebalance and not portfolio_forced_rebalance:
             decision["action"] = "hold"
             decision["reason"] = "no_rebalance_trigger"
-        elif delta == 0:
+        elif abs(delta) < 1e-5:
+            # Same de-minimis threshold OrderExecutor/PositionTracker use for
+            # the portfolio book — with fractional shares, exact-zero deltas
+            # are no longer the common case.
             decision["action"] = "no_change"
         elif config.BROKER.get("trade_only_when_open", True) and not self._market_is_open():
             decision["action"] = "skipped_market_closed"
             logger.info(
                 "Market closed — %s decision observed but not submitted "
-                "(would-be delta=%+d @ %.2f).", ticker, delta, price,
+                "(would-be delta=%+.4f @ %.2f).", ticker, delta, price,
             )
         elif delta > 0:
             account = self._safe_call(self._client.get_account) or {}
@@ -717,24 +720,24 @@ class TradingSystem:
                 regime_label=regime_label,
             )
             if validation.approved:
-                self._submit(ticker, int(validation.approved_qty), price,
+                self._submit(ticker, validation.approved_qty, price,
                              regime_label, strat_signal.confidence, side="buy",
                              bar_date=bar_day)
                 decision["action"] = "order_submitted"
                 decision["side"] = "buy"
-                decision["qty"] = int(validation.approved_qty)
+                decision["qty"] = validation.approved_qty
             else:
                 decision["action"] = "rejected_by_risk"
                 decision["reason"] = validation.reason
                 logger.info("Risk rejected %s order: %s", ticker, validation.reason)
         else:
             # delta < 0 — reducing risk needs no order validation
-            self._submit(ticker, int(-delta), price,
+            self._submit(ticker, -delta, price,
                          regime_label, strat_signal.confidence, side="sell",
                          bar_date=bar_day)
             decision["action"] = "order_submitted"
             decision["side"] = "sell"
-            decision["qty"] = int(-delta)
+            decision["qty"] = -delta
 
         # 8 — Refresh positions
         self._safe_call(self._positions.refresh)
@@ -961,15 +964,15 @@ class TradingSystem:
         except Exception as exc:
             logger.warning("await_fills failed for %s: %s", oid, exc)
 
-    def _position_qty(self, ticker: str) -> int:
-        """Current share count held for `ticker` (0 when flat/unknown)."""
+    def _position_qty(self, ticker: str) -> float:
+        """Current share count held for `ticker` (0.0 when flat/unknown)."""
         if self._positions is None:
-            return 0
+            return 0.0
         try:
             pos = self._positions.get_positions().get(ticker)
-            return int(pos.qty) if pos else 0
+            return float(pos.qty) if pos else 0.0
         except Exception:
-            return 0
+            return 0.0
 
     def _compute_live_target_book(self):
         """Compute portfolio target weights from the current live state.
@@ -1058,15 +1061,15 @@ class TradingSystem:
             price = prices.get(ticker)
 
             if equity <= 0 or price is None or float(price) <= 0 or weight <= 0:
-                target_positions[ticker] = 0
+                target_positions[ticker] = 0.0
                 continue
 
-            target_positions[ticker] = int(shares_for_target_weight(
+            target_positions[ticker] = shares_for_target_weight(
                 weight,
                 float(price),
                 float(equity),
                 cb_scaling=cb_scaling,
-            ))
+            )
 
         return target_positions
 

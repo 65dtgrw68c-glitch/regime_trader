@@ -24,6 +24,7 @@ class OrderExecutor:
         self._positions = position_tracker
         self._trade_logger = trade_logger
         self._submitted_ids: list[str] = []
+        self._expected_prices: dict[str, float] = {}
 
     def _call_with_retry(self, fn, *args, max_retries: int = 3, delay: float = 1.0, **kwargs):
         """Retry transient broker API calls with exponential backoff.
@@ -60,20 +61,32 @@ class OrderExecutor:
         except Exception as exc:
             logger.error("Failed to cancel open orders for %s: %s", ticker, exc)
 
-    def rebalance(self, target_positions: dict[str, float]) -> list[str]:
-        """Berechnet Deltas und führt Orders aus. Löscht vorher alte Protective Stops."""
+    def rebalance(
+        self,
+        target_positions: dict[str, float],
+        prices: Optional[dict[str, float]] = None,
+    ) -> list[str]:
+        """Berechnet Deltas und führt Orders aus. Löscht vorher alte Protective Stops.
+
+        `prices` (decision-time price per ticker) is optional and, when given,
+        recorded as each order's expected fill price for slippage tracking.
+        """
         deltas = self._positions.diff(target_positions)
         order_ids: list[str] = []
 
         for ticker, delta in deltas.items():
             if abs(delta) < 1e-5:
                 continue
-            
+
             # Alte offene Orders vor der Positionsanpassung löschen
             self.cancel_open_orders_for_ticker(ticker)
 
             side = "buy" if delta > 0 else "sell"
-            oid = self.submit_order(ticker, abs(delta), side, order_type="market")
+            expected_price = prices.get(ticker) if prices else None
+            oid = self.submit_order(
+                ticker, abs(delta), side, order_type="market",
+                expected_price=expected_price,
+            )
             if oid:
                 order_ids.append(oid)
 
@@ -89,6 +102,7 @@ class OrderExecutor:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         client_order_id: Optional[str] = None,
+        expected_price: Optional[float] = None,
     ) -> str:
         if qty <= 0:
             return ""
@@ -149,6 +163,9 @@ class OrderExecutor:
             logger.error("Order rejected for %s %s x%.4f (id=%s)", side, ticker, qty, oid)
             return ""
 
+        if oid and expected_price is not None:
+            self._expected_prices[oid] = float(expected_price)
+
         logger.info("Submitted %s %s %s x%.4f (id=%s, status=%s)",
                     order_type, side, ticker, rounded_qty, oid, status)
         return oid
@@ -200,11 +217,13 @@ class OrderExecutor:
 
                 if status in _TERMINAL_STATUSES:
                     pending.discard(oid)
+                    expected_price = self._expected_prices.pop(oid, None)
                     if status == "filled" and self._trade_logger:
                         self._trade_logger.log_fill({
                             "ticker": str(getattr(order, "symbol", "")),
                             "qty": filled_qty,
                             "fill_price": float(getattr(order, "filled_avg_price", 0) or 0),
+                            "expected_price": expected_price,
                             "order_id": oid,
                         })
 
@@ -280,5 +299,11 @@ class OrderExecutor:
                 raise TimeoutError(
                     f"{len(unresolved)} order(s) not terminal after timeout/cancel: {unresolved}"
                 )
+
+        # Any order_id still holding an expected-price entry here reached a
+        # terminal state on the timeout-recheck path (no fill logged there);
+        # drop it so _expected_prices doesn't grow unbounded over uptime.
+        for oid in order_ids:
+            self._expected_prices.pop(oid, None)
 
         return results

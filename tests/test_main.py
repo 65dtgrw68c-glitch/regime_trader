@@ -403,7 +403,9 @@ class TestPortfolioBatchLoop:
         bars = _bars_after(1, seed=202).iloc[-1]
         decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
 
-        sys_._executor.rebalance.assert_called_once_with({"AAA": 10, "BBB": 20})
+        # rebalance also receives the per-ticker decision prices (for
+        # expected-price/slippage tracking); pin down target_positions only.
+        assert sys_._executor.rebalance.call_args.args[0] == {"AAA": 10, "BBB": 20}
 
         assert decisions["AAA"]["action"] == "portfolio_rebalance_submitted"
         assert decisions["BBB"]["action"] == "portfolio_rebalance_submitted"
@@ -525,7 +527,9 @@ class TestPortfolioBatchLoop:
         bars = _bars_after(1, seed=606).iloc[-1]
         decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
 
-        sys_._executor.rebalance.assert_called_once_with({"AAA": 10, "BBB": 20})
+        # rebalance also receives the per-ticker decision prices (for
+        # expected-price/slippage tracking); pin down target_positions only.
+        assert sys_._executor.rebalance.call_args.args[0] == {"AAA": 10, "BBB": 20}
 
         assert decisions["AAA"]["action"] == "no_change"
         assert decisions["BBB"]["action"] == "no_change"

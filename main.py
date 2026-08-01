@@ -453,7 +453,7 @@ class TradingSystem:
         )
 
         # 6. Submit one portfolio rebalance.
-        order_ids = self._safe_call(self._executor.rebalance, target_positions) or []
+        order_ids = self._safe_call(self._executor.rebalance, target_positions, prices) or []
         try:
             submitted = len(order_ids)
         except TypeError:
@@ -944,6 +944,7 @@ class TradingSystem:
         try:
             oid = self._executor.submit_order(
                 ticker, qty, side, order_type="market", client_order_id=coid,
+                expected_price=price,
             )
             if not oid:
                 self._handle_order_rejection(ticker, "broker returned no order id")

@@ -184,6 +184,23 @@ class TestRebalance:
         assert len(ids) == 1
         assert client.trading.submit_order.call_count == 1
 
+    def test_rebalance_records_expected_price_per_ticker(self):
+        client = _make_client()
+        tracker = _tracker_with({"A": 10})
+        ex = OrderExecutor(client, tracker)
+        ids = ex.rebalance({"A": 5, "B": 8}, prices={"A": 100.0, "B": 50.0})
+        assert len(ids) == 2
+
+        # PositionTracker.diff() iterates a set, so submission order between
+        # A/B isn't guaranteed — match each order_id back to its ticker via
+        # the actual submitted request instead of assuming a fixed order.
+        submitted_symbols = [
+            call.args[0].symbol for call in client.trading.submit_order.call_args_list
+        ]
+        expected_price_by_ticker = {"A": 100.0, "B": 50.0}
+        for oid, symbol in zip(ids, submitted_symbols):
+            assert ex._expected_prices[oid] == expected_price_by_ticker[symbol]
+
 
 # ---------------------------------------------------------------------------
 # OrderExecutor single-order operations
@@ -289,6 +306,24 @@ class TestAwaitFills:
         ex = OrderExecutor(client, _tracker_with({}))
         result = ex.await_fills(["oid-1"], timeout=2)
         assert result["oid-1"]["filled_qty"] == 3
+
+    def test_await_fills_logs_expected_price_for_slippage(self):
+        """submit_order's expected_price must reach TradeLogger.log_fill so
+        realised slippage can actually be measured from trades.csv."""
+        client = _make_client()
+        client.trading.get_order_by_id.return_value = _FakeOrder(
+            "oid-1", status="filled", filled_qty=5, symbol="NVDA"
+        )
+        trade_logger = MagicMock()
+        ex = OrderExecutor(client, _tracker_with({}), trade_logger)
+
+        oid = ex.submit_order("NVDA", 5, "buy", expected_price=101.25)
+        ex.await_fills([oid], timeout=2)
+
+        trade_logger.log_fill.assert_called_once()
+        logged = trade_logger.log_fill.call_args.args[0]
+        assert logged["expected_price"] == 101.25
+        assert oid not in ex._expected_prices  # popped after use
 
 
 # ---------------------------------------------------------------------------

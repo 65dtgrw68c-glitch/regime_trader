@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -32,10 +33,29 @@ class PositionTracker:
         self._cash: float = 0.0
         self._last_closed: list[str] = []
 
+    def _call_with_retry(self, fn, *args, max_retries: int = 3, delay: float = 1.0, **kwargs):
+        """Retry transient broker API calls with exponential backoff."""
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Broker call %s failed attempt %d/%d: %s",
+                    getattr(fn, "__name__", str(fn)),
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                if attempt < max_retries:
+                    time.sleep(delay * (2 ** (attempt - 1)))
+        raise last_exc
+
     def refresh(self) -> list[str]:
         if self._client is None:
             raise RuntimeError("PositionTracker has no broker client to refresh from.")
-        raw = self._client.trading.get_all_positions()
+        raw = self._call_with_retry(self._client.trading.get_all_positions)
         snapshot: dict[str, Position] = {}
         for p in raw:
             ticker = str(getattr(p, "symbol"))

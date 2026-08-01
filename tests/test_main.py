@@ -713,6 +713,20 @@ class TestErrorHandling:
         sys_._alerts.alert.assert_called()
         assert sys_._orders_submitted == 0
 
+    def test_submit_cancels_stale_open_orders_before_new_order(self, tmp_path):
+        """Single-asset live path must not leave an orphaned order behind a
+        fresh submission — same protection the portfolio rebalance path has
+        via OrderExecutor.rebalance()."""
+        sys_ = _make_system(tmp_path)
+        manager = MagicMock()
+        manager.attach_mock(sys_._executor.cancel_open_orders_for_ticker, "cancel")
+        manager.attach_mock(sys_._executor.submit_order, "submit")
+
+        sys_._submit("NVDA", 5, 100.0, "Bull", 0.8)
+
+        sys_._executor.cancel_open_orders_for_ticker.assert_called_once_with("NVDA")
+        assert [c[0] for c in manager.mock_calls] == ["cancel", "submit"]
+
 
 # ---------------------------------------------------------------------------
 # 4. Graceful shutdown

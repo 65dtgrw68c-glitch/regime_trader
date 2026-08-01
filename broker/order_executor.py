@@ -165,7 +165,7 @@ class OrderExecutor:
         logger.info("Cancelled order %s", order_id)
 
     def cancel_all_open_orders(self) -> None:
-        self._client.trading.cancel_orders()
+        self._call_with_retry(self._client.trading.cancel_orders)
         logger.info("Cancelled all open orders.")
 
     def await_fills(self, order_ids: list[str], timeout: int = 30) -> dict:

@@ -934,6 +934,10 @@ class TradingSystem:
         # duplicate client_order_id instead of silently doubling the
         # position (this happened: 126 duplicate orders in 40 minutes).
         coid = f"rt-{ticker}-{bar_date}-{side}" if bar_date is not None else None
+        # Cancel any stale open order for this ticker first — same orphan-order
+        # protection the portfolio rebalance path already has (an unfilled
+        # order from a prior decision must not stack with a fresh submission).
+        self._executor.cancel_open_orders_for_ticker(ticker)
         try:
             oid = self._executor.submit_order(
                 ticker, qty, side, order_type="market", client_order_id=coid,

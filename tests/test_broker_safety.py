@@ -95,3 +95,72 @@ def test_await_fills_cancels_pending_orders_on_timeout():
 
     assert result["pending-1"]["status"] == "canceled_on_timeout"
     assert "pending-1" in client.trading.cancelled
+
+
+class _FakePosition:
+    def __init__(self, symbol="SPY", qty=1.0):
+        self.symbol = symbol
+        self.qty = qty
+        self.avg_entry_price = 100.0
+        self.current_price = 100.0
+        self.unrealized_pl = 0.0
+
+
+class _FlakyPositionsClient:
+    """get_all_positions fails `fail_times` times, then succeeds."""
+
+    def __init__(self, fail_times):
+        self._fail_times = fail_times
+        self.calls = 0
+        self.trading = self
+
+    def get_all_positions(self):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise ConnectionError("transient broker error")
+        return [_FakePosition("SPY", 3.0)]
+
+
+def test_refresh_retries_transient_failures_then_succeeds(monkeypatch):
+    client = _FlakyPositionsClient(fail_times=2)
+    tracker = PositionTracker(client=client)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    tracker.refresh()
+
+    assert client.calls == 3
+    assert tracker.get_positions()["SPY"].qty == 3.0
+
+
+def test_refresh_raises_after_exhausting_retries(monkeypatch):
+    client = _FlakyPositionsClient(fail_times=5)
+    tracker = PositionTracker(client=client)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    with pytest.raises(ConnectionError):
+        tracker.refresh()
+
+    assert client.calls == 3  # default max_retries
+
+
+class _FlakyCancelAllClient:
+    def __init__(self, fail_times):
+        self._fail_times = fail_times
+        self.calls = 0
+        self.trading = self
+
+    def cancel_orders(self):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise ConnectionError("transient broker error")
+
+
+def test_cancel_all_open_orders_retries_transient_failures(monkeypatch):
+    client = _FlakyCancelAllClient(fail_times=2)
+    tracker = PositionTracker()
+    executor = OrderExecutor(client, tracker)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    executor.cancel_all_open_orders()
+
+    assert client.calls == 3

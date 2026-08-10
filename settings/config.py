@@ -108,6 +108,16 @@ BROKER = {
     "retry_delay": 2,
     # Only submit orders while the exchange is open (else just log the decision).
     "trade_only_when_open": True,
+    # Which live decision path runs in TradingSystem.run():
+    #   True  → run_portfolio_once: ONE shared target book per bar
+    #           (universe → selector → allocator → sleeves).  This is the
+    #           validated path — scripts/sleeve_check.py and
+    #           core/portfolio_backtester.py evaluate exactly this book.
+    #   False → run_once per ticker via RegimeOrchestrator (HMM/trend_core).
+    # This key used to be ABSENT while main.py read it with a `True` default,
+    # so the live path was chosen by an invisible default and silently
+    # diverged from everything the reports validated.  Keep it explicit.
+    "portfolio_batch_loop": True,
 }
 
 # ---------------------------------------------------------------------------

@@ -115,10 +115,18 @@ becomes a no-op exit **3** (it checks the lock before doing anything). Nothing
 trades until you clear it:
 
 ```bash
-cat /opt/regime_trader/logs/RISK_HALT.lock     # read the incident report
+cat /opt/regime_trader/logs/RISK_HALT.lock          # read the incident report
 # ... review ...
-sudo rm /opt/regime_trader/logs/RISK_HALT.lock # only after you've decided
+sudo rm /opt/regime_trader/logs/RISK_HALT.lock      # only after you've decided
+sudo rm /opt/regime_trader/logs/RISK_HALT_state.json
 ```
+
+**Delete BOTH files.** `RISK_HALT_state.json` carries the peak equity the
+drawdown is measured against, deliberately kept across restarts — the bot runs
+as a fresh process every morning, and without that file the peak resets daily,
+so the drawdown always reads 0.00% and no breaker can ever fire. Leaving it in
+place after a halt means the old peak survives and the breaker re-fires on the
+next bar.
 
 ### Going live (real money) — later, deliberately
 

@@ -411,3 +411,93 @@ class TestRiskConfigFlags:
     def test_regime_caps_apply_by_default(self, tmp_path):
         rm = self._rm_with(tmp_path)
         assert rm.max_leverage_for_regime("Bear") == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 8. Cross-restart state — the deployed bot is a fresh process every day
+# ---------------------------------------------------------------------------
+
+class TestStatePersistence:
+    """`deploy/regime-trader.service` runs `main.py --once` as a oneshot, so
+    every trading day gets a brand-new RiskManager.  With peak equity held only
+    in memory, `startup()` re-anchored the peak to the CURRENT equity each
+    morning: the measured drawdown was permanently 0.00% and NO drawdown
+    breaker could ever fire.  Verified below against a -45% crash."""
+
+    CFG = {**BASE_CFG, "cb_daily_enabled": False, "cb_max_drawdown_halt": 0.20}
+    CRASH = [100_000, 97_000, 92_000, 88_000, 84_000, 79_000, 74_000, 66_000]
+
+    def _daily_oneshot_run(self, tmp_path, equity, persist):
+        """One process lifecycle: construct → start_new_day → update_equity."""
+        rm = RiskManager(cfg=dict(self.CFG),
+                         lock_file_path=str(tmp_path / "RISK_HALT.lock"),
+                         persist_state=persist)
+        rm.start_new_day(equity)            # what TradingSystem.startup() does
+        level = rm.update_equity(equity)    # what run_portfolio_once() does
+        rm.end_of_day(equity)
+        return rm, level
+
+    def test_without_persistence_no_breaker_survives_a_crash(self, tmp_path):
+        worst = CBLevel.NONE
+        for equity in self.CRASH:
+            rm, level = self._daily_oneshot_run(tmp_path, equity, persist=False)
+            worst = max(worst, level)
+            assert rm.state().drawdown == pytest.approx(0.0)
+        assert worst == CBLevel.NONE            # the bug, pinned
+
+    def test_with_persistence_the_halt_fires_across_restarts(self, tmp_path):
+        levels = [self._daily_oneshot_run(tmp_path, e, persist=True)[1]
+                  for e in self.CRASH]
+        assert CBLevel.HALT in levels
+        assert (tmp_path / "RISK_HALT.lock").exists()
+
+    def test_peak_equity_survives_a_restart(self, tmp_path):
+        self._daily_oneshot_run(tmp_path, 120_000, persist=True)
+        rm, _ = self._daily_oneshot_run(tmp_path, 110_000, persist=True)
+        assert rm.state().peak_equity == pytest.approx(120_000)
+        assert rm.state().drawdown == pytest.approx(-1 / 12)
+
+    def test_weekly_breaker_sees_history_from_previous_processes(self, tmp_path):
+        for equity in (100_000, 99_500, 99_000, 98_500, 98_000, 97_500):
+            self._daily_oneshot_run(tmp_path, equity, persist=True)
+        rm = RiskManager(cfg=dict(self.CFG),
+                         lock_file_path=str(tmp_path / "RISK_HALT.lock"),
+                         persist_state=True)
+        rm.start_new_day(97_500)
+        assert rm.update_equity(94_500) == CBLevel.WEEKLY_RESIZE
+
+    def test_state_file_written_next_to_the_lock(self, tmp_path):
+        rm, _ = self._daily_oneshot_run(tmp_path, 100_000, persist=True)
+        assert rm.state_path.exists()
+        assert json.loads(rm.state_path.read_text())["peak_equity"] == 100_000
+
+    def test_corrupt_state_file_does_not_crash_startup(self, tmp_path):
+        (tmp_path / "RISK_HALT_state.json").write_text("{not json")
+        rm = RiskManager(cfg=dict(self.CFG),
+                         lock_file_path=str(tmp_path / "RISK_HALT.lock"),
+                         persist_state=True)
+        rm.start_new_day(100_000)
+        assert rm.update_equity(100_000) == CBLevel.NONE
+
+    def test_clear_lock_reanchors_the_peak_so_the_bot_can_resume(self, tmp_path):
+        """Without re-anchoring, the restored peak would re-trigger the halt on
+        the next bar and the operator could never restart the bot."""
+        rm = RiskManager(cfg=dict(self.CFG),
+                         lock_file_path=str(tmp_path / "RISK_HALT.lock"),
+                         persist_state=True)
+        rm.start_new_day(100_000)
+        rm.update_equity(100_000)
+        assert rm.update_equity(75_000) == CBLevel.HALT
+
+        assert rm.clear_lock() is True
+        assert rm.state().peak_equity == pytest.approx(75_000)
+
+        fresh = RiskManager(cfg=dict(self.CFG),
+                            lock_file_path=str(tmp_path / "RISK_HALT.lock"),
+                            persist_state=True)
+        fresh.start_new_day(75_000)
+        assert fresh.update_equity(75_000) == CBLevel.NONE
+
+    def test_backtests_do_not_write_state_files(self, tmp_path):
+        rm, _ = self._daily_oneshot_run(tmp_path, 100_000, persist=False)
+        assert not rm.state_path.exists()

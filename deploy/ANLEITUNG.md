@@ -344,9 +344,17 @@ So reagierst du darauf:
 # 1. Lies, was passiert ist:
 cat /opt/regime_trader/logs/RISK_HALT.lock
 
-# 2. Wenn du entschieden hast weiterzumachen, lösche die Sperre:
+# 2. Wenn du entschieden hast weiterzumachen, lösche BEIDE Dateien:
 sudo rm /opt/regime_trader/logs/RISK_HALT.lock
+sudo rm /opt/regime_trader/logs/RISK_HALT_state.json
 ```
+
+**Warum zwei Dateien?** In `RISK_HALT_state.json` merkt sich der Bot den
+Höchststand deines Kontos über Neustarts hinweg. Er startet jeden Morgen als
+frischer Prozess — ohne diese Datei würde er den Höchststand täglich neu auf den
+aktuellen Stand setzen, der gemessene Verlust wäre immer 0 % und die Notbremse
+könnte **nie** auslösen. Genau das war bis zum 01.08.2026 der Fall. Lässt du die
+Datei nach einem Halt liegen, löst die Bremse am nächsten Tag sofort wieder aus.
 
 Der `healthcheck.sh` zeigt dir diesen Zustand als `risk_halt PRESENT`.
 

@@ -359,7 +359,10 @@ class Backtester:
             lock_path = Path(tempfile.gettempdir()) / f"bt_halt_{uuid.uuid4().hex}.lock"
             lock_path.unlink(missing_ok=True)
             risk_cfg = {**config.RISK, **self.risk_overrides}
-            risk = RiskManager(cfg=risk_cfg, lock_file_path=str(lock_path))
+            # persist_state=False: each walk-forward window starts from a clean
+            # equity peak, and per-bar disk I/O would buy nothing here.
+            risk = RiskManager(cfg=risk_cfg, lock_file_path=str(lock_path),
+                               persist_state=False)
 
         # We need features for OOS bars too, computed from data up to each
         # bar WITHOUT refitting the scaler (transform only).  To stay strictly

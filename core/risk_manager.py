@@ -94,12 +94,29 @@ class RiskManager:
         cfg: Optional[dict] = None,
         regime_leverage_caps: Optional[dict] = None,
         lock_file_path: Optional[str] = None,
+        persist_state: bool = True,
     ) -> None:
+        """
+        persist_state : keep peak equity / daily-close history on disk so the
+            drawdown and weekly breakers survive a process restart.  MUST stay
+            True in production: the bot is deployed as a daily `--once` oneshot
+            (deploy/regime-trader.service), i.e. a fresh process every morning.
+            With in-memory-only state `startup()` re-anchored the peak to the
+            CURRENT equity every day, so the measured drawdown was permanently
+            0.00% and no drawdown breaker could ever fire — verified against a
+            simulated -45% crash.  Backtests pass False (each window would
+            otherwise inherit the previous run's peak, and it is per-bar disk
+            I/O for nothing).
+        """
         self._cfg = cfg or config.RISK
         self._regime_caps = regime_leverage_caps or getattr(
             config, "REGIME_LEVERAGE_CAPS", {}
         )
         self._lock_path = Path(lock_file_path or self._cfg["lock_file_path"])
+        self._persist_state = bool(persist_state)
+        self._state_path = self._lock_path.with_name(
+            self._lock_path.stem + "_state.json"
+        )
 
         # ── Equity tracking ──────────────────────────────────────────────
         self._day_start_equity: Optional[float] = None
@@ -115,10 +132,60 @@ class RiskManager:
         # ── Price history for correlation checks: ticker -> [returns] ────
         self._price_history: dict[str, list[float]] = {}
 
+        if self._persist_state:
+            self._load_state()
+
     @property
     def lock_path(self) -> Path:
         """Path to this manager's circuit-breaker HALT lock file."""
         return self._lock_path
+
+    @property
+    def state_path(self) -> Path:
+        """Path to the persisted peak-equity / equity-history file."""
+        return self._state_path
+
+    # ------------------------------------------------------------------
+    # Cross-restart state
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Restore peak equity and daily-close history from a previous run."""
+        if not self._state_path.exists():
+            return
+        try:
+            data = json.loads(self._state_path.read_text())
+        except Exception as exc:
+            logger.warning("Could not read risk state %s: %s — starting fresh.",
+                           self._state_path, exc)
+            return
+        peak = data.get("peak_equity")
+        if isinstance(peak, (int, float)) and peak > 0:
+            self._peak_equity = float(peak)
+        history = data.get("equity_history")
+        if isinstance(history, list):
+            self._equity_history = [
+                float(x) for x in history if isinstance(x, (int, float))
+            ]
+        logger.info("Restored risk state: peak_equity=%.2f, %d daily closes.",
+                    self._peak_equity or 0.0, len(self._equity_history))
+
+    def _save_state(self) -> None:
+        """Persist peak equity + daily-close history (best effort, never fatal)."""
+        if not self._persist_state:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "peak_equity": self._peak_equity,
+                "equity_history": self._equity_history,
+                "updated_utc": datetime.now(timezone.utc).isoformat(),
+            }))
+            tmp.replace(self._state_path)   # atomic: never leave a torn file
+        except Exception as exc:
+            logger.warning("Could not persist risk state to %s: %s",
+                           self._state_path, exc)
 
     # ------------------------------------------------------------------
     # Equity / circuit-breaker updates
@@ -141,6 +208,7 @@ class RiskManager:
         lookback = self._cfg["weekly_lookback_days"] + 1
         if len(self._equity_history) > lookback:
             self._equity_history = self._equity_history[-lookback:]
+        self._save_state()
 
     def update_equity(
         self,
@@ -162,6 +230,7 @@ class RiskManager:
             self._day_start_equity = equity
         if self._peak_equity is None or equity > self._peak_equity:
             self._peak_equity = equity
+            self._save_state()   # a new high must survive the next restart
 
         daily_ret = self._daily_return()
         drawdown  = self._drawdown()
@@ -478,8 +547,11 @@ class RiskManager:
             "market_conditions": market_note or "n/a",
             "positions_at_halt": culprits,
             "how_to_resume": (
-                f"Review this incident, then DELETE '{self._lock_path}' to allow "
-                f"the bot to start again."
+                f"Review this incident, then DELETE BOTH '{self._lock_path}' and "
+                f"'{self._state_path}' to allow the bot to start again. "
+                f"The state file holds the peak equity the drawdown is measured "
+                f"against — leaving it in place would re-trigger this halt on "
+                f"the next bar."
             ),
         }
         self._lock_path.write_text(json.dumps(payload, indent=2, default=str))
@@ -499,12 +571,25 @@ class RiskManager:
         Remove the lock file (simulating manual user review).  Returns True
         if a lock was removed.  Intended for operator/test use, NOT for the
         bot to call automatically.
+
+        Also RE-ANCHORS the persisted peak equity to the current equity.  The
+        halt fires on peak-to-trough drawdown, so leaving the old peak in place
+        would re-trigger the breaker on the very next bar and the bot could
+        never resume — clearing the lock is the operator stating that the new,
+        lower equity is the baseline going forward.
         """
         if self._lock_path.exists():
             self._lock_path.unlink()
             self._halted = False
             self._cb_level = CBLevel.NONE
-            logger.info("Risk lock file cleared — trading may resume.")
+            if self._current_equity:
+                self._peak_equity = float(self._current_equity)
+            self._equity_history = []
+            self._save_state()
+            logger.info(
+                "Risk lock cleared — peak equity re-anchored to %.2f, "
+                "trading may resume.", self._peak_equity or 0.0,
+            )
             return True
         return False
 

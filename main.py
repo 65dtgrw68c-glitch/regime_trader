@@ -1268,7 +1268,17 @@ def run_backtest() -> int:
         logger.error("No training data available for portfolio backtest.")
         return EXIT_STARTUP_ERR
 
-    bt = PortfolioBacktester(histories=histories)
+    # Cost and yield assumptions must come from config, not from the
+    # constructor defaults: running this with 0 bps and 0% cash yield made the
+    # headline numbers unreachable in practice and flattered every high-turnover
+    # variant.  BACKTEST["slippage"] is a fraction per fill → basis points here.
+    bt = PortfolioBacktester(
+        histories=histories,
+        initial_capital=config.BACKTEST["initial_capital"],
+        transaction_cost_bps=config.BACKTEST["commission"] * 10_000.0,
+        slippage_bps=config.BACKTEST["slippage"] * 10_000.0,
+        cash_yield_annual=config.BACKTEST["cash_yield_annual"],
+    )
     result = bt.run()
 
     if result.returns.empty:
@@ -1280,12 +1290,22 @@ def run_backtest() -> int:
     avg_gross = result.weights.abs().sum(axis=1).mean() if not result.weights.empty else 0.0
     max_gross = result.weights.abs().sum(axis=1).max() if not result.weights.empty else 0.0
 
+    ann_return = (1.0 + result.returns).prod() ** (252 / len(result.returns)) - 1.0
+    sharpe = (result.returns.mean() / result.returns.std() * (252 ** 0.5)
+              if result.returns.std() else 0.0)
+
     print("Portfolio backtest")
     print("==================")
     print(f"Tickers:        {sorted(histories.keys())}")
+    print(f"Core scale:     {result.metadata.get('core_scale')}")
+    print(f"Sleeves:        {result.metadata.get('sleeves')}")
+    print(f"Costs:          {bt.transaction_cost_bps + bt.slippage_bps:.1f} bps "
+          f"per unit turnover, cash {bt.cash_yield_annual:.2%} p.a.")
     print(f"Initial equity: ${result.initial_capital:,.2f}")
     print(f"Final equity:   ${result.equity_curve.iloc[-1]:,.2f}")
     print(f"Total return:   {total_return:.2%}")
+    print(f"CAGR:           {ann_return:.2%}")
+    print(f"Sharpe:         {sharpe:.2f}")
     print(f"Max drawdown:   {max_drawdown:.2%}")
     print(f"Avg gross exp.: {avg_gross:.2%}")
     print(f"Max gross exp.: {max_gross:.2%}")

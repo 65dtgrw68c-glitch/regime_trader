@@ -10,6 +10,14 @@ Current default execution model:
 - execution at T open
 - mark-to-market at T close
 
+which decomposes each bar's return as
+
+    r[T] = w[T-1] * (open[T]  / close[T-1] - 1)     # overnight, old book
+         + w[T]   * (close[T] / open[T]    - 1)     # intraday, new book
+
+Both terms are required: between the decision and the fill the PREVIOUS
+target is still held, so it earns the overnight gap.
+
 The legacy close-to-close approximation is still available via
 execution_model="close_to_close" for comparison and regression tests.
 """
@@ -46,7 +54,8 @@ class PortfolioBacktester:
     1. derives SMA-200 trend per asset,
     2. builds AssetView objects only for validated assets,
     3. calls the allocator for class-budgeted inverse-vol weights,
-    4. applies target weights to the next bar's close-to-close returns,
+    4. marks the book to market over the next bar, splitting the return into
+       the overnight gap (old weights) and the intraday move (new weights),
     5. records daily portfolio turnover as sum(abs(new_weight - old_weight)).
     """
 
@@ -58,18 +67,44 @@ class PortfolioBacktester:
         slippage_bps: float = 0.0,
         cash_yield_annual: float = 0.0,
         execution_model: str = "next_open",
+        cash_yield_series: Optional[pd.Series] = None,
     ):
+        """
+        cash_yield_series : optional ANNUALISED risk-free yields (decimals,
+            DatetimeIndex — e.g. ^IRX/100) for the idle-cash credit, matched by
+            calendar day and forward-filled.  Bars before the first observation
+            fall back to the flat cash_yield_annual.  Parity with
+            core.backtester.Backtester, which has taken real T-bill yields
+            since 2026-07-10; a trend book sits in cash for long stretches, so
+            crediting a flat rate misprices exactly those stretches.
+        """
         self.histories = histories
         self.initial_capital = float(initial_capital)
         self.transaction_cost_bps = float(transaction_cost_bps)
         self.slippage_bps = float(slippage_bps)
         self.cash_yield_annual = float(cash_yield_annual)
         self.execution_model = str(execution_model)
+        self.cash_yield_series = cash_yield_series
 
         if self.execution_model not in {"next_open", "close_to_close"}:
             raise ValueError(
                 "execution_model must be 'next_open' or 'close_to_close'"
             )
+
+    def _daily_yields(self, index: pd.DatetimeIndex) -> pd.Series:
+        """Per-bar daily cash yield aligned to `index` (calendar-day ffill)."""
+        idx = pd.DatetimeIndex(index)
+        flat = max(0.0, self.cash_yield_annual)
+        if self.cash_yield_series is not None and len(self.cash_yield_series):
+            ann = self.cash_yield_series.copy()
+            ann.index = pd.DatetimeIndex(ann.index).normalize()
+            ann = ann[~ann.index.duplicated(keep="last")].sort_index()
+            aligned = ann.reindex(idx.normalize(), method="ffill")
+            aligned = aligned.fillna(flat).clip(lower=0.0).astype(float)
+        else:
+            aligned = pd.Series(flat, index=idx.normalize(), dtype=float)
+        aligned.index = idx
+        return aligned / 252.0
 
     def _common_index(self) -> pd.DatetimeIndex:
         indexes = []
@@ -163,6 +198,7 @@ class PortfolioBacktester:
         return_dates = []
         weight_rows = []
         turnover_rows = []
+        daily_yields = self._daily_yields(idx)
 
         previous_weights: Dict[str, float] = {}
 
@@ -178,33 +214,45 @@ class PortfolioBacktester:
 
             gross_exposure = sum(abs(float(w)) for w in weights.values())
             cash_weight = max(0.0, 1.0 - gross_exposure)
-            daily_cash_yield = max(0.0, self.cash_yield_annual) / 252.0
-            cash_return = cash_weight * daily_cash_yield
+            cash_return = cash_weight * float(daily_yields.loc[current_date])
 
-            portfolio_ret = 0.0
-            for ticker, weight in weights.items():
+            # The bar is two sub-periods with a rebalance in between, so the
+            # legs COMPOUND — adding them drops the cross-term, which on a
+            # gap-and-reverse day (e.g. 2025-04-08: +3.5% overnight, -4.9%
+            # intraday) is worth 17 bp on that bar alone.
+            overnight_ret = 0.0
+            intraday_ret = 0.0
+            for ticker in set(weights) | set(previous_weights):
                 df = self.histories.get(ticker)
                 if df is None or decision_date not in df.index or current_date not in df.index:
                     continue
 
+                weight = float(weights.get(ticker, 0.0))
                 prev_close = float(df.loc[decision_date, "close"])
                 curr_close = float(df.loc[current_date, "close"])
 
-                if self.execution_model == "next_open":
-                    if "open" in df.columns:
-                        entry_price = float(df.loc[current_date, "open"])
-                    else:
-                        entry_price = prev_close
-                    exit_price = curr_close
+                if self.execution_model == "next_open" and "open" in df.columns:
+                    # The order decided at decision_date's close fills at
+                    # current_date's OPEN.  Until then the book from the
+                    # PREVIOUS decision is still held, so it — not the new
+                    # target — earns the overnight gap.  Crediting the new
+                    # weight only from the open (as this used to) silently
+                    # dropped close[t-1] -> open[t] for every held position;
+                    # for SPY that is ~9.9 of its ~10.4 %/yr.
+                    open_price = float(df.loc[current_date, "open"])
+                    if prev_close > 0:
+                        held = float(previous_weights.get(ticker, 0.0))
+                        overnight_ret += held * (open_price / prev_close - 1.0)
+                    if open_price > 0:
+                        intraday_ret += weight * (curr_close / open_price - 1.0)
                 else:
-                    entry_price = prev_close
-                    exit_price = curr_close
+                    # close-to-close: the target is assumed held across the
+                    # whole bar, so one close-to-close return is complete.
+                    if prev_close > 0:
+                        intraday_ret += weight * (curr_close / prev_close - 1.0)
 
-                if entry_price > 0:
-                    asset_ret = (exit_price / entry_price) - 1.0
-                    portfolio_ret += float(weight) * asset_ret
-
-            portfolio_ret += cash_return
+            intraday_ret += cash_return
+            portfolio_ret = (1.0 + overnight_ret) * (1.0 + intraday_ret) - 1.0
             portfolio_ret -= turnover_cost
             portfolio_ret -= slippage_cost
             portfolio_returns.append(portfolio_ret)
@@ -248,6 +296,9 @@ class PortfolioBacktester:
                 "slippage_model": "turnover_times_bps",
                 "cash_yield_annual": self.cash_yield_annual,
                 "cash_yield_model": "annual_rate_divided_by_252_trading_days",
+                "cash_yield_source": (
+                    "series" if self.cash_yield_series is not None else "flat"
+                ),
                 "execution_model": self.execution_model,
             },
         )

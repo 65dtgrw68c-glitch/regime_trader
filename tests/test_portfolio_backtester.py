@@ -322,6 +322,106 @@ def test_portfolio_backtester_matches_live_target_weight_path():
     for ticker, weight in live_like_weights.items():
         assert backtest_weights[ticker] == pytest.approx(weight)
 
+def _gapping_data(n: int = 260) -> pd.DataFrame:
+    """OHLC with real overnight gaps AND intraday moves in both directions.
+
+    A series where open == close (as _make_data builds) cannot detect a
+    dropped overnight leg — the bug this guards against was invisible for
+    exactly that reason.
+    """
+    idx = pd.bdate_range("2021-01-01", periods=n, freq="B")
+    rows = []
+    prev_close = 100.0
+    for i in range(n):
+        gap = 0.004 if i % 3 else -0.006          # overnight move
+        intra = -0.005 if i % 4 else 0.007        # intraday move
+        open_ = prev_close * (1 + gap)
+        close = open_ * (1 + intra)
+        rows.append({"open": open_, "high": max(open_, close) * 1.001,
+                     "low": min(open_, close) * 0.999, "close": close,
+                     "volume": 1_000_000})
+        prev_close = close
+    return pd.DataFrame(rows, index=idx)
+
+
+@pytest.mark.parametrize("execution_model", ["next_open", "close_to_close"])
+def test_fully_invested_book_reproduces_buy_and_hold_exactly(execution_model):
+    """GOLDEN TEST: a book permanently 100% long one asset IS buy & hold.
+
+    Any execution model that does not reproduce it exactly is dropping (or
+    double-counting) part of the bar.  The shipped 'next_open' model used to
+    credit close[t]/open[t] for every position regardless of whether it was
+    already held, silently discarding every overnight gap — for SPY that is
+    ~9.9pp of its ~10.4%/yr, i.e. it reported 1.5% CAGR where the book earned
+    8.3%.  This assertion would have caught it on day one.
+    """
+    data = _gapping_data(260)
+    bt = PortfolioBacktester(histories={"AAA": data},
+                             execution_model=execution_model)
+    bt.compute_daily_targets = lambda _date: {"AAA": 1.0}
+    returns = bt.run().returns
+
+    buy_hold = data["close"].pct_change().reindex(returns.index)
+    # Bar 1 has no prior position, so its overnight gap cannot be earned;
+    # from bar 2 the two must agree to floating-point precision.
+    comparable = returns.iloc[1:]
+    assert comparable.sub(buy_hold.iloc[1:]).abs().max() < 1e-12
+    assert (1 + comparable).prod() == pytest.approx(
+        (1 + buy_hold.iloc[1:]).prod(), rel=1e-12
+    )
+
+
+def test_flat_book_earns_exactly_the_cash_yield():
+    """The mirror image of the golden test: 0% invested is pure cash."""
+    data = _gapping_data(260)
+    bt = PortfolioBacktester(histories={"AAA": data}, cash_yield_annual=0.05)
+    bt.compute_daily_targets = lambda _date: {}
+    returns = bt.run().returns
+    assert returns.sub(0.05 / 252).abs().max() < 1e-12
+
+
+def test_overnight_gap_is_credited_to_the_previously_held_book():
+    """On a rebalance bar the OLD weights earn the gap, the NEW ones the day."""
+    data = _gapping_data(260)
+    switch_date = data.index[230]
+
+    bt = PortfolioBacktester(histories={"AAA": data, "BBB": data})
+    bt.compute_daily_targets = (
+        lambda d: {"AAA": 1.0} if d < switch_date else {"BBB": 1.0}
+    )
+    returns = bt.run().returns
+
+    # The bar whose decision date is `switch_date` is the first BBB bar; it
+    # must still contain AAA's overnight leg. Both symbols share a price path
+    # here, so the whole bar must equal one close-to-close return.
+    bar = data.index[data.index.get_loc(switch_date) + 1]
+    expected = data["close"].pct_change().loc[bar]
+    assert returns.loc[bar] == pytest.approx(expected, abs=1e-12)
+
+
+def test_next_open_and_close_to_close_agree_on_a_gapless_series():
+    """Sanity check that the two models differ only through the gap."""
+    data = _make_data(260)          # open == close, i.e. no overnight moves
+    books = {}
+    for model in ("next_open", "close_to_close"):
+        bt = PortfolioBacktester(histories={"AAA": data}, execution_model=model)
+        bt.compute_daily_targets = lambda _d: {"AAA": 1.0}
+        books[model] = bt.run().returns
+    diff = books["next_open"].iloc[1:].sub(books["close_to_close"].iloc[1:]).abs()
+    assert diff.max() < 1e-12
+
+
+def test_cash_yield_series_overrides_the_flat_rate():
+    data = _gapping_data(260)
+    series = pd.Series(0.08, index=data.index)
+    bt = PortfolioBacktester(histories={"AAA": data}, cash_yield_annual=0.01,
+                             cash_yield_series=series)
+    bt.compute_daily_targets = lambda _d: {}
+    result = bt.run()
+    assert result.returns.sub(0.08 / 252).abs().max() < 1e-12
+    assert result.metadata["cash_yield_source"] == "series"
+
+
 def test_tradable_universe_contains_validated_diversifiers():
     from core.universe import tradable_universe
 

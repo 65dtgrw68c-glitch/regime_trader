@@ -241,8 +241,15 @@ RISK = {
     "max_position_size": 0.50,
     # Hard per-name cap for target weights in the book validator.
     "per_name_cap": 0.50,
-    # Maximum gross leverage / gross target-book exposure.
+    # Maximum gross NOTIONAL exposure of the target book (no margin).
     "gross_cap": 1.0,
+    # Maximum gross ECONOMIC exposure: Σ |weight_i| * leverage_i, using the
+    # per-asset `leverage` from UNIVERSE.  Notional and economic exposure only
+    # differ once levered products are held: the 60/40 book is ~0.84 notional
+    # but ~1.24 economic on average (0.44 core ×1 + 0.40 QLD ×2), peaking near
+    # 1.4.  Without this second cap the notional gross_cap would happily wave
+    # through a book that is economically 2x levered.
+    "economic_gross_cap": 1.50,
     # Portfolio-level caps per asset class.  levered_equity is deliberately
     # equal to the configured sleeve weight, so SLEEVES cannot silently grow
     # past what the risk layer was set up to allow.

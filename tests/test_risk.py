@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.risk_manager import CBLevel, OrderValidation, RiskManager
+from settings import config
 
 
 # ---------------------------------------------------------------------------
@@ -501,3 +502,48 @@ class TestStatePersistence:
     def test_backtests_do_not_write_state_files(self, tmp_path):
         rm, _ = self._daily_oneshot_run(tmp_path, 100_000, persist=False)
         assert not rm.state_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 9. Economic (leverage-adjusted) book exposure
+# ---------------------------------------------------------------------------
+
+class TestEconomicExposureCap:
+    """Notional weights understate a levered ETF: 0.40 in a 2x fund is 0.80 of
+    market exposure, which the notional gross cap cannot see."""
+
+    def _rm(self, tmp_path, **over):
+        cfg = {**BASE_CFG, "gross_cap": 1.0, "per_name_cap": 0.5,
+               "max_position_size": 0.5,   # per-name cap is min() of both
+               "class_caps": {}, "economic_gross_cap": 1.5, **over}
+        return RiskManager(cfg=cfg, lock_file_path=str(tmp_path / "l.lock"),
+                           persist_state=False)
+
+    def test_levered_book_within_the_cap_is_approved(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(config.UNIVERSE["assets"], "L2",
+                            {"asset_class": "x", "validated": True,
+                             "role": "sleeve", "leverage": 2.0})
+        v = self._rm(tmp_path).validate_book({"SPY": 0.3, "L2": 0.4})   # 1.10
+        assert v.approved, v.reason
+
+    def test_levered_book_beyond_the_cap_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(config.UNIVERSE["assets"], "L3",
+                            {"asset_class": "x", "validated": True,
+                             "role": "sleeve", "leverage": 3.0})
+        v = self._rm(tmp_path).validate_book({"SPY": 0.2, "L3": 0.5})   # 1.70
+        assert not v.approved
+        assert "economic exposure" in v.reason
+
+    def test_notional_gross_cap_alone_would_have_passed_it(self, tmp_path, monkeypatch):
+        """Pins WHY the second cap exists: gross is only 0.70 here."""
+        monkeypatch.setitem(config.UNIVERSE["assets"], "L3",
+                            {"asset_class": "x", "validated": True,
+                             "role": "sleeve", "leverage": 3.0})
+        book = {"SPY": 0.2, "L3": 0.5}
+        assert sum(book.values()) <= 1.0
+        rm = self._rm(tmp_path, economic_gross_cap=None)
+        assert rm.validate_book(book).approved
+
+    def test_unlevered_book_is_unaffected(self, tmp_path):
+        v = self._rm(tmp_path).validate_book({"SPY": 0.5, "GLD": 0.2})
+        assert v.approved, v.reason

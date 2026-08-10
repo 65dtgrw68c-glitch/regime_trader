@@ -394,6 +394,25 @@ class RiskManager:
                     f"per-name {ticker} weight {weight:.2f} exceeds cap {per_name_cap:.2f}",
                 )
 
+        # Economic exposure: a levered product carries more market risk than
+        # its notional weight suggests, so the notional gross cap above cannot
+        # see it (0.40 in a 2x ETF is 0.80 of market exposure).  Without this
+        # second cap the book could be economically 2x levered while reporting
+        # a gross of 1.0.
+        economic_cap = self._cfg.get("economic_gross_cap")
+        if economic_cap is not None:
+            assets = getattr(config, "UNIVERSE", {}).get("assets", {})
+            economic = sum(
+                abs(float(weight)) * float(assets.get(ticker, {}).get("leverage", 1.0))
+                for ticker, weight in target_weights.items()
+            )
+            if economic > float(economic_cap) + 1e-9:
+                return OrderValidation(
+                    False,
+                    f"economic exposure {economic:.2f} exceeds cap "
+                    f"{float(economic_cap):.2f}",
+                )
+
         class_caps = self._cfg.get("class_caps", {})
         by_class: dict[str, float] = {}
         for ticker, weight in target_weights.items():

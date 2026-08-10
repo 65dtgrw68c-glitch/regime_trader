@@ -143,3 +143,10 @@ class TestDeployedConfigIsCoherent:
         book = sleeves.compose_book(core, {"QQQ": True})
         validation = RiskManager(persist_state=False).validate_book(book)
         assert validation.approved, validation.reason
+
+    def test_economic_cap_leaves_headroom_over_the_configured_maximum(self):
+        max_economic = (sleeves.core_scale() * config.RISK["gross_cap"]
+                        + sum(float(s["weight"])
+                              * config.UNIVERSE["assets"][s["ticker"]]["leverage"]
+                              for s in sleeves.sleeve_definitions()))
+        assert max_economic <= config.RISK["economic_gross_cap"] + 1e-9

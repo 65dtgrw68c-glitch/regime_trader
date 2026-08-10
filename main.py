@@ -978,13 +978,18 @@ class TradingSystem:
     def _compute_live_target_book(self):
         """Compute portfolio target weights from the current live state.
 
-        This mirrors the portfolio backtester path:
-        histories -> trend states -> AssetViews -> correlation selector -> allocator.
-        It returns weights, not share counts.
+        Runs the SAME construction as core.portfolio_backtester
+        .compute_daily_targets: histories -> trend states -> AssetViews ->
+        correlation selector -> allocator -> core.sleeves.compose_book.
+        Both paths share the allocator and the sleeve composition, so the
+        live book and the backtested book cannot drift apart silently (they
+        did: see analysis_report_2026-08-01_deep_review.md, Befund 0).
+        Returns weights, not share counts.
         """
         from core.universe import build_views
         from core.selector import select_decorrelated_views
         from core.allocator import target_weights
+        from core.sleeves import compose_book
 
         histories = {}
         trend_states = {}
@@ -999,7 +1004,7 @@ class TradingSystem:
 
         views = build_views(histories, trend_states)
         selected_views = select_decorrelated_views(views, histories)
-        target_book = target_weights(selected_views)
+        target_book = compose_book(target_weights(selected_views), trend_states)
 
         # Include every live state explicitly. Missing tickers are target zero.
         for asset in self._states:

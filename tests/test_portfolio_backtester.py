@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -291,35 +292,37 @@ def test_portfolio_cash_yield_credits_idle_cash():
 
 
 def test_portfolio_backtester_matches_live_target_weight_path():
-    from core.universe import build_views
-    from core.selector import select_decorrelated_views
-    from core.allocator import target_weights
-    from core.regime_strategies import is_trend_confirmed
+    """The backtested book must equal the book the LIVE loop would submit.
+
+    This drives the real main.TradingSystem._compute_live_target_book rather
+    than re-deriving the pipeline inline: an inline copy silently keeps passing
+    when only one of the two paths changes, which is exactly how the live path
+    drifted away from every validated report (see
+    analysis_report_2026-08-01_deep_review.md, Befund 0).
+    """
+    from main import TradingSystem
 
     histories = {
         "SPY": _make_data(260),
         "QQQ": _make_data(260),
+        "QLD": _make_data(260),
     }
     date = histories["SPY"].index[220]
 
     bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
     backtest_weights = bt.compute_daily_targets(date)
 
-    sliced_histories = {
-        ticker: df.loc[:date].copy()
+    # Live path: feed it exactly the same causal slices.
+    system = TradingSystem(tickers=list(histories))
+    system._states = {
+        ticker: SimpleNamespace(history=df.loc[:date].copy())
         for ticker, df in histories.items()
     }
-    trend_states = {
-        ticker: is_trend_confirmed(hist["close"])
-        for ticker, hist in sliced_histories.items()
-    }
+    live_weights = system._compute_live_target_book()
 
-    views = build_views(sliced_histories, trend_states)
-    selected_views = select_decorrelated_views(views, sliced_histories)
-    live_like_weights = target_weights(selected_views)
-
-    assert set(backtest_weights) == set(live_like_weights)
-    for ticker, weight in live_like_weights.items():
+    non_zero_live = {t: w for t, w in live_weights.items() if abs(w) > 1e-9}
+    assert set(backtest_weights) == set(non_zero_live)
+    for ticker, weight in non_zero_live.items():
         assert backtest_weights[ticker] == pytest.approx(weight)
 
 def _gapping_data(n: int = 260) -> pd.DataFrame:

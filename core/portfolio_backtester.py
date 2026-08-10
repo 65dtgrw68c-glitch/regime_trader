@@ -31,6 +31,7 @@ import pandas as pd
 from core.universe import build_views, AssetView
 from core.allocator import target_weights
 from core.selector import select_decorrelated_views
+from core.sleeves import compose_book, core_scale, sleeve_definitions
 from core.regime_strategies import is_trend_confirmed
 
 
@@ -54,9 +55,11 @@ class PortfolioBacktester:
     1. derives SMA-200 trend per asset,
     2. builds AssetView objects only for validated assets,
     3. calls the allocator for class-budgeted inverse-vol weights,
-    4. marks the book to market over the next bar, splitting the return into
+    4. optionally scales that core book and adds levered trend sleeves
+       (core.sleeves) so live and backtest share one weight construction,
+    5. marks the book to market over the next bar, splitting the return into
        the overnight gap (old weights) and the intraday move (new weights),
-    5. records daily portfolio turnover as sum(abs(new_weight - old_weight)).
+    6. records daily portfolio turnover as sum(abs(new_weight - old_weight)).
     """
 
     def __init__(
@@ -148,7 +151,11 @@ class PortfolioBacktester:
         return float(turnover)
 
     def compute_daily_targets(self, date) -> Dict[str, float]:
-        """Compute target weights using only data available up to `date`."""
+        """Compute target weights using only data available up to `date`.
+
+        Identical construction to the live loop (main.TradingSystem
+        ._compute_live_target_book): trend -> selector -> allocator -> sleeves.
+        """
         trend_states = {}
         sliced_histories: Dict[str, pd.DataFrame] = {}
 
@@ -166,7 +173,7 @@ class PortfolioBacktester:
 
         views: List[AssetView] = build_views(sliced_histories, trend_states)
         views = select_decorrelated_views(views, sliced_histories)
-        return target_weights(views)
+        return compose_book(target_weights(views), trend_states)
 
     def run(
         self,
@@ -299,6 +306,8 @@ class PortfolioBacktester:
                 "cash_yield_source": (
                     "series" if self.cash_yield_series is not None else "flat"
                 ),
+                "core_scale": core_scale(),
+                "sleeves": [s.get("ticker") for s in sleeve_definitions()],
                 "execution_model": self.execution_model,
             },
         )

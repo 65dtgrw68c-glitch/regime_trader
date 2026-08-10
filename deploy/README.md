@@ -108,7 +108,7 @@ morning fire):
 | Update to latest code | `sudo bash deploy/update.sh` (from your checkout) |
 | Trades audit trail | `/opt/regime_trader/logs/trades.csv` |
 
-### When the risk HALT fires (−20% drawdown)
+### When the risk HALT fires (−35% drawdown)
 
 The bot writes `/opt/regime_trader/logs/RISK_HALT.lock` and every daily run
 becomes a no-op exit **3** (it checks the lock before doing anything). Nothing
@@ -127,6 +127,11 @@ as a fresh process every morning, and without that file the peak resets daily,
 so the drawdown always reads 0.00% and no breaker can ever fire. Leaving it in
 place after a halt means the old peak survives and the breaker re-fires on the
 next bar.
+
+The threshold is −35% because the 60/40 book's own worst historical drawdown is
+−24.8%: a tighter halt sits inside the strategy's ordinary operating range and
+terminates it permanently (measured: CAGR 13.7% → 1.0%). See
+`analysis_report_2026-08-01_deep_review.md`.
 
 ### Going live (real money) — later, deliberately
 

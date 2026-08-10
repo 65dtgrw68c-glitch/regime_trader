@@ -333,7 +333,7 @@ Du musst **nicht** täglich reinschauen, aber du solltest wissen, wie:
 
 **Die eine Sache, die deine Aufmerksamkeit braucht — der Not-Aus:**
 
-Wenn der Bot jemals **20 % Verlust vom Höchststand** erreicht, aktiviert er
+Wenn der Bot jemals **35 % Verlust vom Höchststand** erreicht, aktiviert er
 eine Notbremse: Er stoppt und legt eine Sperrdatei an
 (`/opt/regime_trader/logs/RISK_HALT.lock`). Ab dann macht jeder tägliche Lauf
 **nichts** — absichtlich. Der Bot fährt **nicht** von selbst wieder hoch; das
@@ -355,6 +355,12 @@ frischer Prozess — ohne diese Datei würde er den Höchststand täglich neu au
 aktuellen Stand setzen, der gemessene Verlust wäre immer 0 % und die Notbremse
 könnte **nie** auslösen. Genau das war bis zum 01.08.2026 der Fall. Lässt du die
 Datei nach einem Halt liegen, löst die Bremse am nächsten Tag sofort wieder aus.
+
+**Warum 35 % und nicht 20 %?** Das aktuelle 60/40-Buch hatte historisch selbst
+schon −24,8 % Rückgang. Eine Bremse bei −20 % läge also *innerhalb* des normalen
+Arbeitsbereichs der Strategie und würde sie dauerhaft abschalten (gemessen:
+13,7 % → 1,0 % Rendite pro Jahr). 35 % lässt Luft nach oben und stoppt trotzdem
+lange vor einem Totalverlust.
 
 Der `healthcheck.sh` zeigt dir diesen Zustand als `risk_halt PRESENT`.
 

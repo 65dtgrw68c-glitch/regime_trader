@@ -11,19 +11,43 @@ source of truth instead of scattering magic numbers across the codebase.
 # The runtime universe is now driven by a validated-asset map.  Only entries
 # marked as validated are traded; other assets remain available for future
 # harness validation without being activated by default.
+# Each asset carries:
+#   asset_class  — bucket for the portfolio-level class caps
+#   validated    — only validated assets are traded at all
+#   role         — "core"   : offered to the trend/correlation/allocator path
+#                  "sleeve" : NOT allocated by the allocator; driven solely by
+#                             an explicit entry in SLEEVES (see below)
+#   leverage     — economic exposure per unit of notional (2.0 for a 2x ETF).
+#                  The allocator and the gross cap work in NOTIONAL weights;
+#                  this factor is what lets the risk layer also bound the
+#                  ECONOMIC exposure (RISK["economic_gross_cap"]).
 UNIVERSE = {
     "assets": {
-        "SPY": {"asset_class": "equity", "validated": True},
-        "QQQ": {"asset_class": "equity", "validated": True},
-        "GLD": {"asset_class": "gold", "validated": True},
-        "IEF": {"asset_class": "bonds", "validated": True},
-        "DBC": {"asset_class": "commod", "validated": False},
+        "SPY": {"asset_class": "equity", "validated": True,
+                "role": "core", "leverage": 1.0},
+        "QQQ": {"asset_class": "equity", "validated": True,
+                "role": "core", "leverage": 1.0},
+        "GLD": {"asset_class": "gold", "validated": True,
+                "role": "core", "leverage": 1.0},
+        "IEF": {"asset_class": "bonds", "validated": True,
+                "role": "core", "leverage": 1.0},
+        "DBC": {"asset_class": "commod", "validated": False,
+                "role": "core", "leverage": 1.0},
+        # 2x QQQ.  Traded ONLY through the levered sleeve, never by the
+        # allocator: the correlation selector would reject it on sight (it is
+        # ~0.95 correlated with SPY/QQQ and has the highest vol, so it sorts
+        # last and always loses), and that rejection is correct for a
+        # DIVERSIFICATION candidate — but this sleeve is a deliberate,
+        # separately budgeted beta position, not a diversifier.
+        "QLD": {"asset_class": "levered_equity", "validated": True,
+                "role": "sleeve", "leverage": 2.0},
     },
     "class_caps": {
         "equity": 0.70,
         "gold": 0.20,
         "bonds": 0.25,
         "commod": 0.10,
+        "levered_equity": 0.40,
     },
     "vol_lookback": 63,
 }
@@ -31,6 +55,44 @@ TICKERS = [
     ticker for ticker, meta in UNIVERSE["assets"].items()
     if meta.get("validated", False)
 ]
+
+# ---------------------------------------------------------------------------
+# Sleeves — how the book is split between the diversified core and explicit
+# levered trend sleeves.
+# ---------------------------------------------------------------------------
+# Rationale (measured 2026-08-01, 2007-2026, 2 bps, ^IRX cash — see
+# analysis_report_2026-08-01_deep_review.md and scripts/sleeve_check.py):
+#
+#   Buch                              CAGR     Vol   Sharpe   maxDD
+#   SPY buy&hold (Benchmark)        11.09%   19.7%     0.63  -55.2%
+#   Kern allein (core_scale 1.0)     7.89%    7.6%     1.04  -11.8%
+#   Sleeve allein (Trend(QQQ)→QLD)  20.43%   31.7%     0.75  -46.8%
+#   60% Kern + 40% Sleeve           13.66%   16.6%     0.86  -24.8%
+#
+# The core book alone is the better STRATEGY (Sharpe 1.04) but structurally
+# cannot beat a 19.7%-vol index from 7.6% vol — that is arithmetic, not skill
+# (it beat SPY in 0% of rolling 10-year windows).  The blend buys index-beating
+# absolute return (+2.6pp p.a., ahead in ~56% of rolling windows) by giving up
+# 0.18 Sharpe and doubling the drawdown.  That trade-off is the OWNER'S
+# DECISION, taken deliberately on 2026-08-01 — it is not a tuning result and
+# must not be re-optimised by grid search.
+#
+# Known weakness, measured: levered trend works in SLOW bear markets (2008:
+# blend +2.7% vs SPY -36.9%) and fails in FAST crashes (2020-02..04: blend
+# -15.8% vs SPY -13.5%) because the SMA-200 exits too late.
+SLEEVES = {
+    # Multiplier applied to the allocator's core book before the sleeves are
+    # added.  1.0 = pure core (the pre-2026-08 behaviour).
+    "core_scale": 0.60,
+    # Explicit levered trend sleeves.  `signal` is the UNLEVERED asset whose
+    # SMA-200 trend drives the position (never the levered ETF itself: its own
+    # SMA is distorted by the daily-reset path dependency).  `weight` is a
+    # FIXED notional target, not vol-scaled — the leverage already lives in
+    # the product.
+    "levered": [
+        {"ticker": "QLD", "signal": "QQQ", "weight": 0.40},
+    ],
+}
 
 # ---------------------------------------------------------------------------
 # Broker / Alpaca settings
@@ -181,12 +243,15 @@ RISK = {
     "per_name_cap": 0.50,
     # Maximum gross leverage / gross target-book exposure.
     "gross_cap": 1.0,
-    # Portfolio-level caps per asset class.
+    # Portfolio-level caps per asset class.  levered_equity is deliberately
+    # equal to the configured sleeve weight, so SLEEVES cannot silently grow
+    # past what the risk layer was set up to allow.
     "class_caps": {
         "equity": 0.70,
         "gold": 0.20,
         "bonds": 0.25,
         "commod": 0.10,
+        "levered_equity": 0.40,
     },
     # Maximum gross leverage
     "max_leverage": 1.0,
@@ -256,7 +321,21 @@ RISK = {
     # ONCE, at the very trough of the worst episode.  That is arguably
     # exactly what a tail safeguard is for; raise to ~0.25 only if you
     # want it strictly outside everything in 27 years of history.
-    "cb_max_drawdown_halt": 0.20,  # -20% from equity peak
+    # RAISED 0.20 → 0.35 (owner decision 2026-08-01, together with the levered
+    # sleeve).  MEASURED, not guessed (scripts/sleeve_check.py, 2007-2026):
+    # the 60/40 book's own worst drawdown is -24.8% (trough 2016-06-27), so a
+    # -20% halt fires INSIDE the strategy's ordinary operating range and kills
+    # it for good — CAGR collapses 13.66% → 1.00%, Sharpe 0.86 → 0.18.  At
+    # -25%/-30%/-35% it never fires over the whole span.
+    # 0.35 rather than 0.25 on purpose: pinning the halt just past the deepest
+    # drawdown that happens to be in the sample is fitting a safety limit to
+    # one realised path.  0.35 keeps ~10pp of headroom above anything observed
+    # while still stopping a genuine malfunction long before ruin.
+    # NOTE: this threshold only does anything because the peak-equity state is
+    # now persisted across process restarts (see RiskManager._state_path); in
+    # the daily `--once` deployment it previously reset every morning and no
+    # drawdown breaker could ever fire.
+    "cb_max_drawdown_halt": 0.35,  # -35% from equity peak
 
     # Factor applied to position sizes when the "halve" breaker fires
     "cb_halve_factor": 0.50,

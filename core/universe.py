@@ -26,6 +26,21 @@ def tradable_universe() -> Dict[str, dict]:
     }
 
 
+def core_universe() -> Dict[str, dict]:
+    """
+    Validated assets the ALLOCATOR may size (role == "core").
+
+    Assets with role "sleeve" are excluded: they are held through an explicit
+    entry in config.SLEEVES, not by trend/correlation/inverse-vol selection.
+    See core.sleeves for why a levered ETF must not go through the selector.
+    """
+    return {
+        ticker: meta
+        for ticker, meta in tradable_universe().items()
+        if meta.get("role", "core") == "core"
+    }
+
+
 def build_views(
     histories: Dict[str, pd.DataFrame],
     trend_states: Dict[str, bool],
@@ -38,7 +53,7 @@ def build_views(
     """
     views: List[AssetView] = []
     window = int(vol_lookback or config.UNIVERSE.get("vol_lookback", 63))
-    for ticker, meta in tradable_universe().items():
+    for ticker, meta in core_universe().items():
         hist = histories.get(ticker)
         if hist is None or hist.empty:
             continue

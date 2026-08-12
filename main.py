@@ -69,6 +69,11 @@ class TickerState:
     last_stable_regime: int = -1
     last_stable_label: str = "Unknown"
     bar_count: int = 0
+    # Timestamp of the bar this PROCESS last ran a decision on.  Staleness is
+    # per process, not per history: the scheduled --once run rebuilds history
+    # from the API at startup, so the newest completed bar is already in it
+    # and a "did the history grow?" test would call every single day stale.
+    last_decision_ts: Optional[pd.Timestamp] = None
 
 
 @dataclass
@@ -354,10 +359,7 @@ class TradingSystem:
                 decisions[ticker] = decision
                 continue
 
-            prev_len = len(state.history)
-            state.history = self._append_bar(state.history, bar)
-
-            if len(state.history) <= prev_len:
+            if not self._accept_bar(state, bar):
                 decision["action"] = "stale_bar"
                 decisions[ticker] = decision
                 continue
@@ -369,8 +371,8 @@ class TradingSystem:
             self._bars_processed += 1
             updated_tickers.append(ticker)
 
-            price = float(bar.get("close", state.history["close"].iloc[-1]))
-            prices[ticker] = price
+            decision_close = float(bar.get("close", state.history["close"].iloc[-1]))
+            prices[ticker] = self._execution_price(ticker, decision_close)
 
             decision["action"] = "bar_updated"
             decisions[ticker] = decision
@@ -521,13 +523,11 @@ class TradingSystem:
             return decision
 
         # 1 — Append new bar to history.  The poll loop re-delivers the same
-        #     (possibly still-forming) daily bar many times per day; appending
-        #     it repeatedly corrupted every rolling feature and produced one
-        #     order per poll.  A re-delivered timestamp only UPDATES the row
-        #     (keep=last); the decision pipeline runs once per NEW bar.
-        prev_len = len(state.history)
-        state.history = self._append_bar(state.history, bar)
-        if len(state.history) <= prev_len:
+        #     daily bar many times per day; appending it repeatedly corrupted
+        #     every rolling feature and produced one order per poll.  A
+        #     re-delivered timestamp only UPDATES the row (keep=last); the
+        #     decision pipeline runs once per NEW bar.
+        if not self._accept_bar(state, bar):
             decision["action"] = "stale_bar"
             return decision
         if len(state.history) > _MAX_HISTORY_BARS:
@@ -574,7 +574,9 @@ class TradingSystem:
         #     check all need causal inputs derived from the price history)
         vol_z = float(feats.iloc[-1].get("volume_zscore_21d", 0.0))
         closes = state.history["close"]
-        price = float(bar.get("close", closes.iloc[-1]))
+        # Sizing and the logged expected_price must use the price the order
+        # will actually fill near, not the completed bar's close it decided on.
+        price = self._execution_price(ticker, float(bar.get("close", closes.iloc[-1])))
         equity = self._current_equity()
         current_qty = self._position_qty(ticker)
         current_weight = (current_qty * price / equity) if equity > 0 else 0.0
@@ -1152,6 +1154,64 @@ class TradingSystem:
         row.columns = [c.lower() for c in row.columns]
         out = pd.concat([history, row])
         return out[~out.index.duplicated(keep="last")].sort_index()
+
+    def _accept_bar(self, state: TickerState, bar: pd.Series) -> bool:
+        """
+        Store `bar` and report whether it is a NEW decision bar for this run.
+
+        The row is written either way, so a re-delivered in-progress bar still
+        refreshes the stored prices.  What it must not do is re-run the
+        decision pipeline — that produced one duplicate order per poll.
+
+        A bar is a decision bar when this process has not already decided on
+        it AND it is not older than the history we hold.  The "not older"
+        half rejects a genuinely stale bar; the "not already decided" half is
+        what lets a fresh process act on the newest completed bar, which its
+        own startup fetch has necessarily already put into the history.
+        """
+        prev_len = len(state.history)
+        newest_known = (
+            pd.Timestamp(state.history.index[-1]) if prev_len else None
+        )
+        state.history = self._append_bar(state.history, bar)
+
+        try:
+            bar_ts = pd.Timestamp(bar.name)
+        except (TypeError, ValueError):
+            bar_ts = None
+        if bar_ts is None or pd.isna(bar_ts):
+            return len(state.history) > prev_len
+
+        try:
+            if state.last_decision_ts is not None and bar_ts <= state.last_decision_ts:
+                return False
+            if newest_known is not None and bar_ts < newest_known:
+                return False
+        except TypeError:
+            # Mixed tz-aware / naive timestamps: fall back to the old rule
+            # rather than guessing which calendar the caller meant.
+            return len(state.history) > prev_len
+
+        state.last_decision_ts = bar_ts
+        return True
+
+    def _execution_price(self, ticker: str, fallback: float) -> float:
+        """
+        Price used to turn a target weight into a share count.
+
+        Decisions run on the last COMPLETED daily bar, but the order fills
+        now, so the decision close is stale by one overnight gap. Ask the feed
+        for the current price and fall back to the decision close when it
+        cannot answer (or when the feed predates get_latest_price).
+        """
+        getter = getattr(self._data_feed, "get_latest_price", None)
+        if getter is None:
+            return fallback
+        try:
+            price = float(self._safe_call(getter, ticker))
+        except (TypeError, ValueError):
+            return fallback
+        return price if price > 0 else fallback
 
     def _alert(self, message: str, severity: str, key: Optional[str] = None) -> None:
         if self._alerts is not None:

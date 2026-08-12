@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -28,6 +29,10 @@ from settings import config
 logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path(config.MONITORING["log_dir"]).parent / "data_cache"
+
+# Exchange calendar reference for deciding whether a daily bar is finished.
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
+_SESSION_CLOSE_HOUR = 16          # 16:00 New York
 
 
 class MarketDataFeed:
@@ -101,7 +106,12 @@ class MarketDataFeed:
     # Latest / real-time bars
     # ------------------------------------------------------------------
 
-    def get_latest_bar(self, ticker: str, timeframe: str = "1Day") -> pd.Series:
+    def get_latest_bar(
+        self,
+        ticker: str,
+        timeframe: str = "1Day",
+        completed_only: bool = True,
+    ) -> pd.Series:
         """
         Fetch the most recent bar for `ticker` at the given interval.
 
@@ -109,15 +119,73 @@ class MarketDataFeed:
         defined on DAILY bars.  (The previous 5Min default fed intraday bars
         into the daily pipeline — every rolling feature and the SMA-200
         became a mix of daily and 5-minute data.)
+
+        `completed_only` (daily bars only) drops a trailing bar whose session
+        is still open.  The scheduled run fires 09:35 New York, when the API
+        already serves TODAY's daily bar — five minutes of trading presented
+        as a finished day.  Feeding that to the SMA-200, the vol estimate and
+        the HMM meant the live system decided on a different quantity than
+        anything ever backtested, which decides on the completed close and
+        fills at the next open.  With the in-progress bar dropped, the newest
+        completed bar IS yesterday's close and execution happens just after
+        today's open — exactly the backtested model.
+
+        Pass completed_only=False to get the current, still-forming bar; that
+        is a price source (see get_latest_price), not a decision input.
         """
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=5)   # enough lookback to guarantee a bar
+        # 10 days: a long weekend plus a holiday can leave very few sessions,
+        # and completed_only discards one of whatever comes back.
+        start = end - timedelta(days=10)
         df = self._fetch_bars_with_retry(
             ticker, start.isoformat(), end.isoformat(), timeframe,
         )
         if df.empty:
             raise RuntimeError(f"No recent bar available for {ticker}.")
+        if completed_only and timeframe == "1Day":
+            df = self._drop_in_progress_session(df, now=end)
+            if df.empty:
+                raise RuntimeError(
+                    f"No completed daily bar available for {ticker}."
+                )
         return df.iloc[-1]
+
+    def get_latest_price(self, ticker: str) -> float:
+        """
+        Most recent traded price, INCLUDING the still-forming session.
+
+        Decisions run on completed bars, but orders fill now: sizing a target
+        weight on yesterday's close would be wrong by the whole overnight gap,
+        and the expected_price recorded for slippage measurement would carry
+        that gap into every fill it logs.
+        """
+        bar = self.get_latest_bar(ticker, "1Day", completed_only=False)
+        return float(bar["close"])
+
+    @staticmethod
+    def _drop_in_progress_session(
+        df: pd.DataFrame, now: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        """
+        Drop a trailing daily bar belonging to a session that has not closed.
+
+        A bar dated today is final only once the exchange has closed; before
+        16:00 New York it is a partial day whose "close" is simply the last
+        print.  Timestamps without a timezone are taken to be exchange dates
+        already, which is how the parquet cache stores them.
+        """
+        if df.empty:
+            return df
+        now_ny = (now or datetime.now(timezone.utc)).astimezone(_EXCHANGE_TZ)
+        if now_ny.hour >= _SESSION_CLOSE_HOUR:
+            return df           # today's session is over; its bar is final
+
+        last_ts = pd.Timestamp(df.index[-1])
+        if last_ts.tzinfo is not None:
+            last_ts = last_ts.tz_convert(_EXCHANGE_TZ)
+        if last_ts.date() == now_ny.date():
+            return df.iloc[:-1]
+        return df
 
     def start_stream(self, tickers: list[str], callback: Callable) -> None:
         """

@@ -149,11 +149,14 @@ Until all three are done it stays paper — no accidental path to real orders.
 - **Firing time.** 09:35 ET, Mon-Fri, via `OnCalendar=Mon-Fri 09:35
   America/New_York` — the explicit timezone means systemd tracks EST/EDT so
   it stays 5 min after the open all year. Holidays fire but no-op.
-- **Decision vs fill timing.** The bot decides on today's fresh bar and
-  submits an immediate market order. The backtest models "decide on the
-  completed close, fill next open"; firing near the *close* and submitting
-  market-on-open orders for the next day would map that even more exactly —
-  a possible refinement, not required for a slow SMA-200 system.
+- **Decision vs fill timing.** The bot decides on the last *completed* daily
+  bar — yesterday's close — and submits an immediate market order that fills
+  just after today's open. That is the backtester's model exactly ("decide at
+  close T-1, fill at open T"). Until 2026-08-10 it decided on today's
+  still-forming bar instead, i.e. on five minutes of trading dressed up as a
+  finished day, which put the SMA-200 and the vol estimate on data no backtest
+  ever saw. Order *sizing* still uses the current price, not the decision
+  close, so a target weight is not off by the overnight gap.
 - **Missed runs.** `Persistent=true`: if the host was off at fire time it
   runs on next boot rather than skipping the day.
 - **Reboots / data feed / clock:** free Alpaca IEX daily bars (no SIP sub);

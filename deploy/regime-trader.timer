@@ -6,14 +6,16 @@ Documentation=file:///opt/regime_trader/deploy/README.md
 # 09:35 America/New_York, Mon-Fri. The explicit timezone makes systemd
 # handle EST/EDT itself, so this stays 5 minutes after the 09:30 open all
 # year (a naive UTC time would drift an hour across DST). US market holidays
-# still fire but are harmless no-ops: the market clock reads closed and the
-# latest daily bar is stale, so no order is placed.
+# still fire but are harmless no-ops: the market clock reads closed, so no
+# order is placed.
 #
-# Why just after the open (not the close): the existing loop submits an
-# immediate market order on the latest bar, so it decides on today's fresh
-# bar and fills right away. (A close-time run submitting market-on-open
-# orders for the next day would map the backtest's next-open fills even more
-# exactly — a possible future refinement, see README.)
+# Why just after the open (not the close): this IS the backtested execution
+# model. The bot decides on the last COMPLETED daily bar — yesterday's close
+# — and its market order fills just after today's open, which is exactly the
+# "decide at close T-1, fill at open T" the backtester simulates. Firing at
+# 09:35 is what makes that alignment true, so do not move it into the middle
+# of the session: the run would still decide on yesterday's close, but the
+# fill would drift away from the open the backtest assumes.
 OnCalendar=Mon-Fri 09:35 America/New_York
 
 # If the host was asleep/off at fire time (e.g. a reboot window), run as soon

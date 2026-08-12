@@ -339,6 +339,47 @@ class TestBarHygiene:
         decision = started_system.run_once("AAA", stale)
         assert decision["action"] == "stale_bar"
 
+    def test_newest_completed_bar_is_decided_on_by_a_fresh_process(self, started_system):
+        """
+        The deployed bot is a daily `--once` oneshot: startup refetches
+        history, so the newest COMPLETED bar — the one it must decide on — is
+        already in it. Staleness is therefore per process, not "did the
+        history grow": the latter called every single run stale and the bot
+        would never trade once it stopped deciding on the unfinished bar.
+        """
+        state = started_system._states["AAA"]
+        newest = state.history.iloc[-1]
+        before = started_system._bars_processed
+
+        decision = started_system.run_once("AAA", newest)
+
+        assert decision["action"] != "stale_bar"
+        assert started_system._bars_processed == before + 1
+        # ...and only once per process, however often the poll re-delivers it.
+        assert started_system.run_once("AAA", newest)["action"] == "stale_bar"
+
+    def test_sizing_uses_the_current_price_not_the_decision_close(self, started_system):
+        """
+        Decisions run on the completed bar, but the order fills now. Sizing
+        and the logged expected_price must use the live price, or both are
+        wrong by the whole overnight gap.
+        """
+        bar = _bars_after(1, seed=11).iloc[-1]
+        started_system._data_feed.get_latest_price = lambda ticker: 1234.5
+        assert started_system._execution_price("AAA", float(bar["close"])) == 1234.5
+
+    @pytest.mark.parametrize("answer", [None, 0.0, -5.0, "nope"])
+    def test_unusable_live_price_falls_back_to_the_decision_close(
+        self, started_system, answer,
+    ):
+        started_system._data_feed.get_latest_price = lambda ticker: answer
+        assert started_system._execution_price("AAA", 42.0) == 42.0
+
+    def test_feed_without_a_price_endpoint_still_works(self, started_system):
+        """FakeDataFeed and any older feed simply have no get_latest_price."""
+        assert not hasattr(started_system._data_feed, "get_latest_price")
+        assert started_system._execution_price("AAA", 42.0) == 42.0
+
     def test_history_is_capped(self, started_system, monkeypatch):
         import main as main_mod
         monkeypatch.setattr(main_mod, "_MAX_HISTORY_BARS", 345)

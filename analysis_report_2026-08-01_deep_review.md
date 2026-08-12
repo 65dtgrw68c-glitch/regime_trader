@@ -528,3 +528,34 @@ Turnover 9,5×/Jahr.
 * **Der Tail-Risiko-Vorbehalt gilt unverändert**: ein einzelner −50%-Tag löscht
   einen 2x-ETF aus. So etwas kam 2007–2026 nicht vor. Und gehebelter Trend
   versagt in schnellen Crashs (2020-02..04: 60/40 −15,8% vs SPY −13,5%).
+
+# NACHTRAG 2026-08-12 — Befund 5, 6, 7 geschlossen
+
+Die drei zuvor zurückgestellten Code-Befunde wurden jetzt behoben (Branch
+`levered-sleeve-60-40`, im Anschluss an die 60/40-Umsetzung oben):
+
+* **Befund 6** (Timing-Divergenz): `MarketDataFeed.get_latest_bar` verwirft jetzt
+  standardmäßig einen Tagesbalken, dessen Session noch läuft (America/New_York,
+  16:00-Schluss). Der 09:35-Lauf entscheidet damit auf dem letzten VOLLSTÄNDIGEN
+  Close — exakt das Backtester-Modell ("Entscheidung auf Close T-1, Fill bei
+  Open T"). Die Staleness-Prüfung ist jetzt pro Prozess (`last_decision_ts`),
+  nicht mehr "ist die Historie gewachsen" — Letzteres hätte den täglichen
+  `--once`-Lauf für immer als „stale" markiert, sobald er korrekt auf dem
+  fertigen Balken entscheidet, den sein eigener Startup-Fetch bereits geladen
+  hat. Sizing/`expected_price` nutzen jetzt den aktuellen Kurs
+  (`get_latest_price`), nicht den Entscheidungs-Close, sonst wäre die Positionsgröße
+  um genau die Overnight-Bewegung falsch gewesen.
+* **Befund 5** (toter Code): `size_position()`/`max_risk_per_trade` entfernt.
+  Kein Pfad rief die Methode je auf; die Konfiguration versprach eine Regel, die
+  es nicht gab. Ein Nachbau hätte einen `stop_price` gebraucht, den es im Live-Pfad
+  nicht gibt (Stops sind aus guten, gemessenen Gründen deaktiviert) — Löschen war
+  die ehrliche Lösung, nicht Nachrüsten.
+* **Befund 7** (Klassen-Cap-Bug in `run_once`): `RiskManager.clip_target_weight()`
+  ersetzt den Alles-oder-Nichts-Reject durch ein Clipping auf das verbleibende
+  Budget. Vorher gewann der zuerst entschiedene Ticker eines Asset-Class-Budgets
+  dauerhaft; ein zweiter Ticker derselben Klasse wurde auf 0 gesetzt, selbst wenn
+  eine kleinere Position gepasst hätte. Betrifft weiterhin nur den
+  Nicht-Default-Pfad (`portfolio_batch_loop=True` bleibt der produktive Pfad).
+
+Weiterhin offen: Phase 3 (echte Slippage aus Paper-Handel) und der
+Tail-Risiko-Vorbehalt oben — beide unverändert.

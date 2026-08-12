@@ -26,7 +26,6 @@ from settings import config
 BASE_CFG = {
     "max_position_size":        0.10,
     "max_leverage":             1.0,
-    "max_risk_per_trade":       0.01,
     "per_name_cap":             0.40,
     "gross_cap":                1.00,
     "class_caps":               {"equity": 0.65, "gold": 0.20},
@@ -181,46 +180,7 @@ class TestLockFile:
 
 
 # ---------------------------------------------------------------------------
-# 3. Position sizing (1% risk rule)
-# ---------------------------------------------------------------------------
-
-class TestPositionSizing:
-
-    def test_basic_one_percent_risk(self, rm):
-        # portfolio 100k, risk 1% = $1000; stop distance $2 → 500 shares,
-        # but capped by max_position_size 10% = $10k / $100 = 100 shares.
-        qty = rm.size_position(entry_price=100.0, stop_price=98.0, portfolio_value=100_000)
-        assert qty == 100   # position cap binds
-
-    def test_risk_limit_binds_when_below_cap(self, rm):
-        # Wide stop so the 1% risk limit is the binding constraint.
-        # risk $1000 / stop distance $50 = 20 shares; cap = $10k/$100 = 100.
-        qty = rm.size_position(entry_price=100.0, stop_price=50.0, portfolio_value=100_000)
-        assert qty == 20
-
-    def test_scales_with_portfolio_value(self, rm):
-        small = rm.size_position(100.0, 50.0, 100_000)   # 20 shares
-        big   = rm.size_position(100.0, 50.0, 200_000)   # risk $2000/$50 = 40
-        assert big == 2 * small
-
-    def test_zero_stop_distance_returns_zero(self, rm):
-        assert rm.size_position(100.0, 100.0, 100_000) == 0
-
-    def test_halve_breaker_reduces_size(self, rm):
-        base = rm.size_position(100.0, 50.0, 100_000)    # 20 shares
-        rm.start_new_day(100_000)
-        rm.update_equity(98_000)                          # HALVE active
-        reduced = rm.size_position(100.0, 50.0, 100_000)
-        assert reduced == base // 2
-
-    def test_flatten_breaker_zero_size(self, rm):
-        rm.start_new_day(100_000)
-        rm.update_equity(97_000)                          # FLATTEN
-        assert rm.size_position(100.0, 50.0, 100_000) == 0
-
-
-# ---------------------------------------------------------------------------
-# 4. Leverage enforcement per regime
+# 3. Leverage enforcement per regime
 # ---------------------------------------------------------------------------
 
 class TestLeverageEnforcement:
@@ -245,7 +205,7 @@ class TestLeverageEnforcement:
 
 
 # ---------------------------------------------------------------------------
-# 5. Order validation
+# 4. Order validation
 # ---------------------------------------------------------------------------
 
 class TestOrderValidation:
@@ -357,7 +317,7 @@ class TestCorrelationChecks:
 
 
 # ---------------------------------------------------------------------------
-# 8. Config flags — daily-breaker switch & regime-cap switch
+# 7. Config flags — daily-breaker switch & regime-cap switch
 # ---------------------------------------------------------------------------
 
 class TestRiskConfigFlags:

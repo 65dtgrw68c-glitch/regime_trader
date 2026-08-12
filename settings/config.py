@@ -296,12 +296,6 @@ RISK = {
     # Volatility scaling: target annualised portfolio vol
     "target_vol": 0.10,
 
-    # ── Per-trade risk (position sizing) ───────────────────────────────────
-    # Maximum risk per individual trade as a fraction of total portfolio.
-    # Position size = (portfolio * max_risk_per_trade) / stop_loss_distance.
-    # ── EDIT THIS to change how much you risk on any single trade ──────────
-    "max_risk_per_trade": 0.01,    # 1% of portfolio at risk per trade
-
     # ── Hardcoded circuit-breaker trigger levels ────────────────────────────
     # Daily HALVE/FLATTEN breakers on/off.  They measure CLOSE-to-close
     # equity on a daily-bar system, i.e. they fire only after the loss is

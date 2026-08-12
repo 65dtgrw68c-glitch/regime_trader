@@ -83,7 +83,8 @@ class RiskManager:
     Typical usage each bar:
         rm.update_equity(portfolio_value)        # refresh breakers
         if rm.is_halted(): ...                    # respect HALT
-        qty = rm.size_position(price, stop_price, portfolio_value)
+        qty = shares_for_target_weight(target_weight, price, equity,
+                                       cb_scaling=rm.size_scaling_factor())
         v   = rm.validate_order(ticker, qty, price, portfolio_value,
                                 buying_power, leverage, regime_label)
         if v.approved: submit(v.approved_qty)
@@ -286,47 +287,6 @@ class RiskManager:
             )
         self._cb_level = level
         return level
-
-    # ------------------------------------------------------------------
-    # Position sizing (1% risk rule)
-    # ------------------------------------------------------------------
-
-    def size_position(
-        self,
-        entry_price: float,
-        stop_price: float,
-        portfolio_value: float,
-        max_risk_per_trade: Optional[float] = None,
-    ) -> int:
-        """
-        Size a position from the per-trade risk limit and stop distance.
-
-            risk_dollars = portfolio_value * max_risk_per_trade
-            qty          = risk_dollars / |entry_price - stop_price|
-
-        The result is reduced by any active circuit-breaker scaling factor
-        and floored to a whole number of shares.
-        """
-        if entry_price <= 0 or portfolio_value <= 0:
-            return 0
-        stop_distance = abs(entry_price - stop_price)
-        if stop_distance <= 0:
-            logger.warning("size_position: zero stop distance — returning 0 shares.")
-            return 0
-
-        risk_pct     = max_risk_per_trade or self._cfg["max_risk_per_trade"]
-        risk_dollars = portfolio_value * risk_pct
-        raw_qty      = risk_dollars / stop_distance
-
-        # Apply circuit-breaker scaling
-        raw_qty *= self.size_scaling_factor()
-
-        # Never exceed the per-position notional cap
-        max_notional = portfolio_value * self._cfg["max_position_size"]
-        max_qty      = max_notional / entry_price
-        qty          = min(raw_qty, max_qty)
-
-        return int(max(0, np.floor(qty)))
 
     def size_scaling_factor(self) -> float:
         """

@@ -674,15 +674,31 @@ class TradingSystem:
         candidate_weights = {}
         for asset in self._states:
             if asset == ticker:
-                candidate_weights[asset] = target_weight
+                continue
+            qty = self._position_qty(asset)
+            if qty:
+                price_for_asset = self._states[asset].history["close"].iloc[-1]
+                candidate_weights[asset] = (qty * float(price_for_asset) / equity) if equity > 0 else 0.0
             else:
-                qty = self._position_qty(asset)
-                if qty:
-                    price_for_asset = self._states[asset].history["close"].iloc[-1]
-                    candidate_weights[asset] = (qty * float(price_for_asset) / equity) if equity > 0 else 0.0
-                else:
-                    candidate_weights[asset] = 0.0
+                candidate_weights[asset] = 0.0
+
+        # Clip (never reject outright) `ticker`'s own target to whatever
+        # book-level headroom the OTHER tickers' current holdings leave. A
+        # flat reject here durably favours whichever ticker claimed a shared
+        # class/gross budget first: with two tickers in one asset class, the
+        # second-decided one would always be zeroed even when a smaller
+        # position of its own would fit — and the lost budget never comes
+        # back once a neighbour holds it. Clipping gives each ticker its fair
+        # share of whatever room is left, independent of decision order.
+        clipped_weight = self._risk.clip_target_weight(ticker, target_weight, candidate_weights)
+        if clipped_weight < target_weight - 1e-9:
+            logger.info(
+                "Portfolio risk clipped %s target %.4f -> %.4f to fit remaining "
+                "book budget.", ticker, target_weight, clipped_weight,
+            )
+        target_weight = clipped_weight
         candidate_weights[ticker] = target_weight
+
         book_validation = self._risk.validate_book(candidate_weights)
         if not book_validation.approved:
             decision["action"] = "rejected_by_risk"

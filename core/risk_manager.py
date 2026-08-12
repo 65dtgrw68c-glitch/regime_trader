@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import numpy as np
 
@@ -389,6 +389,66 @@ class RiskManager:
                 )
 
         return OrderValidation(True, "approved")
+
+    def clip_target_weight(
+        self,
+        ticker: str,
+        target_weight: float,
+        other_weights: Mapping[str, float],
+    ) -> float:
+        """
+        Largest weight for `ticker` that keeps (this weight + `other_weights`
+        held fixed) within every book-level cap: per-name, gross, economic and
+        class.  `other_weights` may include a stale/zero entry for `ticker`
+        itself; it is ignored.
+
+        For a caller that can only move ONE ticker's position per call (the
+        single-asset live path — main.TradingSystem.run_once), rejecting the
+        whole book on a class/gross breach durably favours whichever ticker
+        happened to claim the shared budget first: a later ticker's request
+        is zeroed outright even when a SMALLER position would fit, and the
+        budget it lost never comes back once its neighbour holds it. Clipping
+        to whatever headroom remains gives every ticker its fair share of the
+        shared budget regardless of arrival order — nobody is durably locked
+        to zero as long as the book has room left.
+
+        This system is long-only (shares_for_target_weight treats
+        target_weight <= 0 as no position), so a negative input clips to 0
+        rather than being preserved with its sign.
+        """
+        if target_weight <= 0:
+            return 0.0
+        others = {t: float(w) for t, w in other_weights.items() if t != ticker}
+        room = float(target_weight)
+
+        room = min(room, self._effective_per_name_cap())
+
+        gross_cap = self._cfg.get("gross_cap", self._cfg.get("max_leverage", 1.0))
+        other_gross = sum(abs(w) for w in others.values())
+        room = min(room, max(0.0, gross_cap - other_gross))
+
+        economic_cap = self._cfg.get("economic_gross_cap")
+        assets = getattr(config, "UNIVERSE", {}).get("assets", {})
+        if economic_cap is not None:
+            leverage = float(assets.get(ticker, {}).get("leverage", 1.0))
+            other_economic = sum(
+                abs(w) * float(assets.get(t, {}).get("leverage", 1.0))
+                for t, w in others.items()
+            )
+            if leverage > 0:
+                room = min(room, max(0.0, (float(economic_cap) - other_economic) / leverage))
+
+        class_caps = self._cfg.get("class_caps", {})
+        asset_class = assets.get(ticker, {}).get("asset_class", "equity")
+        cap = class_caps.get(asset_class)
+        if cap is not None:
+            other_class = sum(
+                abs(w) for t, w in others.items()
+                if assets.get(t, {}).get("asset_class", "equity") == asset_class
+            )
+            room = min(room, max(0.0, cap - other_class))
+
+        return max(0.0, room)
 
     def validate_order(
         self,

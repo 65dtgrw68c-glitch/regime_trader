@@ -275,6 +275,115 @@ class TestOrderValidation:
 
 
 # ---------------------------------------------------------------------------
+# 5. Class-cap clipping for the single-asset live path (Befund 7)
+# ---------------------------------------------------------------------------
+
+class TestClipTargetWeight:
+    """main.TradingSystem.run_once decides one ticker at a time and can only
+    move THAT ticker's position; it used to reject the whole candidate book
+    outright on a class/gross breach. With two same-class tickers, whichever
+    was decided first durably won the shared budget: the second was zeroed
+    every time even when a smaller position of its own would fit, since the
+    lost budget never came back once a neighbour held it. clip_target_weight
+    replaces the flat reject with "take whatever headroom is left," so a
+    ticker decided later still gets its fair share instead of nothing."""
+
+    def _rm(self, tmp_path, **over):
+        # BASE_CFG's max_position_size (0.10) would itself clip every "other"
+        # weight used below; raise it so per_name_cap is what actually binds
+        # in the one test that means to exercise it.
+        cfg = {**BASE_CFG, "max_position_size": 1.0, "per_name_cap": 1.0,
+               "class_caps": {"equity": 0.70, "gold": 0.20}, **over}
+        return RiskManager(cfg=cfg, lock_file_path=str(tmp_path / "l.lock"),
+                           persist_state=False)
+
+    def test_no_other_positions_passes_through_unclipped(self, tmp_path):
+        rm = self._rm(tmp_path)
+        assert rm.clip_target_weight("SPY", 0.30, {}) == pytest.approx(0.30)
+
+    def test_clips_to_remaining_class_budget(self, tmp_path, monkeypatch):
+        """SPY holds 0.50 of a 0.70 equity cap; QQQ wants 0.50 but only 0.20
+        of headroom is left — the literal Befund 7 scenario, previously a
+        flat rejection to zero regardless of processing order."""
+        monkeypatch.setitem(config.UNIVERSE["assets"], "QQQ",
+                            {"asset_class": "equity"})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity"})
+        rm = self._rm(tmp_path)
+        clipped = rm.clip_target_weight("QQQ", 0.50, {"SPY": 0.50})
+        assert clipped == pytest.approx(0.20)
+
+    def test_second_ticker_is_not_durably_zeroed(self, tmp_path, monkeypatch):
+        """Symmetry check: swap which ticker is "other" — both get a
+        positive share of the budget, neither is durably locked to zero."""
+        monkeypatch.setitem(config.UNIVERSE["assets"], "QQQ",
+                            {"asset_class": "equity"})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity"})
+        rm = self._rm(tmp_path)
+        spy_clip = rm.clip_target_weight("SPY", 0.50, {"QQQ": 0.50})
+        assert spy_clip == pytest.approx(0.20)
+
+    def test_other_ticker_in_a_different_class_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(config.UNIVERSE["assets"], "GLD",
+                            {"asset_class": "gold"})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity"})
+        rm = self._rm(tmp_path)
+        assert rm.clip_target_weight("SPY", 0.60, {"GLD": 0.20}) == pytest.approx(0.60)
+
+    def test_per_name_cap_binds_independent_of_other_positions(self, tmp_path):
+        rm = self._rm(tmp_path, per_name_cap=0.25)
+        assert rm.clip_target_weight("SPY", 0.60, {}) == pytest.approx(0.25)
+
+    def test_gross_cap_binds_across_all_classes(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(config.UNIVERSE["assets"], "IEF",
+                            {"asset_class": "bonds"})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity"})
+        rm = self._rm(tmp_path, gross_cap=0.80, per_name_cap=1.0,
+                      class_caps={"equity": 1.0, "bonds": 1.0})
+        assert rm.clip_target_weight("SPY", 0.50, {"IEF": 0.50}) == pytest.approx(0.30)
+
+    def test_economic_cap_scales_by_leverage(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(config.UNIVERSE["assets"], "QLD",
+                            {"asset_class": "levered_equity", "leverage": 2.0})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity", "leverage": 1.0})
+        rm = self._rm(tmp_path, economic_gross_cap=1.20, per_name_cap=1.0,
+                      class_caps={"equity": 1.0, "levered_equity": 1.0})
+        # 0.60 economic already used by SPY; 0.60 left / leverage 2.0 = 0.30.
+        clipped = rm.clip_target_weight("QLD", 0.50, {"SPY": 0.60})
+        assert clipped == pytest.approx(0.30)
+
+    def test_no_budget_left_clips_to_zero_not_a_rejection(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(config.UNIVERSE["assets"], "QQQ",
+                            {"asset_class": "equity"})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity"})
+        rm = self._rm(tmp_path)
+        assert rm.clip_target_weight("QQQ", 0.50, {"SPY": 0.70}) == pytest.approx(0.0)
+
+    def test_zero_or_negative_target_clips_to_zero(self, tmp_path):
+        rm = self._rm(tmp_path)
+        assert rm.clip_target_weight("SPY", 0.0, {}) == 0.0
+        assert rm.clip_target_weight("SPY", -0.10, {}) == 0.0
+
+    def test_clipped_candidate_book_always_passes_validate_book(self, tmp_path, monkeypatch):
+        """The two are meant to agree: clip first, and validate_book on the
+        clipped result should never itself reject."""
+        monkeypatch.setitem(config.UNIVERSE["assets"], "QQQ",
+                            {"asset_class": "equity"})
+        monkeypatch.setitem(config.UNIVERSE["assets"], "SPY",
+                            {"asset_class": "equity"})
+        rm = self._rm(tmp_path)
+        others = {"SPY": 0.50}
+        clipped = rm.clip_target_weight("QQQ", 0.50, others)
+        book = {**others, "QQQ": clipped}
+        assert rm.validate_book(book).approved
+
+
+# ---------------------------------------------------------------------------
 # 6. Correlation checks
 # ---------------------------------------------------------------------------
 

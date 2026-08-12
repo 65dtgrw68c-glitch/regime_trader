@@ -303,6 +303,92 @@ class TestFractionalShares:
         assert not float(target_positions["AAA"]).is_integer()
 
 
+class TestSingleAssetClassCapClipping:
+    """Befund 7: run_once decides one ticker at a time, and a class-cap breach
+    used to reject the WHOLE candidate book to zero — durably favouring
+    whichever same-class ticker was decided first, since the loser's request
+    is zeroed even when a smaller position of its own would fit. RiskManager
+    .clip_target_weight() replaces that flat reject with "take whatever
+    headroom is left"; this drives it end-to-end through run_once."""
+
+    @staticmethod
+    def _fixed_evaluate(target_weight):
+        """Bypass the HMM/trend machinery: always ask for `target_weight` in
+        whichever single ticker this call's current_weights key names."""
+        from core.regime_strategies import StrategyParams, StrategySignal, VolTier
+
+        params = StrategyParams(
+            allocation_pct=1.0, max_leverage=1.0,
+            require_trend_confirmation=False, cash_buffer_pct=0.0,
+            allow_shorts=False, rationale="test fixture",
+        )
+
+        def _evaluate(self, *, regime_index, regime_label, proba,
+                     high_uncertainty, volume_zscore, current_weights,
+                     current_vol, trend_confirmed):
+            ticker = next(iter(current_weights))
+            return StrategySignal(
+                regime_index=regime_index, regime_label=regime_label,
+                vol_tier=VolTier.MED, confidence=1.0, high_uncertainty=False,
+                params=params, effective_alloc=target_weight,
+                effective_leverage=1.0,
+                target_weights={ticker: target_weight},
+                should_rebalance=True, rebalance_reason="test fixture",
+            )
+
+        return _evaluate
+
+    def test_second_same_class_ticker_gets_its_fair_share_not_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        """SPY already holds 0.50 of the 0.70 equity class cap (production
+        settings/config.py). QQQ — same class — now wants 0.50 too. Before
+        clip_target_weight this was `rejected_by_risk` outright; QQQ must now
+        receive an order sized to its remaining 0.20 headroom instead."""
+        from core.regime_strategies import RegimeOrchestrator
+
+        sys_ = _make_system(tmp_path, tickers=("SPY", "QQQ"), equity=100_000.0)
+        assert sys_.startup() is True
+        monkeypatch.setattr(
+            RegimeOrchestrator, "evaluate", self._fixed_evaluate(0.50),
+        )
+
+        spy_price = float(sys_._states["SPY"].history["close"].iloc[-1])
+        spy_qty = 0.50 * 100_000.0 / spy_price
+        monkeypatch.setattr(
+            sys_, "_position_qty",
+            lambda t: spy_qty if t == "SPY" else 0.0,
+        )
+
+        bar = _bars_after(1, seed=201, start="2022-06-01").iloc[-1]
+        decision = sys_.run_once("QQQ", bar)
+
+        assert decision["action"] != "rejected_by_risk", decision
+        assert decision["action"] == "order_submitted"
+        qty_price = float(bar["close"] if "open" not in bar else bar["open"])
+        implied_weight = decision["qty"] * qty_price / 100_000.0
+        assert implied_weight == pytest.approx(0.20, abs=0.01)
+
+    def test_ticker_with_no_class_neighbour_is_unaffected(self, tmp_path, monkeypatch):
+        """Sanity check: with no competing same-class position, the ticker
+        gets its full requested weight — clipping must not shrink it."""
+        from core.regime_strategies import RegimeOrchestrator
+
+        sys_ = _make_system(tmp_path, tickers=("SPY",), equity=100_000.0)
+        assert sys_.startup() is True
+        monkeypatch.setattr(
+            RegimeOrchestrator, "evaluate", self._fixed_evaluate(0.50),
+        )
+
+        bar = _bars_after(1, seed=202, start="2022-06-01").iloc[-1]
+        decision = sys_.run_once("SPY", bar)
+
+        assert decision["action"] == "order_submitted"
+        price = float(bar["close"])
+        implied_weight = decision["qty"] * price / 100_000.0
+        assert implied_weight == pytest.approx(0.50, abs=0.01)
+
+
 # ---------------------------------------------------------------------------
 # 2b. Bar hygiene — the live loop must act once per NEW bar
 # ---------------------------------------------------------------------------

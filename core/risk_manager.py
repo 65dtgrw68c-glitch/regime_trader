@@ -677,7 +677,7 @@ class RiskManager:
         return (self._current_equity - self._day_start_equity) / self._day_start_equity
 
     def _drawdown(self) -> float:
-        if not self._peak_equity:
+        if not self._peak_equity or self._current_equity is None:
             return 0.0
         return (self._current_equity - self._peak_equity) / self._peak_equity
 

@@ -339,7 +339,19 @@ eine Notbremse: Er stoppt und legt eine Sperrdatei an
 **nichts** — absichtlich. Der Bot fährt **nicht** von selbst wieder hoch; das
 soll ein Mensch (du) entscheiden.
 
-So reagierst du darauf:
+So reagierst du darauf — am einfachsten mit dem eingebauten Werkzeug:
+```bash
+cd /opt/regime_trader
+python3 scripts/clear_halt.py
+```
+Es zeigt dir den vollständigen Vorfallsbericht, holt den echten aktuellen
+Kontostand von Alpaca und zeigt dir genau, worauf der Höchststand
+zurückgesetzt wird — und fasst erst danach, nach deiner ausdrücklichen
+Bestätigung (`yes`), überhaupt etwas an. Mit `--yes` überspringst du die
+Nachfrage (z. B. wenn du gerade ein bereits geprüftes Runbook abarbeitest),
+mit `--current-equity <Wert>` überspringst du den Alpaca-Abruf.
+
+Manuell geht es auch (z. B. ohne Netzwerkzugriff auf Alpaca von diesem Server):
 ```bash
 # 1. Lies, was passiert ist:
 cat /opt/regime_trader/logs/RISK_HALT.lock
@@ -355,6 +367,8 @@ frischer Prozess — ohne diese Datei würde er den Höchststand täglich neu au
 aktuellen Stand setzen, der gemessene Verlust wäre immer 0 % und die Notbremse
 könnte **nie** auslösen. Genau das war bis zum 01.08.2026 der Fall. Lässt du die
 Datei nach einem Halt liegen, löst die Bremse am nächsten Tag sofort wieder aus.
+(`clear_halt.py` setzt den Höchststand sofort neu, statt bis zum nächsten Lauf
+zu warten, bis der fehlende Zustand auffällt.)
 
 **Warum 35 % und nicht 20 %?** Das aktuelle 60/40-Buch hatte historisch selbst
 schon −24,8 % Rückgang. Eine Bremse bei −20 % läge also *innerhalb* des normalen

@@ -112,7 +112,22 @@ morning fire):
 
 The bot writes `/opt/regime_trader/logs/RISK_HALT.lock` and every daily run
 becomes a no-op exit **3** (it checks the lock before doing anything). Nothing
-trades until you clear it:
+trades until you clear it — a human always has to make that call, but the
+mechanics of clearing it are now one command instead of two blind `rm`s:
+
+```bash
+cd /opt/regime_trader
+python3 scripts/clear_halt.py
+```
+
+It prints the incident report, fetches the account's real current equity from
+Alpaca, shows exactly what the peak-equity baseline will be re-anchored to,
+and only touches anything after you type `yes`. Run it with `--yes` to skip
+the interactive prompt (e.g. from a runbook you've already reviewed), or
+`--current-equity <value>` to skip the broker lookup.
+
+Manual fallback, if you'd rather do it by hand (e.g. no network to Alpaca from
+the box):
 
 ```bash
 cat /opt/regime_trader/logs/RISK_HALT.lock          # read the incident report
@@ -126,7 +141,8 @@ drawdown is measured against, deliberately kept across restarts — the bot runs
 as a fresh process every morning, and without that file the peak resets daily,
 so the drawdown always reads 0.00% and no breaker can ever fire. Leaving it in
 place after a halt means the old peak survives and the breaker re-fires on the
-next bar.
+next bar. (`clear_halt.py` does this same re-anchor immediately instead of
+waiting for tomorrow's run to discover the state file is missing.)
 
 The threshold is −35% because the 60/40 book's own worst historical drawdown is
 −24.8%: a tighter halt sits inside the strategy's ordinary operating range and

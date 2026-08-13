@@ -572,6 +572,21 @@ class TestStatePersistence:
         rm, _ = self._daily_oneshot_run(tmp_path, 100_000, persist=False)
         assert not rm.state_path.exists()
 
+    def test_state_readable_before_any_equity_update(self, tmp_path):
+        """A caller that just wants to inspect a restored peak (e.g. an
+        operator tool reviewing a halt before deciding whether to clear it)
+        must be able to call .state() right after construction — before
+        start_new_day()/update_equity() have ever run. _current_equity is
+        only set by those, while _peak_equity is restored from disk, so
+        _drawdown() used to divide against a None current equity."""
+        self._daily_oneshot_run(tmp_path, 100_000, persist=True)
+        fresh = RiskManager(cfg=dict(self.CFG),
+                            lock_file_path=str(tmp_path / "RISK_HALT.lock"),
+                            persist_state=True)
+        state = fresh.state()
+        assert state.peak_equity == pytest.approx(100_000)
+        assert state.drawdown == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # 9. Economic (leverage-adjusted) book exposure

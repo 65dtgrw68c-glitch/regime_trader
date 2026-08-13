@@ -559,3 +559,52 @@ Die drei zuvor zurückgestellten Code-Befunde wurden jetzt behoben (Branch
 
 Weiterhin offen: Phase 3 (echte Slippage aus Paper-Handel) und der
 Tail-Risiko-Vorbehalt oben — beide unverändert.
+
+# NACHTRAG 2026-08-13 — Vol-Gate für den Sleeve geprüft und verworfen
+
+Reaktion auf den Tail-Risiko-Vorbehalt oben ("gehebelter Trend versagt in
+schnellen Crashs"): eine frühere, UNREGISTRIERTE Exploration hatte ein
+Realized-Vol-Gate (QLD auf 0 sobald QQQs kurzfristige Vol gegenüber ihrem
+eigenen Median explodiert, statt auf den SMA-200-Ausstieg zu warten) gegen
+genau zwei bekannte Krisen (2020, 2022) gescort und sah dabei stark aus —
+klassische Overfitting-Falle, siehe [[universe-expansion-plan]] /
+Do-not-tune-Liste. Deshalb vor Implementierung ein vorregistriertes Protokoll
+mit Owner-Freigabe (2026-08-13):
+
+* **Regel (fix, keine erneute Grid-Suche)**: QLD-Gewicht auf 0, wenn QQQs
+  10-Tage-Realized-Vol das 2,0-fache ihres eigenen 252-Tage-Medians
+  überschreitet.
+* **Bestehens-Kriterium**: Übernahme nur wenn, auf echten Daten (Blended-Buch
+  2007-04-10..2026-08-10, Fenster durch GLD-Historie begrenzt) Sharpe nicht
+  um mehr als 0,02 fällt, CAGR nicht um mehr als 0,5pp fällt, UND maxDD in
+  JEDER von vier Krisen (Dotcom, GFC, 2020, 2022) gleich oder besser ist.
+  Dotcom (2000-02, vor QLDs echtem Start 2006-06-21) nur Sleeve-isoliert,
+  mit einem synthetischen täglich neu gehebelten 2x-QQQ-Proxy — GLD/IEF
+  existieren vor 2004/2002 ebenfalls nicht, ein Blended-Buch ist dort ohnehin
+  nicht berechenbar.
+
+**Ergebnis** (`scripts/sleeve_check.py`-Referenzmethodik ergänzt um das Gate,
+Skript: `scripts/vol_gate_check.py`):
+
+| Fenster | Baseline maxDD | Gated maxDD | Ergebnis |
+|---|---:|---:|---|
+| Dotcom (Sleeve-only, synthetisch) | -74.91% | -74.02% | OK |
+| GFC (2007-10..2009-03) | -17.10% | **-18.62%** | **FAIL** |
+| 2020-02..04 | -24.50% | -13.54% | OK |
+| 2022 | -18.19% | -16.12% | OK |
+
+Sharpe/CAGR-Bar auf dem Gesamtzeitraum bestanden (Sharpe +0,08, CAGR +0,45pp),
+aber die GFC-Krise — nie Teil der ursprünglichen Auswahl — schneidet mit Gate
+SCHLECHTER ab als ohne. Plausible Erklärung: 2008 war ein zäher,
+mehrphasiger Bärenmarkt mit wiederholten Vol-Spikes und -Beruhigungen statt
+eines einzelnen scharfen Crashs wie 2020 — das Gate flackert dort rein/raus
+und verpasst Erholungsphasen, die der reine SMA-200-Ausstieg mitgenommen
+hätte.
+
+**Verdikt: REJECT — Vol-Gate wird nicht implementiert.** Genau der Fall, für
+den die Vorregistrierung gedacht war: auf den zwei Krisen, gegen die informell
+gesucht wurde, ein klarer Gewinn; auf der dritten, ungesehenen Krise ein
+klarer Verlust. Damit ist diese Idee jetzt eine abgeschlossene, getestete
+Entscheidung — nicht mehr offene "schwache Evidenz". Der Tail-Risiko-Vorbehalt
+(schnelle Crashs) bleibt unverändert bestehen; ein Vol-Gate ist nicht die
+Lösung dafür.

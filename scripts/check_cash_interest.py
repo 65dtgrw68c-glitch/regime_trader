@@ -56,6 +56,7 @@ def main(argv=None) -> int:
     account = client.get_account()
     is_paper = "paper-api" in (client.base_url or "") or client.paper
     print(f"Account: mode={'PAPER' if is_paper else 'LIVE'}  "
+          f"number={account['account_number']}  "
           f"status={account['status']}  cash=${account['cash']:,.2f}  "
           f"equity=${account['equity']:,.2f}")
 

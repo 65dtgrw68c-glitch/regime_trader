@@ -111,6 +111,7 @@ class AlpacaClient(BaseBroker):
         """Return account info as a plain dict (mit Retry-Schutz)."""
         acct = self.trading.get_account()
         return {
+            "account_number": str(getattr(acct, "account_number", "")),
             "buying_power":   float(getattr(acct, "buying_power", 0.0)),
             "cash":           float(getattr(acct, "cash", 0.0)),
             "equity":         float(getattr(acct, "equity", 0.0)),

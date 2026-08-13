@@ -144,6 +144,25 @@ class TestDeployedConfigIsCoherent:
         validation = RiskManager(persist_state=False).validate_book(book)
         assert validation.approved, validation.reason
 
+    def test_composed_book_survives_its_own_rounding(self):
+        """Befund R1: compose_book() rounds each weight to 6 decimals AFTER
+        scaling to the gross cap, so a book that lands exactly on the cap can
+        present to validate_book() as e.g. 1.0000010000000001 instead of 1.0
+        — a rounding artifact, not a real breach. Reproduced with the real
+        production sleeve config (core_scale 0.60, QLD 0.40) through the SAME
+        compose_book() both main.py and the backtester call. On the deployed
+        live path the old 1e-9 tolerance turned this into a whole-book outage
+        (main.py marks every ticker rejected_by_risk and trades nothing that
+        day) rather than the tiny rounding noise it actually is."""
+        core = {"SPY": 0.5919326993040515,
+                "GLD": 0.27470957199199836,
+                "IEF": 0.2209959829788603}
+        book = sleeves.compose_book(core, {"QQQ": True})
+        gross = sum(abs(w) for w in book.values())
+        assert gross == pytest.approx(1.0000010000000001)
+        validation = RiskManager(persist_state=False).validate_book(book)
+        assert validation.approved, validation.reason
+
     def test_economic_cap_leaves_headroom_over_the_configured_maximum(self):
         max_economic = (sleeves.core_scale() * config.RISK["gross_cap"]
                         + sum(float(s["weight"])

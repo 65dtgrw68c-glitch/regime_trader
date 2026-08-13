@@ -38,6 +38,16 @@ from settings import config
 logger = logging.getLogger(__name__)
 
 
+# `compose_book()` (core/sleeves.py) rounds every weight to 6 decimals AFTER
+# scaling to the gross cap, so a book that lands exactly on a cap can present
+# here as e.g. 1.0000010000000001 instead of 1.0 — a rounding artifact, not a
+# real breach. The float-comparison tolerance below has to be at least as
+# coarse as that rounding (worst case ~0.5e-6 per position, several positions
+# summed for the gross/class checks), or the book-level caps reject books the
+# composer itself judged to be exactly at the cap. Order-level dollar/leverage
+# checks below use their own, unrelated 1e-6 tolerance and are not affected.
+_WEIGHT_CAP_EPS = 1e-5
+
 # ===========================================================================
 # Circuit-breaker severity ladder
 # ===========================================================================
@@ -343,12 +353,12 @@ class RiskManager:
 
         gross = sum(abs(float(weight)) for weight in target_weights.values())
         gross_cap = self._cfg.get("gross_cap", self._cfg.get("max_leverage", 1.0))
-        if gross > gross_cap + 1e-9:
+        if gross > gross_cap + _WEIGHT_CAP_EPS:
             return OrderValidation(False, f"gross {gross:.2f} exceeds cap {gross_cap:.2f}")
 
         per_name_cap = self._effective_per_name_cap()
         for ticker, weight in target_weights.items():
-            if abs(weight) > per_name_cap + 1e-9:
+            if abs(weight) > per_name_cap + _WEIGHT_CAP_EPS:
                 return OrderValidation(
                     False,
                     f"per-name {ticker} weight {weight:.2f} exceeds cap {per_name_cap:.2f}",
@@ -366,7 +376,7 @@ class RiskManager:
                 abs(float(weight)) * float(assets.get(ticker, {}).get("leverage", 1.0))
                 for ticker, weight in target_weights.items()
             )
-            if economic > float(economic_cap) + 1e-9:
+            if economic > float(economic_cap) + _WEIGHT_CAP_EPS:
                 return OrderValidation(
                     False,
                     f"economic exposure {economic:.2f} exceeds cap "
@@ -382,7 +392,7 @@ class RiskManager:
 
         for asset_class, weight in by_class.items():
             cap = class_caps.get(asset_class)
-            if cap is not None and weight > cap + 1e-9:
+            if cap is not None and weight > cap + _WEIGHT_CAP_EPS:
                 return OrderValidation(
                     False,
                     f"class {asset_class} weight {weight:.2f} exceeds cap {cap:.2f}",

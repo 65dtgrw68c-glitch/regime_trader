@@ -119,6 +119,18 @@ class AlpacaClient(BaseBroker):
         }
 
     @with_retry(max_retries=3, delay=1.0)
+    def get_account_activities(self, activity_type: str) -> list[dict]:
+        """Return raw account activity entries (e.g. "INT" for cash interest).
+
+        alpaca-py's TradingClient has no typed wrapper for this endpoint, so
+        this goes through its generic `.get()` escape hatch (same auth/base
+        URL handling as every other call here) and returns whatever JSON the
+        API gives back.
+        """
+        result = self.trading.get(f"/account/activities/{activity_type}")
+        return result if isinstance(result, list) else []
+
+    @with_retry(max_retries=3, delay=1.0)
     def get_clock(self) -> dict:
         """Return the market clock as a plain dict (mit Retry-Schutz)."""
         clock = self.trading.get_clock()

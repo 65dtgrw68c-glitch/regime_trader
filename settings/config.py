@@ -227,6 +227,19 @@ STRATEGY = {
 # confirmation damps SMA-hover whipsaw — the a-priori rationale it was
 # added to the grid with.  vol_target stays: under the 0.50 cap it rarely
 # binds, but it restores tail protection automatically if the cap rises.
+#
+# NOT READ BY THE DEPLOYED LIVE/BACKTEST PATH. `trend_confirm_bars` and
+# `vol_target` above are consumed only by RegimeOrchestrator
+# (core/regime_strategies.py), which the default portfolio path
+# (BROKER["portfolio_batch_loop"]=True, i.e. main.py's run_portfolio_once /
+# core/portfolio_backtester.py) never instantiates. The deployed sleeve/core
+# signal is the plain `is_trend_confirmed()` check (close > SMA200, no bar
+# confirmation, no portfolio vol target) in core/regime_strategies.py and
+# core/sleeves.py — every walk-forward number and pre-registration result
+# documented above and below applies to RegimeOrchestrator, not to what runs
+# at 09:35 NY. Found 2026-08-13 (analysis_report_2026-08-13_rendite.md,
+# "Section 0" / P1+P2) after the mandate that produced that report assumed
+# both were active live.
 ORCHESTRATOR: dict = {
     "trend_core": True,
     "trend_confirm_bars": 3,

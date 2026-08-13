@@ -194,6 +194,22 @@ class OrderExecutor:
         self._call_with_retry(self._client.trading.cancel_orders)
         logger.info("Cancelled all open orders.")
 
+    def _record_fill(self, oid: str, order: object) -> None:
+        """Log a fill to the trade log, if there's a logger and the order is
+        actually filled. Reads (not pops) `_expected_prices` — callers share
+        one bulk cleanup pass at the end of `await_fills`."""
+        if not self._trade_logger:
+            return
+        if str(getattr(order, "status", "")).lower() != "filled":
+            return
+        self._trade_logger.log_fill({
+            "ticker": str(getattr(order, "symbol", "")),
+            "qty": float(getattr(order, "filled_qty", 0) or 0),
+            "fill_price": float(getattr(order, "filled_avg_price", 0) or 0),
+            "expected_price": self._expected_prices.get(oid),
+            "order_id": oid,
+        })
+
     def await_fills(self, order_ids: list[str], timeout: int = 30) -> dict:
         """
         Poll until every order reaches a terminal status or `timeout`
@@ -217,15 +233,7 @@ class OrderExecutor:
 
                 if status in _TERMINAL_STATUSES:
                     pending.discard(oid)
-                    expected_price = self._expected_prices.pop(oid, None)
-                    if status == "filled" and self._trade_logger:
-                        self._trade_logger.log_fill({
-                            "ticker": str(getattr(order, "symbol", "")),
-                            "qty": filled_qty,
-                            "fill_price": float(getattr(order, "filled_avg_price", 0) or 0),
-                            "expected_price": expected_price,
-                            "order_id": oid,
-                        })
+                    self._record_fill(oid, order)
 
             if pending:
                 time.sleep(1)
@@ -251,6 +259,7 @@ class OrderExecutor:
                             oid,
                             status,
                         )
+                        self._record_fill(oid, order)
                         continue
 
                     still_pending.add(oid)
@@ -280,10 +289,21 @@ class OrderExecutor:
                             "Timed-out order %s was already filled when cancel was attempted.",
                             oid,
                         )
-                        results[oid] = {
-                            "status": "filled",
-                            "filled_qty": results.get(oid, {}).get("filled_qty", 0.0),
-                        }
+                        # The pre-cancel snapshot in `results` predates the
+                        # fill (that's exactly why cancel was rejected) — its
+                        # qty/price are stale, so re-fetch before logging.
+                        try:
+                            filled_order = self._call_with_retry(
+                                self._client.trading.get_order_by_id, oid
+                            )
+                        except Exception:
+                            filled_order = None
+                        if filled_order is not None:
+                            self._record_fill(oid, filled_order)
+                            filled_qty = float(getattr(filled_order, "filled_qty", 0) or 0)
+                        else:
+                            filled_qty = results.get(oid, {}).get("filled_qty", 0.0)
+                        results[oid] = {"status": "filled", "filled_qty": filled_qty}
                         still_pending.discard(oid)
                     else:
                         logger.error("Failed to cancel timed-out order %s: %s", oid, exc)
@@ -300,9 +320,10 @@ class OrderExecutor:
                     f"{len(unresolved)} order(s) not terminal after timeout/cancel: {unresolved}"
                 )
 
-        # Any order_id still holding an expected-price entry here reached a
-        # terminal state on the timeout-recheck path (no fill logged there);
-        # drop it so _expected_prices doesn't grow unbounded over uptime.
+        # _record_fill only reads _expected_prices; clear entries for every
+        # order_id passed in here so the dict doesn't grow unbounded over
+        # uptime (covers orders that never reached a logged fill too, e.g.
+        # canceled/rejected).
         for oid in order_ids:
             self._expected_prices.pop(oid, None)
 

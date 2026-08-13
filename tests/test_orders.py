@@ -387,3 +387,99 @@ def test_await_fills_treats_already_filled_cancel_error_as_filled():
 
     assert result["oid-1"]["status"] == "filled"
     assert client.trading.cancel_calls == 1
+
+
+def test_await_fills_logs_fill_found_during_timeout_recheck():
+    """Regression: an order reported 'filled' on the recheck GET itself
+    (before any cancel attempt) used to just `continue` without ever
+    calling log_fill — a real fill silently missing from the trade log."""
+    class FakeOrder:
+        def __init__(self, status, filled_qty=0, filled_avg_price=0.0):
+            self.status = status
+            self.filled_qty = filled_qty
+            self.symbol = "QQQ"
+            self.filled_avg_price = filled_avg_price
+
+    class FakeTrading:
+        def get_order_by_id(self, oid):
+            return FakeOrder(status="filled", filled_qty=3, filled_avg_price=55.0)
+
+        def cancel_order_by_id(self, oid):
+            raise AssertionError("should not cancel an already-terminal order")
+
+    class FakeClient:
+        def __init__(self):
+            self.trading = FakeTrading()
+
+    class FakePositions:
+        def diff(self, target):
+            return {}
+
+    client = FakeClient()
+    trade_logger = MagicMock()
+    executor = OrderExecutor(client=client, position_tracker=FakePositions(), trade_logger=trade_logger)
+    executor._expected_prices["oid-2"] = 54.5
+
+    result = executor.await_fills(["oid-2"], timeout=0)
+
+    assert result["oid-2"]["status"] == "filled"
+    trade_logger.log_fill.assert_called_once()
+    logged = trade_logger.log_fill.call_args.args[0]
+    assert logged["ticker"] == "QQQ"
+    assert logged["qty"] == 3
+    assert logged["fill_price"] == 55.0
+    assert logged["expected_price"] == 54.5
+
+
+def test_await_fills_logs_fill_found_after_already_filled_cancel_error():
+    """Regression: an order whose fill only surfaces via the 'already
+    filled' cancel-rejection used to be dropped from the trade log
+    entirely — this is exactly what happened to two real orders on
+    2026-08-12 (SPY sell + QLD buy), leaving trades.csv with zero rows
+    despite both trades actually filling."""
+    class FakeOrder:
+        def __init__(self, status, filled_qty=0, filled_avg_price=0.0):
+            self.status = status
+            self.filled_qty = filled_qty
+            self.symbol = "SPY"
+            self.filled_avg_price = filled_avg_price
+
+    class FakeTrading:
+        def __init__(self):
+            self.calls = 0
+
+        def get_order_by_id(self, oid):
+            self.calls += 1
+            # Recheck-before-cancel still sees it pending; by the time the
+            # follow-up re-fetch (inside the fix) runs, it has filled.
+            if self.calls == 1:
+                return FakeOrder(status="new", filled_qty=0)
+            return FakeOrder(status="filled", filled_qty=5, filled_avg_price=101.5)
+
+        def cancel_order_by_id(self, oid):
+            raise RuntimeError(
+                '{"code":42210000,"message":"order is already in \\"filled\\" state"}'
+            )
+
+    class FakeClient:
+        def __init__(self):
+            self.trading = FakeTrading()
+
+    class FakePositions:
+        def diff(self, target):
+            return {}
+
+    client = FakeClient()
+    trade_logger = MagicMock()
+    executor = OrderExecutor(client=client, position_tracker=FakePositions(), trade_logger=trade_logger)
+    executor._expected_prices["oid-1"] = 100.0
+
+    result = executor.await_fills(["oid-1"], timeout=0)
+
+    assert result["oid-1"]["status"] == "filled"
+    assert result["oid-1"]["filled_qty"] == 5
+    trade_logger.log_fill.assert_called_once()
+    logged = trade_logger.log_fill.call_args.args[0]
+    assert logged["qty"] == 5
+    assert logged["fill_price"] == 101.5
+    assert logged["expected_price"] == 100.0

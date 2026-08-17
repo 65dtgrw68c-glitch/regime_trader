@@ -16,6 +16,32 @@ from broker.base import BaseBroker
 logger = logging.getLogger(__name__)
 
 
+def _resolve_paper_flag(raw: str) -> bool:
+    """Fail-closed parse of the PAPER env var.
+
+    python-dotenv and systemd's EnvironmentFile= disagree on inline
+    comments: dotenv strips them, systemd takes the line literally
+    (`PAPER=true   # comment` becomes the value `"true   # comment"`,
+    which is neither of dotenv's `"true"` nor `"false"` and flipped a
+    naive `== "true"` check to Live). Taking only the first whitespace
+    token keeps both loaders' explicit "true"/"false" intent intact,
+    and treats anything unrecognized as paper (safe default) rather than
+    live (fail-open into real money).
+    """
+    token = raw.strip().split()[0].lower() if raw.strip() else ""
+    return token not in ("false", "0", "no", "off", "live")
+
+
+def _infer_paper_from_key(key: str) -> Optional[bool]:
+    """Best-effort read of Alpaca's own paper/live key-prefix convention."""
+    prefix = key[:2].upper()
+    if prefix == "PK":
+        return True
+    if prefix == "AK":
+        return False
+    return None
+
+
 def with_retry(max_retries: int = 3, delay: float = 1.0):
     """Decorator für automatisches Retry bei temporären Netzwerkausfällen oder API-Rate-Limits."""
     def decorator(func):
@@ -45,7 +71,6 @@ class AlpacaClient(BaseBroker):
         self,
         api_key: Optional[str] = None,
         secret_key: Optional[str] = None,
-        base_url: Optional[str] = None,
         paper: Optional[bool] = None,
     ) -> None:
         try:
@@ -56,8 +81,7 @@ class AlpacaClient(BaseBroker):
 
         self.api_key    = api_key    or os.getenv("ALPACA_API_KEY", "")
         self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY", "")
-        self.base_url   = base_url   or os.getenv("ALPACA_BASE_URL", "")
-        env_paper = os.getenv("PAPER", "true").lower() == "true"
+        env_paper = _resolve_paper_flag(os.getenv("PAPER", "true"))
         self.paper = env_paper if paper is None else paper
 
         self._trading: Any = None
@@ -72,6 +96,36 @@ class AlpacaClient(BaseBroker):
                 "Alpaca credentials missing. Set ALPACA_API_KEY and "
                 "ALPACA_SECRET_KEY in your .env file."
             )
+
+        # K1 hardening: `self.paper` is the ONLY switch between simulated and
+        # real money, so refuse to connect on ANY ambiguity instead of
+        # silently picking a side. Two independent cross-checks:
+        expected_mode = "paper" if self.paper else "live"
+
+        # 1) settings/config.py's declared mode must agree with the env flag
+        #    — catches a stale/forgotten config edit or a corrupted env var.
+        configured_mode = str(config.BROKER.get("mode", "paper")).lower()
+        if configured_mode != expected_mode:
+            raise RuntimeError(
+                f"Refusing to connect: PAPER env resolves to '{expected_mode}' "
+                f"but config.BROKER['mode'] is '{configured_mode}'. Fix "
+                f"whichever one is wrong before trading — this mismatch is "
+                f"exactly the kind of ambiguity that must never decide "
+                f"between paper and live money."
+            )
+
+        # 2) Alpaca's own key-prefix convention (PK.. = paper, AK.. = live)
+        #    must agree with the resolved mode — catches paper keys pasted
+        #    into a live env or vice versa.
+        inferred = _infer_paper_from_key(self.api_key)
+        if inferred is not None and inferred != self.paper:
+            raise RuntimeError(
+                f"Refusing to connect: ALPACA_API_KEY looks like a "
+                f"{'PAPER' if inferred else 'LIVE'} key but PAPER env "
+                f"resolves to {expected_mode.upper()} trading. Check "
+                f"which credentials and PAPER value belong together in .env."
+            )
+
         from alpaca.trading.client import TradingClient
         from alpaca.data.historical import StockHistoricalDataClient
 

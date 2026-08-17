@@ -472,7 +472,10 @@ garantiert nichts mit echtem Geld):
 2. In `settings/config.py` den Wert `BROKER["mode"]` auf `"live"` ändern.
 3. `sudo bash deploy/update.sh` ausführen.
 
-Bis alle drei erledigt sind, bleibt es Spielgeld.
+Bis alle drei erledigt sind, bleibt es Spielgeld. `.env`s `PAPER` und
+`config.py`s `BROKER["mode"]` werden beim Verbindungsaufbau jetzt gegeneinander
+geprüft: Widersprechen sie sich, oder passt das Schlüssel-Präfix (`PK…`/`AK…`)
+zu keinem von beiden, startet der Bot gar nicht erst.
 
 ---
 

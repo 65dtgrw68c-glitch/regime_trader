@@ -65,11 +65,20 @@ class OrderExecutor:
         self,
         target_positions: dict[str, float],
         prices: Optional[dict[str, float]] = None,
+        run_tag: Optional[str] = None,
     ) -> list[str]:
         """Berechnet Deltas und führt Orders aus. Löscht vorher alte Protective Stops.
 
         `prices` (decision-time price per ticker) is optional and, when given,
         recorded as each order's expected fill price for slippage tracking.
+
+        `run_tag` (typically the bar date, e.g. "2026-08-17", or "flatten-…")
+        seeds a stable client_order_id per ticker+side, the same idempotency
+        mechanism `_submit()` already uses on the single-asset path. Two
+        overlapping runs (a manual start racing the timer, a catch-up fire
+        after reboot) diff against the same stale snapshot and would compute
+        the same delta — without this, both submit; with it, the broker
+        rejects the second as a duplicate instead of doubling the position.
         """
         deltas = self._positions.diff(target_positions)
         order_ids: list[str] = []
@@ -83,9 +92,10 @@ class OrderExecutor:
 
             side = "buy" if delta > 0 else "sell"
             expected_price = prices.get(ticker) if prices else None
+            coid = f"rt-{ticker}-{run_tag}-{side}" if run_tag is not None else None
             oid = self.submit_order(
                 ticker, abs(delta), side, order_type="market",
-                expected_price=expected_price,
+                client_order_id=coid, expected_price=expected_price,
             )
             if oid:
                 order_ids.append(oid)

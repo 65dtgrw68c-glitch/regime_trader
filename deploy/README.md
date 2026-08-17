@@ -157,6 +157,9 @@ terminates it permanently (measured: CAGR 13.7% → 1.0%). See
 4. `sudo bash deploy/update.sh`.
 
 Until all three are done it stays paper — no accidental path to real orders.
+`.env`'s `PAPER` and `config.py`'s `BROKER["mode"]` are now cross-checked at
+connect time: if they disagree, or the key prefix (`PK…`/`AK…`) doesn't match
+either, the bot refuses to start rather than guessing.
 
 ---
 

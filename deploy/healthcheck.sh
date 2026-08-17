@@ -30,6 +30,31 @@ else
     say "risk_halt" "clear"
 fi
 
+# 1b) Flatten confirmation — a halt/flatten breaker writes this after trying
+# to close every position. "false" here means the close was submitted but
+# never confirmed filled (broker outage mid-flatten, etc.) — a leveraged
+# position may still be open with nothing else watching it.
+FLATTEN_STATUS="$APP_DIR/logs/FLATTEN_STATUS.json"
+if [[ -f "$FLATTEN_STATUS" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+        confirmed="$(python3 -c "
+import json, sys
+try:
+    print(json.load(open('$FLATTEN_STATUS')).get('confirmed_flat'))
+except Exception:
+    print('unknown')
+" 2>/dev/null)"
+    else
+        confirmed="unknown"
+    fi
+    if [[ "$confirmed" == "True" ]]; then
+        say "flatten" "confirmed"
+    else
+        say "flatten" "NOT CONFIRMED — positions may still be open, check $FLATTEN_STATUS!"
+        rc=1
+    fi
+fi
+
 # 2) Timer armed?
 tstate="$(systemctl is-active "$UNIT.timer" 2>/dev/null || true)"
 say "timer" "$tstate"

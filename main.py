@@ -20,11 +20,16 @@ Usage
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import json
 import logging
+import os
 import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Optional
 
 import pandas as pd
@@ -455,7 +460,13 @@ class TradingSystem:
         )
 
         # 6. Submit one portfolio rebalance.
-        order_ids = self._safe_call(self._executor.rebalance, target_positions, prices) or []
+        # bar_day is normally the traded day; fall back to today's UTC date
+        # if it couldn't be resolved above so the idempotency tag still
+        # varies per day instead of colliding on a literal "None".
+        run_tag = str(bar_day) if bar_day is not None else datetime.now(timezone.utc).date().isoformat()
+        order_ids = self._safe_call(
+            self._executor.rebalance, target_positions, prices, run_tag,
+        ) or []
         try:
             submitted = len(order_ids)
         except TypeError:
@@ -1098,12 +1109,88 @@ class TradingSystem:
         return target_positions
 
     def _flatten_all(self) -> None:
-        if self._executor is not None:
-            self._safe_call(self._executor.cancel_all_open_orders)
-            positions = self._open_positions_dict()
-            target = {t: 0 for t in positions}
-            if target:
-                self._safe_call(self._executor.rebalance, target)
+        """
+        Close every open position after a HALT/FLATTEN breaker — and verify
+        it actually happened.
+
+        Submitting the flatten orders is not the same as being flat: the
+        prior version trusted `rebalance()` silently and returned, so a
+        broker API failure mid-flatten (plausible on exactly the kind of
+        crash day that triggers a halt) left a leveraged position open with
+        nobody ever retrying, because the HALT lock blocks every future run
+        before it makes any broker contact. This now polls fills, re-checks
+        live positions, and persists the outcome to FLATTEN_STATUS.json so
+        healthcheck.sh (and a human) can see an unconfirmed flatten instead
+        of assuming silence means success.
+        """
+        if self._executor is None:
+            return
+
+        self._safe_call(self._executor.cancel_all_open_orders)
+        if self._positions is not None:
+            self._safe_call(self._positions.refresh)
+
+        positions = self._open_positions_dict()
+        target = {t: 0 for t in positions}
+        if not target:
+            self._write_flatten_status(confirmed=True, tickers=[])
+            return
+
+        run_tag = f"flatten-{datetime.now(timezone.utc).date().isoformat()}"
+        order_ids = self._safe_call(
+            self._executor.rebalance, target, None, run_tag,
+        ) or []
+
+        still_open: dict = {}
+        confirmed = False
+        try:
+            if order_ids:
+                self._executor.await_fills(order_ids, timeout=60)
+            if self._positions is not None:
+                self._positions.refresh()
+                still_open = {
+                    t: p.qty for t, p in self._positions.get_positions().items()
+                    if t in target and abs(p.qty) > 1e-5
+                }
+            confirmed = not still_open
+        except Exception as exc:
+            logger.error("Flatten verification failed: %s", exc)
+
+        self._write_flatten_status(
+            confirmed=confirmed, tickers=list(target.keys()), still_open=still_open,
+        )
+
+        if not confirmed:
+            self._alert(
+                f"FLATTEN NOT CONFIRMED after halt/flatten trigger — "
+                f"positions may still be open: "
+                f"{still_open or 'verification itself failed, check logs'}. "
+                f"Manual intervention required immediately.",
+                SEVERITY_CRITICAL,
+                key="flatten_unconfirmed",
+            )
+
+    def _write_flatten_status(
+        self, confirmed: bool, tickers: list[str], still_open: Optional[dict] = None,
+    ) -> None:
+        """Persist the outcome of the last _flatten_all() so healthcheck.sh
+        (and a human reviewing a halt) can see whether the book actually
+        emptied, without having to check the broker directly. Best-effort —
+        a write failure must never mask the CRITICAL alert already fired."""
+        path = Path(config.RISK["lock_file_path"]).with_name("FLATTEN_STATUS.json")
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "confirmed_flat": confirmed,
+            "tickers_targeted": tickers,
+            "still_open": still_open or {},
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, default=str))
+            tmp.replace(path)   # atomic: never leave a torn file
+        except Exception as exc:
+            logger.warning("Could not persist flatten status to %s: %s", path, exc)
 
     def _poll_bars(self) -> Optional[dict]:
         """Poll the data feed for the latest bar of each ticker (live mode)."""
@@ -1262,14 +1349,62 @@ EXIT_HALTED      = 3   # risk HALT lock present → needs manual review, NO rest
 def _halt_lock_present() -> bool:
     """True when the risk-manager HALT lock file exists on disk."""
     try:
-        from pathlib import Path
         return Path(config.RISK["lock_file_path"]).exists()
     except Exception:
         return False
 
 
+def _instance_lock_path() -> Path:
+    return Path(config.RISK["lock_file_path"]).with_name("RUN_INSTANCE.lock")
+
+
+@contextlib.contextmanager
+def _instance_lock():
+    """
+    Filesystem lock so two overlapping invocations of this process — a
+    manual `systemctl start` racing the timer, a `Persistent=true` catch-up
+    fire after reboot, a manual `python main.py --once` run on the server —
+    never execute concurrently. Without this, two processes each diff their
+    target book against the same stale position snapshot and both submit;
+    client_order_id (see OrderExecutor.rebalance) only catches that after
+    the fact, by rejecting the second identical order. This stops the
+    second run before it does any broker work at all.
+
+    Uses flock, not a PID file: the OS releases the lock automatically if
+    the holding process dies, so there is no stale-lock cleanup to get
+    wrong (unlike the RISK_HALT lock, which is deliberately sticky).
+    """
+    lock_path = _instance_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise RuntimeError(
+            f"Another regime_trader instance already holds {lock_path} — "
+            f"refusing to run concurrently."
+        )
+    try:
+        fh.write(str(os.getpid()))
+        fh.flush()
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
 def run_live() -> int:
     configure_logging()
+    try:
+        with _instance_lock():
+            return _run_live_locked()
+    except RuntimeError as exc:
+        logger.critical(str(exc))
+        return EXIT_STARTUP_ERR
+
+
+def _run_live_locked() -> int:
     # A present HALT lock means the -drawdown breaker fired and a human must
     # review before resuming. Return a DISTINCT code so a Restart=always
     # supervisor stops instead of restart-looping into the same wall.
@@ -1305,8 +1440,20 @@ def run_once_daily() -> int:
     Returns the same supervisor-friendly codes as run_live(): EXIT_HALTED
     (3) when the risk lock is present so the timer's next fire is a harmless
     no-op instead of trading into a halt that needs a human.
+
+    Wrapped in the same instance flock as run_live(): a manual debug run or
+    a systemd catch-up fire overlapping the timer must not race this one.
     """
     configure_logging()
+    try:
+        with _instance_lock():
+            return _run_once_daily_locked()
+    except RuntimeError as exc:
+        logger.critical(str(exc))
+        return EXIT_STARTUP_ERR
+
+
+def _run_once_daily_locked() -> int:
     if _halt_lock_present():
         logger.critical("Risk HALT lock present (%s) — skipping daily run. "
                         "Review the incident and delete the file to resume.",

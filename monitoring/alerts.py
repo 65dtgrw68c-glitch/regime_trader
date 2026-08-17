@@ -94,9 +94,13 @@ class AlertManager:
         body = self._format_body(message, severity, context)
 
         # Route by severity: CRITICAL/WARNING → email; everything → webhook.
-        if severity in (SEVERITY_CRITICAL, SEVERITY_WARNING) and self._recipients:
+        # Both channels also respect their own kill switch (previously read
+        # at init and never actually checked here — a "disabled" channel
+        # sent anyway as long as a destination was configured).
+        if (self._email_enabled and self._recipients
+                and severity in (SEVERITY_CRITICAL, SEVERITY_WARNING)):
             self._send_email(subject, body)
-        if self._webhook_url:
+        if self._webhook_enabled and self._webhook_url:
             self._send_webhook({"text": subject, "severity": severity, **context})
 
         self._last_sent[throttle_key] = time.monotonic()

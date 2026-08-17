@@ -5,6 +5,17 @@ All tuneable parameters live here so every module imports from a single
 source of truth instead of scattering magic numbers across the codebase.
 """
 
+import os
+
+try:
+    # Best-effort: picks up .env in local/dev (Codespace, tests). On the
+    # server, systemd's EnvironmentFile= already sets these directly, so
+    # this is a no-op there (load_dotenv doesn't override existing env vars).
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # Tickers / universe
 # ---------------------------------------------------------------------------
@@ -451,10 +462,17 @@ MONITORING = {
     "poll_interval_seconds": 60,
     # How often the dashboard refreshes (seconds)
     "dashboard_refresh_seconds": 30,
-    # Email alert recipients
-    "alert_email_recipients": [],
-    # Webhook URL for Slack / Teams alerts (set via env or here)
-    "alert_webhook_url": "",
+    # Email alert recipients — comma-separated ALERT_EMAIL_RECIPIENTS in .env.
+    "alert_email_recipients": [
+        r.strip() for r in os.getenv("ALERT_EMAIL_RECIPIENTS", "").split(",") if r.strip()
+    ],
+    # Webhook URL for Slack / Discord alerts — ALERT_WEBHOOK_URL in .env.
+    # The server's .env already sets this for deploy/monitor.sh's 30-minute
+    # healthcheck; wiring it through here means AlertManager (fired in-process
+    # by main.py for order rejections, API outages, drift, halts, ...) uses
+    # the SAME url and pushes immediately instead of waiting for the next
+    # healthcheck cycle.
+    "alert_webhook_url": os.getenv("ALERT_WEBHOOK_URL", ""),
     # Log level: "DEBUG", "INFO", "WARNING", "ERROR"
     "log_level": "INFO",
     # Directory where log files are written
@@ -482,7 +500,14 @@ ALERTS = {
     "cooldown_seconds": 300,
 
     # ── Email channel (SMTP) ───────────────────────────────────────────────
-    "email_enabled": False,
+    # Per-channel kill switch — actually enforced in AlertManager.alert() now
+    # (it used to be read at init and never checked, so this flag was purely
+    # decorative). True by default: the real gate is having a destination
+    # configured at all (alert_email_recipients is empty unless
+    # ALERT_EMAIL_RECIPIENTS is set), so leaving this on costs nothing until
+    # you actually add a recipient. Flip to False to silence this channel
+    # even with recipients configured.
+    "email_enabled": True,
     "smtp_host": "localhost",
     "smtp_port": 25,
     "smtp_use_tls": False,
@@ -491,6 +516,8 @@ ALERTS = {
     # Recipients also read from MONITORING["alert_email_recipients"].
 
     # ── Webhook channel (Slack / Discord) ──────────────────────────────────
-    "webhook_enabled": False,
+    # Same kill-switch semantics as email_enabled above. True by default:
+    # gated in practice by alert_webhook_url being set at all.
+    "webhook_enabled": True,
     # Webhook URL also read from MONITORING["alert_webhook_url"].
 }

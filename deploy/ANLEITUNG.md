@@ -406,6 +406,12 @@ Einrichten (Beispiel Discord — Slack geht genauso):
 Ohne `ALERT_WEBHOOK_URL` passiert nichts (der Monitor läuft, schickt aber
 nichts) — die Benachrichtigung ist also rein optional.
 
+Dieselbe URL treibt jetzt **zwei** Kanäle: den 30-Minuten-Healthcheck oben,
+UND sofortige Meldungen direkt aus dem Bot-Prozess (abgelehnte Order, Alpaca
+nicht erreichbar, Portfolio-Drift, Not-Aus, nicht bestätigtes Flatten) —
+vorher landeten diese Ereignisse nur im Log und man erfuhr erst beim
+nächsten Healthcheck (bis zu 30 Minuten später) davon.
+
 **Code aktualisieren** (wenn wir am Bot etwas verbessern): auf dem Server im
 `regime_trader`-Ordner `sudo bash deploy/update.sh` ausführen — das holt die
 neueste Version und übernimmt sie zum nächsten Lauf.

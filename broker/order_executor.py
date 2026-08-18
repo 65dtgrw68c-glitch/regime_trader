@@ -4,6 +4,8 @@ import logging
 import time
 from typing import Optional
 
+from broker.base import is_non_transient_error
+
 logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "closed"}
@@ -30,13 +32,21 @@ class OrderExecutor:
         """Retry transient broker API calls with exponential backoff.
 
         Used for status/cancel calls and only for idempotent order submissions
-        where a stable client_order_id is provided.
+        where a stable client_order_id is provided. A 401/403 is a
+        credentials/permissions problem, not transient, so it raises
+        immediately instead of burning the full backoff first.
         """
         last_exc = None
         for attempt in range(1, max_retries + 1):
             try:
                 return fn(*args, **kwargs)
             except Exception as exc:
+                if is_non_transient_error(exc):
+                    logger.error(
+                        "Broker call %s failed with a non-retryable auth/permission "
+                        "error: %s", getattr(fn, "__name__", str(fn)), exc,
+                    )
+                    raise
                 last_exc = exc
                 logger.warning(
                     "Broker call %s failed attempt %d/%d: %s",

@@ -43,6 +43,7 @@ from core.regime_strategies import (
     shares_for_target_weight,
 )
 from core.risk_manager import CBLevel, RiskManager
+from broker.base import is_non_transient_error
 from monitoring.alerts import AlertManager, SEVERITY_CRITICAL, SEVERITY_WARNING
 from monitoring.logger import configure_logging, get_logger, TradeLogger
 from settings import config
@@ -145,6 +146,10 @@ class TradingSystem:
         self._bars_processed = 0
         self._orders_submitted = 0
         self._equity = 0.0
+        # True whenever _current_equity() had to fall back to the last known
+        # value instead of a fresh broker read — callers must not size/submit
+        # orders against it (see _current_equity).
+        self._equity_stale = False
         self._market_status = "unknown"
         # Trading date the daily circuit breakers are currently anchored to;
         # run_once rolls it forward when a bar from a new day arrives.
@@ -448,6 +453,24 @@ class TradingSystem:
             logger.info("Market closed — portfolio rebalance observed but not submitted.")
             return decisions
 
+        # 4b. Do not size/submit orders against a stale equity snapshot — a
+        # broker outage must not silently keep trading on yesterday's number
+        # while the drawdown breaker above (which tolerates staleness fine;
+        # worst case an overcautious halt) already saw the same value.
+        if self._equity_stale:
+            for ticker in updated_tickers:
+                decisions[ticker]["action"] = "skipped_stale_equity"
+            logger.warning(
+                "Equity unavailable — portfolio rebalance observed but not "
+                "submitted (sizing against a stale snapshot would mis-size "
+                "every order)."
+            )
+            self._alert(
+                "Equity unavailable — portfolio rebalance skipped this cycle "
+                "(stale equity snapshot).", SEVERITY_WARNING, key="stale_equity_skip",
+            )
+            return decisions
+
         # 5. Convert target weights to absolute target share counts.
         for ticker, state in self._states.items():
             if ticker not in prices and state.history is not None and not state.history.empty:
@@ -740,6 +763,17 @@ class TradingSystem:
                 "Market closed — %s decision observed but not submitted "
                 "(would-be delta=%+.4f @ %.2f).", ticker, delta, price,
             )
+        elif self._equity_stale:
+            decision["action"] = "skipped_stale_equity"
+            logger.warning(
+                "Equity unavailable — %s decision observed but not submitted "
+                "(would-be delta=%+.4f @ %.2f); sizing against a stale "
+                "equity snapshot would mis-size the order.", ticker, delta, price,
+            )
+            self._alert(
+                f"Equity unavailable — {ticker} order skipped this cycle "
+                f"(stale equity snapshot).", SEVERITY_WARNING, key="stale_equity_skip",
+            )
         elif delta > 0:
             account = self._safe_call(self._client.get_account) or {}
             buying_power = float(account.get("buying_power", equity))
@@ -783,6 +817,10 @@ class TradingSystem:
         """
         Failure mode 1: Alpaca API down/unreachable.
         Retry with exponential backoff; after repeated failures, pause + alert.
+
+        A 401/403 is a credentials/permissions problem, not a network blip —
+        it will not resolve itself on retry #2 or #3, so it skips straight
+        to the pause+alert below instead of burning the full backoff first.
         """
         last_exc = None
         for attempt in range(self._max_api_retries):
@@ -790,6 +828,12 @@ class TradingSystem:
                 return fn(*args, **kwargs)
             except Exception as exc:
                 last_exc = exc
+                if is_non_transient_error(exc):
+                    logger.error(
+                        "API call %s failed with a non-retryable auth/permission "
+                        "error: %s", getattr(fn, "__name__", fn), exc,
+                    )
+                    break
                 wait = self._retry_delay * (2 ** attempt)
                 logger.warning(
                     "API call %s failed (attempt %d/%d): %s — backoff %.2fs",
@@ -797,7 +841,7 @@ class TradingSystem:
                 )
                 if wait > 0:
                     time.sleep(wait)
-        # Repeated failures → pause trading + alert
+        # Repeated (or non-transient) failures → pause trading + alert
         self._paused = True
         self._alert(
             f"Alpaca API unreachable after {self._max_api_retries} retries: {last_exc}",
@@ -1212,23 +1256,38 @@ class TradingSystem:
         Return True if the exchange is currently open.
 
         The result is cached for `ttl` seconds so a single loop iteration over
-        many tickers does not hammer the clock endpoint.  If the clock call
-        cannot be resolved we fall back to the last known value (or True on the
-        very first call) so a transient failure never silently freezes trading.
+        many tickers does not hammer the clock endpoint. If the clock call
+        cannot be resolved we fall back to the last known value — but if we
+        have never once confirmed it, we do NOT assume open: a DAY market
+        order submitted while genuinely closed queues until the next open
+        and fills at an unplanned gap instead of the price the decision was
+        made on. Skipping this cycle's submission (the caller checks this
+        before submitting, not before deciding) just delays a trade to the
+        next successful poll; submitting blind does not.
         """
         now = time.time()
         if self._market_open_cache is not None and now - self._market_check_ts < ttl:
             return self._market_open_cache
         clock = self._safe_call(self._client.get_clock) if self._client else None
         if clock is None:
-            return True if self._market_open_cache is None else self._market_open_cache
+            return False if self._market_open_cache is None else self._market_open_cache
         self._market_open_cache = bool(clock.get("is_open", False))
         self._market_check_ts = now
         self._market_status = "open" if self._market_open_cache else "closed"
         return self._market_open_cache
 
     def _current_equity(self) -> float:
+        """
+        Current account equity, with the last known value as a fallback on a
+        failed fetch — but `self._equity_stale` is set whenever that fallback
+        is used, so callers about to SIZE or SUBMIT an order can refuse to do
+        so against a number that predates whatever the broker outage might
+        have already done to the account. The risk layer's breakers are fine
+        reading a stale value (worst case an overcautious, not dangerous,
+        false-positive halt); order sizing is not.
+        """
         account = self._safe_call(self._client.get_account) if self._client else None
+        self._equity_stale = account is None
         if account:
             self._equity = float(account.get("equity", self._equity))
         return self._equity

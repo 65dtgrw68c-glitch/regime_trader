@@ -11,7 +11,7 @@ from functools import wraps
 from typing import Any, Optional
 
 from settings import config
-from broker.base import BaseBroker
+from broker.base import BaseBroker, is_non_transient_error
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,12 @@ def _infer_paper_from_key(key: str) -> Optional[bool]:
 
 
 def with_retry(max_retries: int = 3, delay: float = 1.0):
-    """Decorator für automatisches Retry bei temporären Netzwerkausfällen oder API-Rate-Limits."""
+    """Decorator für automatisches Retry bei temporären Netzwerkausfällen oder API-Rate-Limits.
+
+    A 401/403 is a credentials/permissions problem, not a network blip —
+    retrying it with backoff just delays reporting a config error that will
+    never resolve itself, so those fail immediately instead.
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -52,6 +57,12 @@ def with_retry(max_retries: int = 3, delay: float = 1.0):
                 try:
                     return func(*args, **kwargs)
                 except Exception as exc:
+                    if is_non_transient_error(exc):
+                        logger.error(
+                            "API Call %s failed with a non-retryable auth/permission "
+                            "error: %s", func.__name__, exc,
+                        )
+                        raise
                     last_exc = exc
                     logger.warning("API Call %s fehlgeschlagen (Versuch %d/%d): %s", func.__name__, attempt, max_retries, exc)
                     if attempt < max_retries:

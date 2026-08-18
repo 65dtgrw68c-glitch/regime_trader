@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from broker.base import is_non_transient_error
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,12 +36,22 @@ class PositionTracker:
         self._last_closed: list[str] = []
 
     def _call_with_retry(self, fn, *args, max_retries: int = 3, delay: float = 1.0, **kwargs):
-        """Retry transient broker API calls with exponential backoff."""
+        """Retry transient broker API calls with exponential backoff.
+
+        A 401/403 is a credentials/permissions problem, not transient, so it
+        raises immediately instead of burning the full backoff first.
+        """
         last_exc = None
         for attempt in range(1, max_retries + 1):
             try:
                 return fn(*args, **kwargs)
             except Exception as exc:
+                if is_non_transient_error(exc):
+                    logger.error(
+                        "Broker call %s failed with a non-retryable auth/permission "
+                        "error: %s", getattr(fn, "__name__", str(fn)), exc,
+                    )
+                    raise
                 last_exc = exc
                 logger.warning(
                     "Broker call %s failed attempt %d/%d: %s",

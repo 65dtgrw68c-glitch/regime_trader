@@ -45,12 +45,23 @@ jobs:
           pip install numpy pandas scikit-learn hmmlearn
 
       - name: Run experiment grid
+        # Inputs go through env:, never spliced into the script source: a
+        # ${{ inputs.ticker }} interpolated directly into `run:` becomes
+        # literal shell text before bash even sees it, so anything with a
+        # backtick or `$(...)` in it executes with this job's GITHUB_TOKEN.
+        # An env var's VALUE isn't re-parsed for shell syntax, and quoting
+        # "$TICKER"/"$BARS" below also blocks word-splitting/glob expansion
+        # from turning a crafted ticker into extra CLI flags.
+        env:
+          TICKER: ${{ inputs.ticker }}
+          BARS: ${{ inputs.bars }}
+          SYNTHETIC: ${{ inputs.synthetic }}
         run: |
-          ARGS="--ticker ${{ inputs.ticker }} --bars ${{ inputs.bars }} --out experiments_report.md"
-          if [ "${{ inputs.synthetic }}" = "true" ]; then
-            ARGS="$ARGS --synthetic"
+          if [ "$SYNTHETIC" = "true" ]; then
+            python scripts/run_experiments.py --ticker "$TICKER" --bars "$BARS" --out experiments_report.md --synthetic
+          else
+            python scripts/run_experiments.py --ticker "$TICKER" --bars "$BARS" --out experiments_report.md
           fi
-          python scripts/run_experiments.py $ARGS
 
       - name: Publish report to run summary
         if: always()

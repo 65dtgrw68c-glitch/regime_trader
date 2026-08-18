@@ -6,10 +6,18 @@ Wants=network-online.target
 
 [Service]
 # Runs the health check and notifies a webhook only when the status changes.
-# Triggered by regime-trader-monitor.timer; runs as root so it can read the
-# 600-perm .env (for the webhook URL) and query systemd. Not enabled on its
-# own.
+# Triggered by regime-trader-monitor.timer. Not enabled on its own.
+#
+# Runs as the unprivileged `regime` user, NOT root: it only reads files
+# `regime` already owns (.env, logs/) and queries systemd unit status
+# read-only (systemctl is-active/show never require root). Root execution
+# here used to be a real privilege-escalation path — setup.sh's
+# `chown -R regime:regime /opt/regime_trader` means `regime` owns this
+# script's own directory, so anyone who can write there as `regime` (e.g.
+# via a compromised dependency) would get root on the next timer tick.
 Type=oneshot
+User=regime
+Group=regime
 ExecStart=/bin/bash /opt/regime_trader/deploy/monitor.sh
 
 # The monitor must never itself become a failure that needs monitoring:

@@ -88,7 +88,9 @@ morning fire):
 
 ```bash
 # /etc/cron.d/regime-trader-health
-0 16 * * 1-5 root bash /opt/regime_trader/deploy/healthcheck.sh >/dev/null || \
+# Runs as `regime`, not root — the script only touches files `regime`
+# already owns and read-only systemctl queries, neither needs root.
+0 16 * * 1-5 regime bash /opt/regime_trader/deploy/healthcheck.sh >/dev/null || \
   curl -fsS -X POST "$YOUR_WEBHOOK_URL" -d 'regime-trader UNHEALTHY'
 ```
 

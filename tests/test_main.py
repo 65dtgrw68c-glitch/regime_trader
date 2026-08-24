@@ -196,6 +196,50 @@ class TestStartup:
         )
         assert sys_.startup() is False
 
+    def test_startup_aborts_when_one_ticker_has_insufficient_history(self, tmp_path):
+        # A single missing ticker must not "trade the rest": the deployed
+        # portfolio path would read it as target weight 0 and liquidate any
+        # existing position with no signal behind it (K2). Startup must
+        # abort instead of silently dropping the ticker.
+        good = _make_ohlcv()
+        short = good.iloc[-5:]
+
+        class PerTickerFeed:
+            def get_training_data(self, ticker, years=2.0):
+                return short if ticker == "BBB" else good
+
+        client = FakeClient()
+        risk = RiskManager(lock_file_path=str(tmp_path / "RISK_HALT.lock"))
+        sys_ = TradingSystem(
+            tickers=["AAA", "BBB"], client=client, data_feed=PerTickerFeed(),
+            order_executor=MagicMock(), risk_manager=risk,
+            alert_manager=MagicMock(),
+        )
+        # The whole run must abort — the caller never proceeds to trade a
+        # partially-initialised book (whichever tickers happened to be
+        # processed before the missing one is irrelevant once startup()
+        # returns False, since the process exits before any target book
+        # gets built).
+        assert sys_.startup() is False
+
+    def test_startup_keeps_ticker_when_hmm_training_fails(self, tmp_path, monkeypatch):
+        # A training exception must not disqualify the ticker from the book
+        # it actually trades on — the deployed path never reads state.engine
+        # (K2/M1).
+        import main as main_mod
+
+        def _broken_fit(self, feats):
+            raise RuntimeError("model is not converging")
+
+        monkeypatch.setattr(main_mod.HMMEngine, "fit", _broken_fit)
+
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"))
+        assert sys_.startup() is True
+        assert "AAA" in sys_._states
+        assert "BBB" in sys_._states
+        assert sys_._states["AAA"].engine is None
+        assert sys_._states["BBB"].engine is None
+
 
 # ---------------------------------------------------------------------------
 # 2. Main loop
@@ -451,8 +495,12 @@ class TestBarHygiene:
         wrong by the whole overnight gap.
         """
         bar = _bars_after(1, seed=11).iloc[-1]
-        started_system._data_feed.get_latest_price = lambda ticker: 1234.5
-        assert started_system._execution_price("AAA", float(bar["close"])) == 1234.5
+        decision_close = float(bar["close"])
+        # A plausible overnight gap (well within the K3a sanity band), not
+        # the decision close, so the assertion distinguishes the two.
+        live_price = decision_close * 1.05
+        started_system._data_feed.get_latest_price = lambda ticker: live_price
+        assert started_system._execution_price("AAA", decision_close) == live_price
 
     @pytest.mark.parametrize("answer", [None, 0.0, -5.0, "nope"])
     def test_unusable_live_price_falls_back_to_the_decision_close(
@@ -460,6 +508,15 @@ class TestBarHygiene:
     ):
         started_system._data_feed.get_latest_price = lambda ticker: answer
         assert started_system._execution_price("AAA", 42.0) == 42.0
+
+    def test_implausible_live_price_falls_back_and_alerts(self, started_system):
+        # A single bad IEX print must not size the order directly (K3a):
+        # anything outside the sanity band around the decision close is
+        # rejected in favour of the close, with an alert raised.
+        started_system._data_feed.get_latest_price = lambda ticker: 4200.0
+        assert started_system._execution_price("AAA", 42.0) == 42.0
+        started_system._alerts.alert.assert_called_once()
+        assert "price_sanity_AAA" == started_system._alerts.alert.call_args.kwargs["key"]
 
     def test_feed_without_a_price_endpoint_still_works(self, started_system):
         """FakeDataFeed and any older feed simply have no get_latest_price."""
@@ -539,6 +596,50 @@ class TestPortfolioBatchLoop:
         assert decisions["AAA"]["target_position"] == 10
         assert decisions["BBB"]["target_position"] == 20
 
+    def test_run_portfolio_once_skips_rebalance_when_buying_power_insufficient(
+        self, tmp_path, monkeypatch,
+    ):
+        # validate_book() only checks target WEIGHTS against equity; it
+        # cannot see broker-side buying power. Without this guard (K3) a
+        # buying-power reject would silently drop the order instead of
+        # alerting (broker/order_executor.py's submit_order swallows the
+        # exception and returns "").
+        sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True, equity=100_000.0)
+        assert sys_.startup() is True
+
+        monkeypatch.setattr(
+            sys_, "_compute_live_target_book", lambda: {"AAA": 0.50, "BBB": 0.50},
+        )
+        monkeypatch.setattr(
+            sys_,
+            "_target_positions_from_weights",
+            lambda target_weights, prices, equity: {"AAA": 10, "BBB": 20},
+        )
+        monkeypatch.setattr(sys_, "_market_is_open", lambda: True)
+
+        approved = MagicMock()
+        approved.approved = True
+        approved.reason = ""
+        monkeypatch.setattr(sys_._risk, "validate_book", lambda target_weights: approved)
+
+        # Real account equity/status stay intact; only buying power is cut
+        # far below what 10 AAA + 20 BBB actually costs.
+        real_get_account = sys_._client.get_account
+        def _tight_buying_power():
+            acct = dict(real_get_account())
+            acct["buying_power"] = 1.0
+            return acct
+        monkeypatch.setattr(sys_._client, "get_account", _tight_buying_power)
+
+        sys_._executor.rebalance.reset_mock()
+
+        bars = _bars_after(1, seed=606).iloc[-1]
+        decisions = sys_.run_portfolio_once({"AAA": bars, "BBB": bars})
+
+        assert decisions["AAA"]["action"] == "skipped_insufficient_buying_power"
+        assert decisions["BBB"]["action"] == "skipped_insufficient_buying_power"
+        sys_._executor.rebalance.assert_not_called()
+        sys_._alerts.alert.assert_called()
 
     def test_run_portfolio_once_rejects_invalid_book_without_rebalance(self, tmp_path, monkeypatch):
         sys_ = _make_system(tmp_path, tickers=("AAA", "BBB"), is_open=True)

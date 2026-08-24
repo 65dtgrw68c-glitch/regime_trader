@@ -60,6 +60,14 @@ _MAX_HISTORY_BARS = 800
 # matches the periodic-refit warm-up).
 _HMM_WARMUP_BARS = 30
 
+# Sanity band around the decision close for the live sizing price
+# (_execution_price). Wide enough that no genuine overnight gap in this
+# universe's history should ever trip it; tight enough to catch a bad
+# single-print read. A 2x product (QLD) doubles the underlying's move, so
+# this is set for the levered leg, not the 1x names.
+_EXECUTION_PRICE_BAND_LOW = 0.80
+_EXECUTION_PRICE_BAND_HIGH = 1.25
+
 
 # ===========================================================================
 # Per-ticker live state
@@ -69,7 +77,7 @@ _HMM_WARMUP_BARS = 30
 class TickerState:
     """Accumulating state for one symbol during live trading."""
     feature_engineer: FeatureEngineer
-    engine: HMMEngine
+    engine: Optional[HMMEngine]
     orchestrator: RegimeOrchestrator
     history: pd.DataFrame                       # accumulating OHLCV bars
     last_stable_regime: int = -1
@@ -204,10 +212,20 @@ class TradingSystem:
             logger.info("[startup 5-6/10] Fetching history & training HMM for %s...", ticker)
             hist = self._safe_call(self._data_feed.get_training_data, ticker)
             if hist is None or len(hist) < config.HMM["min_history_bars"]:
-                logger.error("Insufficient history for %s — skipping.", ticker)
-                continue
+                # A ticker missing from self._states is NOT "trade the rest":
+                # the deployed portfolio path builds its target book only from
+                # self._states, and PositionTracker.diff() reads an absent
+                # target key as 0 — i.e. a full liquidation order with no
+                # signal behind it. Abort the whole run instead.
+                logger.critical("Insufficient history for %s — aborting startup.", ticker)
+                self._alert(
+                    f"Startup aborted: insufficient history for {ticker}.",
+                    SEVERITY_CRITICAL, key="startup_missing_data",
+                )
+                return False
+            fe = FeatureEngineer()
+            engine = None
             try:
-                fe = FeatureEngineer()
                 feats = fe.fit_transform(hist)
                 engine = HMMEngine(
                     n_iter=config.HMM["n_iter"],
@@ -226,8 +244,15 @@ class TradingSystem:
                 for row in feats.iloc[-_HMM_WARMUP_BARS:].values:
                     engine.update(row)
             except Exception as exc:
-                logger.error("HMM training failed for %s: %s", ticker, exc)
-                continue
+                # The deployed path (run_portfolio_once) never reads
+                # state.engine — only the disabled single-ticker run_once
+                # does. A training failure must not disqualify the ticker
+                # from the book it actually trades on.
+                logger.warning(
+                    "HMM training failed for %s: %s — trading without it.",
+                    ticker, exc,
+                )
+                engine = None
             # The portfolio exposure cap goes INTO the orchestrator target so
             # the drift trigger compares against what will actually be held
             # (a downstream sizing clip left a permanent target-vs-held gap
@@ -481,6 +506,37 @@ class TradingSystem:
             prices,
             equity,
         )
+
+        # 5b. Guard the actual submission against real buying power.
+        # validate_book() above only checks that target WEIGHTS sum
+        # correctly against equity — it cannot see broker-side constraints
+        # (settlement, existing margin usage) that shrink buying power below
+        # what the weights assume. Without this, a broker-side reject on
+        # insufficient buying power silently drops that order (submit_order
+        # returns "") and the book quietly ends up underinvested, unalerted.
+        deltas = self._positions.diff(target_positions)
+        buy_notional = sum(
+            abs(delta) * prices.get(ticker, 0.0)
+            for ticker, delta in deltas.items()
+            if delta > 0
+        )
+        if buy_notional > 1e-6:
+            account = self._safe_call(self._client.get_account) or {}
+            buying_power = float(account.get("buying_power", equity))
+            if buy_notional > buying_power + 1e-6:
+                for ticker in updated_tickers:
+                    decisions[ticker]["action"] = "skipped_insufficient_buying_power"
+                logger.error(
+                    "Portfolio rebalance needs %.2f buying power, only %.2f "
+                    "available — skipping this cycle instead of submitting a "
+                    "partially-fillable book.", buy_notional, buying_power,
+                )
+                self._alert(
+                    f"Insufficient buying power for portfolio rebalance: need "
+                    f"{buy_notional:.0f}, have {buying_power:.0f}.",
+                    SEVERITY_CRITICAL, key="insufficient_buying_power",
+                )
+                return decisions
 
         # 6. Submit one portfolio rebalance.
         # bar_day is normally the traded day; fall back to today's UTC date
@@ -855,6 +911,13 @@ class TradingSystem:
         Failure mode 2: HMM prediction error.
         Fall back to the last known stable regime; log and continue.
         """
+        if state.engine is None:
+            # HMM training failed at startup (K2 fix) — this path (run_once)
+            # is not the deployed one, but must not crash if reactivated.
+            # An empty proba mirrors the existing "no confirmed regime yet"
+            # shape, which the caller already handles.
+            import numpy as np
+            return state.last_stable_regime, state.last_stable_label, np.array([]), True
         try:
             state.engine.update(obs)
             idx = state.engine.current_regime()
@@ -1373,7 +1436,28 @@ class TradingSystem:
             price = float(self._safe_call(getter, ticker))
         except (TypeError, ValueError):
             return fallback
-        return price if price > 0 else fallback
+        if not price > 0:
+            return fallback
+        # The live price is a SINGLE IEX print from the still-running session,
+        # taken minutes after the open, and feeds directly into share count
+        # (shares = weight * equity / price) with nothing downstream checking
+        # the result against equity. A bad print would mis-size the order
+        # outright, so reject anything outside a band no genuine overnight
+        # gap in this universe has produced and size on the decision close
+        # instead.
+        if not (_EXECUTION_PRICE_BAND_LOW * fallback <= price <= _EXECUTION_PRICE_BAND_HIGH * fallback):
+            logger.error(
+                "Live price %.2f for %s is %+.1f%% off the decision close "
+                "%.2f — using the close for sizing.",
+                price, ticker, (price / fallback - 1) * 100, fallback,
+            )
+            self._alert(
+                f"Implausible live price for {ticker}: {price:.2f} vs close "
+                f"{fallback:.2f} — sizing on the close instead.",
+                SEVERITY_WARNING, key=f"price_sanity_{ticker}",
+            )
+            return fallback
+        return price
 
     def _alert(self, message: str, severity: str, key: Optional[str] = None) -> None:
         if self._alerts is not None:

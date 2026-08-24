@@ -108,6 +108,23 @@ class TestPositionTrackerDiff:
         tracker = _tracker_with({})
         assert tracker.diff({"C": 7}) == {"C": 7}
 
+    def test_diff_never_rounds_a_sell_past_the_held_quantity(self):
+        # round(delta, 4) can round a sell UP in magnitude past what's
+        # actually held (e.g. -10.00005 -> -10.0001), which the broker
+        # rejects as overselling on a full close (M2). The sell size must
+        # be floored instead.
+        tracker = _tracker_with({})
+        tracker.set_positions({
+            "A": Position(ticker="A", qty=10.00005, avg_entry_price=100.0, current_price=100.0),
+        })
+        deltas = tracker.diff({"A": 0.0})
+        assert deltas["A"] == pytest.approx(-10.0000, abs=1e-9)
+        assert abs(deltas["A"]) <= 10.00005
+
+    def test_diff_still_rounds_buys_normally(self):
+        tracker = _tracker_with({"A": 5})
+        assert tracker.diff({"A": 5.00006}) == {"A": pytest.approx(0.0001)}
+
 
 # ---------------------------------------------------------------------------
 # PositionTracker external-close detection

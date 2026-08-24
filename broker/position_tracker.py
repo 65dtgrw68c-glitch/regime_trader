@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -124,6 +125,14 @@ class PositionTracker:
             current = self._positions[t].qty if t in self._positions else 0.0
             desired = float(target.get(t, 0.0))
             delta = desired - current
-            if abs(delta) > 1e-5:
+            if abs(delta) <= 1e-5:
+                continue
+            if delta < 0:
+                # Rounding a sell UP in magnitude can oversell past the
+                # current holding (e.g. current=10.00005, target=0 rounds
+                # to -10.0001, a qty the broker doesn't have). Floor the
+                # sell size instead so it never exceeds what's held.
+                deltas[t] = -math.floor(abs(delta) * 10_000) / 10_000
+            else:
                 deltas[t] = round(delta, 4)
         return deltas

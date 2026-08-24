@@ -218,6 +218,104 @@ class TestRebalance:
         for oid, symbol in zip(ids, submitted_symbols):
             assert ex._expected_prices[oid] == expected_price_by_ticker[symbol]
 
+    def test_client_order_id_includes_target_quantity(self):
+        # (ticker, date, side) alone can't distinguish "the rest of a
+        # partially-filled decision" from "the same decision run again" —
+        # the broker would reject the remainder as a duplicate (H2). Folding
+        # the target quantity into the key tells them apart.
+        client = _make_client()
+        tracker = _tracker_with({"A": 10})
+        ex = OrderExecutor(client, tracker)
+        ex.rebalance({"A": 25}, run_tag="2026-08-24")
+        request = client.trading.submit_order.call_args.args[0]
+        assert request.client_order_id == "rt-A-2026-08-24-buy-25.0000"
+
+
+# ---------------------------------------------------------------------------
+# OrderExecutor.cancel_open_orders_for_ticker — cancel confirmation (H2a)
+# ---------------------------------------------------------------------------
+
+class TestCancelConfirmation:
+
+    def test_waits_for_cancel_to_reach_terminal_status(self):
+        client = _make_client()
+        client.trading.get_orders.return_value = [_FakeOrder("old-1", status="new", symbol="A")]
+        statuses = iter(["pending_cancel", "pending_cancel", "canceled"])
+        client.trading.get_order_by_id.side_effect = (
+            lambda oid: _FakeOrder(oid, status=next(statuses), symbol="A")
+        )
+        ex = OrderExecutor(client, _tracker_with({"A": 10}))
+
+        ex.cancel_open_orders_for_ticker("A")
+
+        client.trading.cancel_order_by_id.assert_called_once_with("old-1")
+        assert client.trading.get_order_by_id.call_count == 3
+
+    def test_gives_up_after_timeout_without_raising(self):
+        client = _make_client()
+        client.trading.get_orders.return_value = [_FakeOrder("old-1", status="new", symbol="A")]
+        client.trading.get_order_by_id.return_value = _FakeOrder(
+            "old-1", status="pending_cancel", symbol="A",
+        )
+        ex = OrderExecutor(client, _tracker_with({"A": 10}))
+        ex.cancel_open_orders_for_ticker("A", confirm_timeout=0.05)  # must return, not hang
+
+    def test_lookup_failure_during_confirmation_does_not_raise(self):
+        client = _make_client()
+        client.trading.get_orders.return_value = [_FakeOrder("old-1", status="new", symbol="A")]
+        client.trading.get_order_by_id.side_effect = RuntimeError("not found")
+        ex = OrderExecutor(client, _tracker_with({"A": 10}))
+        ex.cancel_open_orders_for_ticker("A")  # must not propagate
+
+
+# ---------------------------------------------------------------------------
+# OrderExecutor.submit_order — duplicate client_order_id (H2c)
+# ---------------------------------------------------------------------------
+
+class TestDuplicateClientOrderId:
+
+    def test_duplicate_coid_looks_up_existing_order_instead_of_dropping(self):
+        client = MagicMock()
+        error = RuntimeError('{"code":40010001,"message":"client_order_id must be unique"}')
+        error.status_code = 422
+        client.trading.submit_order.side_effect = error
+        client.trading.get_order_by_client_id.return_value = _FakeOrder(
+            "existing-oid-1", status="accepted",
+        )
+        ex = OrderExecutor(client, _tracker_with({}))
+
+        oid = ex.submit_order(
+            "SPY", 5, "buy", client_order_id="rt-SPY-2026-08-24-buy-5.0000",
+        )
+
+        assert oid == "existing-oid-1"
+        client.trading.get_order_by_client_id.assert_called_once_with(
+            "rt-SPY-2026-08-24-buy-5.0000"
+        )
+        # 422 is now classified non-transient (M4) — fails fast, no retries.
+        assert client.trading.submit_order.call_count == 1
+
+    def test_duplicate_coid_with_no_lookup_support_still_returns_empty(self):
+        client = MagicMock()
+        del client.trading.get_order_by_client_id
+        error = RuntimeError('{"message":"client_order_id must be unique"}')
+        error.status_code = 422
+        client.trading.submit_order.side_effect = error
+        ex = OrderExecutor(client, _tracker_with({}))
+        oid = ex.submit_order("SPY", 5, "buy", client_order_id="rt-SPY-x-buy-5.0000")
+        assert oid == ""
+
+    def test_non_duplicate_rejection_still_returns_empty(self):
+        client = MagicMock()
+        error = RuntimeError('{"message":"insufficient buying power"}')
+        error.status_code = 422
+        client.trading.submit_order.side_effect = error
+        client.trading.get_order_by_client_id.return_value = _FakeOrder("should-not-use")
+        ex = OrderExecutor(client, _tracker_with({}))
+        oid = ex.submit_order("SPY", 5, "buy", client_order_id="rt-SPY-x-buy-5.0000")
+        assert oid == ""
+        client.trading.get_order_by_client_id.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # OrderExecutor single-order operations

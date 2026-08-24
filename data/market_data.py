@@ -76,6 +76,8 @@ class MarketDataFeed:
             df = None
             if use_cache:
                 df = self._load_cache(ticker, timeframe, start=start, end=end)
+            if df is not None and not df.empty:
+                df = self._fill_cache_tail(ticker, timeframe, df, end, use_cache)
             if df is None:
                 df = self._fetch_bars_with_retry(ticker, start, end, timeframe)
                 if use_cache and not df.empty:
@@ -352,6 +354,40 @@ class MarketDataFeed:
             logger.warning("Cache range check failed for %s: %s — refetching.", ticker, exc)
             return None
         return df
+
+    def _fill_cache_tail(
+        self,
+        ticker: str,
+        timeframe: str,
+        df: pd.DataFrame,
+        end: Optional[str],
+        use_cache: bool,
+    ) -> pd.DataFrame:
+        """
+        Fetch and merge the sessions between the cache's last bar and `end`.
+
+        `_load_cache` accepts a cache up to `_CACHE_END_GRACE_DAYS` stale,
+        and the scheduled --once process appends exactly one bar on top of
+        it. Every session strictly between the two is then missing from
+        SMA-200, the 63-bar vol window and the correlation selector — the
+        series the live decision runs on is not the series any backtest
+        evaluates on the same dates. One small tail request per ticker per
+        run closes that gap; the fetch itself is not wrapped in extra
+        retry/fallback here (`_fetch_bars_with_retry` already retries, and
+        its caller already treats a failure as "trading paused" rather than
+        silently serving the gapped series).
+        """
+        tail_start = pd.Timestamp(df.index.max()) - pd.Timedelta(days=1)
+        tail = self._fetch_bars_with_retry(
+            ticker, tail_start.date().isoformat(), end, timeframe,
+        )
+        if tail.empty:
+            return df
+        merged = pd.concat([df, tail])
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        if use_cache:
+            self._save_cache(ticker, timeframe, merged)
+        return merged
 
     def _save_cache(self, ticker: str, timeframe: str, df: pd.DataFrame) -> None:
         try:

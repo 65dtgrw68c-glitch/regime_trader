@@ -25,6 +25,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import signal
 import time
 from dataclasses import dataclass, field
@@ -890,7 +891,8 @@ class TradingSystem:
                         "error: %s", getattr(fn, "__name__", fn), exc,
                     )
                     break
-                wait = self._retry_delay * (2 ** attempt)
+                # +/-20% jitter so a shared outage doesn't retry in lockstep.
+                wait = self._retry_delay * (2 ** attempt) * random.uniform(0.8, 1.2)
                 logger.warning(
                     "API call %s failed (attempt %d/%d): %s — backoff %.2fs",
                     getattr(fn, "__name__", fn), attempt + 1, self._max_api_retries, exc, wait,

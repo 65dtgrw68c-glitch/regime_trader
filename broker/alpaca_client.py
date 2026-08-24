@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from functools import wraps
 from typing import Any, Optional
@@ -66,7 +67,10 @@ def with_retry(max_retries: int = 3, delay: float = 1.0):
                     last_exc = exc
                     logger.warning("API Call %s fehlgeschlagen (Versuch %d/%d): %s", func.__name__, attempt, max_retries, exc)
                     if attempt < max_retries:
-                        time.sleep(delay * (2 ** (attempt - 1)))
+                        # +/-20% jitter so concurrent callers hitting the
+                        # same transient error don't retry in lockstep.
+                        wait = delay * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+                        time.sleep(wait)
             logger.error("API Call %s nach %d Versuchen fehlgeschlagen.", func.__name__, max_retries)
             raise last_exc
         return wrapper

@@ -4,11 +4,15 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 # HTTP statuses that mean "this request will never succeed, no matter how
-# many times you retry it" — bad/expired credentials or a permissions
-# problem, not a transient network blip. Every retry helper in broker/
-# checks this before backing off, so a 401 fails fast as the config error it
-# is instead of burning 3 rounds of exponential backoff first.
-_NON_TRANSIENT_STATUS_CODES = frozenset({401, 403})
+# many times you retry it" — bad/expired credentials, a permissions
+# problem, a malformed/duplicate request the broker will reject the same
+# way every time, or a resource that genuinely doesn't exist. None of
+# those are a transient network blip. Every retry helper in broker/ checks
+# this before backing off, so e.g. a 401 fails fast as the config error it
+# is, and a 422 validation error (duplicate client_order_id, non-tradable
+# asset, insufficient buying power) stops burning 3 rounds of exponential
+# backoff on a request that was never going to succeed.
+_NON_TRANSIENT_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
 
 
 def is_non_transient_error(exc: Exception) -> bool:

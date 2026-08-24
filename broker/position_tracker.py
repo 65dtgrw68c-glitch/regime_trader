@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -62,7 +63,11 @@ class PositionTracker:
                     exc,
                 )
                 if attempt < max_retries:
-                    time.sleep(delay * (2 ** (attempt - 1)))
+                    # +/-20% jitter: several tickers hitting a transient
+                    # error in the same cycle would otherwise retry in
+                    # lockstep and re-collide on the same second.
+                    wait = delay * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+                    time.sleep(wait)
         raise last_exc
 
     def refresh(self) -> list[str]:

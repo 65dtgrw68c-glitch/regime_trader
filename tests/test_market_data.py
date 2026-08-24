@@ -153,3 +153,48 @@ class TestLatestBar:
         assert feed.get_latest_price("SPY") != pytest.approx(
             float(feed.get_latest_bar("SPY")["close"])
         )
+
+
+# ---------------------------------------------------------------------------
+# 3. Cache tail gap (H1)
+# ---------------------------------------------------------------------------
+
+class TestCacheTail:
+    """A cache accepted up to _CACHE_END_GRACE_DAYS stale must not be served
+    with a hole in it — the sessions between its last bar and `end` are
+    missing from SMA-200, the vol window and the correlation selector, so
+    the live decision would run on a different series than any backtest."""
+
+    def test_stale_cache_has_its_tail_fetched_and_merged(self, tmp_path):
+        feed = MarketDataFeed(client=object(), cache_dir=str(tmp_path))
+        cached = _daily_bars(["2026-08-01", "2026-08-02", "2026-08-03"])
+        feed._save_cache("AAA", "1Day", cached)
+
+        tail = _daily_bars(["2026-08-04", "2026-08-05"])
+        calls = []
+        def _fake_fetch(ticker, start, end, timeframe):
+            calls.append((ticker, start, end, timeframe))
+            return tail.copy()
+        feed._fetch_bars_with_retry = _fake_fetch
+
+        result = feed.get_historical_bars(["AAA"], "2026-08-01", "2026-08-06")
+        result = result.xs("AAA", level="ticker")
+
+        assert len(calls) == 1, "only the missing tail should be fetched, not a full refetch"
+        got_dates = {pd.Timestamp(ts).date() for ts in result.index}
+        assert pd.Timestamp("2026-08-04").date() in got_dates
+        assert pd.Timestamp("2026-08-05").date() in got_dates
+
+        # The merged frame is persisted so the next run's cache is complete.
+        reloaded = pd.read_parquet(feed._cache_path("AAA", "1Day"))
+        assert len(reloaded) == 5
+
+    def test_empty_tail_leaves_cache_untouched(self, tmp_path):
+        feed = MarketDataFeed(client=object(), cache_dir=str(tmp_path))
+        cached = _daily_bars(["2026-08-01", "2026-08-02"])
+        feed._save_cache("AAA", "1Day", cached)
+        feed._fetch_bars_with_retry = lambda *a, **k: pd.DataFrame()
+
+        result = feed.get_historical_bars(["AAA"], "2026-08-01", "2026-08-03")
+        result = result.xs("AAA", level="ticker")
+        assert len(result) == 2

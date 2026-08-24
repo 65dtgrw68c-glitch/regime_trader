@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from typing import Optional
 
@@ -9,6 +10,16 @@ from broker.base import is_non_transient_error
 logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "rejected", "expired", "closed"}
+
+
+def _is_duplicate_client_order_id_error(exc: Exception) -> bool:
+    """True if `exc` looks like a broker rejection for a client_order_id
+    that was already used by an earlier order — as opposed to any other
+    validation failure, which should stay rejected."""
+    msg = str(exc).lower()
+    return "client_order_id" in msg and (
+        "unique" in msg or "duplicate" in msg or "already" in msg
+    )
 
 
 class OrderExecutor:
@@ -56,11 +67,22 @@ class OrderExecutor:
                     exc,
                 )
                 if attempt < max_retries:
-                    time.sleep(delay * (2 ** (attempt - 1)))
+                    # +/-20% jitter: several tickers hitting a transient
+                    # error in the same cycle would otherwise retry in
+                    # lockstep and re-collide on the same second.
+                    wait = delay * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+                    time.sleep(wait)
         raise last_exc
 
-    def cancel_open_orders_for_ticker(self, ticker: str) -> None:
-        """Storniert alle offenen Orders für ein Symbol vor dem Rebalancing (Schutz vor verwaisten Stops)."""
+    def cancel_open_orders_for_ticker(self, ticker: str, confirm_timeout: float = 10.0) -> None:
+        """Storniert alle offenen Orders für ein Symbol vor dem Rebalancing (Schutz vor verwaisten Stops).
+
+        Waits for each cancel to reach a terminal status before returning.
+        Alpaca acknowledges a cancel request with a 204 and moves the order
+        to `pending_cancel` — not terminal — so submitting the replacement
+        order immediately after risked the old order still filling.
+        """
+        cancelled_ids: list[str] = []
         try:
             orders = self._call_with_retry(self._client.trading.get_orders)
             for o in orders:
@@ -68,8 +90,35 @@ class OrderExecutor:
                     oid = str(getattr(o, "id", ""))
                     self._call_with_retry(self._client.trading.cancel_order_by_id, oid)
                     logger.info("Cancelled open order %s for %s prior to rebalance", oid, ticker)
+                    cancelled_ids.append(oid)
         except Exception as exc:
             logger.error("Failed to cancel open orders for %s: %s", ticker, exc)
+        if cancelled_ids:
+            self._await_cancel_terminal(cancelled_ids, timeout=confirm_timeout)
+
+    def _await_cancel_terminal(self, order_ids: list[str], timeout: float = 10.0) -> None:
+        """Poll each order until it reaches a terminal status or `timeout` elapses."""
+        deadline = time.time() + timeout
+        pending = set(order_ids)
+        while pending and time.time() < deadline:
+            for oid in list(pending):
+                try:
+                    order = self._client.trading.get_order_by_id(oid)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not confirm cancel status for %s: %s — proceeding.", oid, exc,
+                    )
+                    pending.discard(oid)
+                    continue
+                if str(getattr(order, "status", "")).lower() in _TERMINAL_STATUSES:
+                    pending.discard(oid)
+            if pending:
+                time.sleep(0.2)
+        if pending:
+            logger.warning(
+                "Cancel not confirmed terminal for %d order(s) within %.0fs: %s",
+                len(pending), timeout, pending,
+            )
 
     def rebalance(
         self,
@@ -89,6 +138,15 @@ class OrderExecutor:
         after reboot) diff against the same stale snapshot and would compute
         the same delta — without this, both submit; with it, the broker
         rejects the second as a duplicate instead of doubling the position.
+
+        The target QUANTITY is folded into the key too, not just
+        ticker+date+side: with only those three, a rebalance that got
+        partially filled and then interrupted could never re-order the
+        remainder on the same day — the broker rejects the retry as a
+        duplicate of the first (partially-filled) order. Two runs proposing
+        the same target still collide on the same key (the protection above
+        is preserved); a second run proposing a different remaining target
+        gets a new key and is free to submit.
         """
         deltas = self._positions.diff(target_positions)
         order_ids: list[str] = []
@@ -102,7 +160,11 @@ class OrderExecutor:
 
             side = "buy" if delta > 0 else "sell"
             expected_price = prices.get(ticker) if prices else None
-            coid = f"rt-{ticker}-{run_tag}-{side}" if run_tag is not None else None
+            target_qty = float(target_positions.get(ticker, 0.0))
+            coid = (
+                f"rt-{ticker}-{run_tag}-{side}-{target_qty:.4f}"
+                if run_tag is not None else None
+            )
             oid = self.submit_order(
                 ticker, abs(delta), side, order_type="market",
                 client_order_id=coid, expected_price=expected_price,
@@ -173,6 +235,28 @@ class OrderExecutor:
             else:
                 order = self._client.trading.submit_order(request)
         except Exception as exc:
+            if client_order_id and _is_duplicate_client_order_id_error(exc):
+                # The order was already accepted by an earlier attempt (e.g.
+                # the acceptance response was lost to a network timeout, and
+                # a retry with the same idempotency key just replayed the
+                # submission). Look it up instead of returning "" and
+                # leaving a live order untracked.
+                logger.warning(
+                    "Duplicate client_order_id %s for %s %s x%.4f — looking "
+                    "up the existing order instead of dropping it.",
+                    client_order_id, side, ticker, qty,
+                )
+                existing = self._lookup_by_client_order_id(client_order_id)
+                if existing is not None:
+                    existing_oid = str(getattr(existing, "id", ""))
+                    if existing_oid and expected_price is not None:
+                        self._expected_prices[existing_oid] = float(expected_price)
+                    logger.info(
+                        "Found existing order %s for client_order_id %s (status=%s)",
+                        existing_oid, client_order_id,
+                        str(getattr(existing, "status", "")).lower(),
+                    )
+                    return existing_oid
             logger.error("Order REJECTED for %s %s x%.4f: %s", side, ticker, qty, exc)
             return ""
 
@@ -189,6 +273,18 @@ class OrderExecutor:
         logger.info("Submitted %s %s %s x%.4f (id=%s, status=%s)",
                     order_type, side, ticker, rounded_qty, oid, status)
         return oid
+
+    def _lookup_by_client_order_id(self, client_order_id: str) -> Optional[object]:
+        getter = getattr(self._client.trading, "get_order_by_client_id", None)
+        if getter is None:
+            return None
+        try:
+            return getter(client_order_id)
+        except Exception as exc:
+            logger.warning(
+                "Lookup by client_order_id %s failed: %s", client_order_id, exc,
+            )
+            return None
 
     def submit_stop_loss(self, ticker: str, qty: float, stop_price: float, side: str = "sell") -> str:
         return self.submit_order(ticker, qty, side, order_type="stop", stop_price=stop_price)

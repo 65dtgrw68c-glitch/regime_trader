@@ -76,8 +76,14 @@ def main(argv=None) -> int:
         "--target", type=float, default=DEFAULT_TARGET_VOL,
         help="pre-registered book_vol_target to evaluate (default 0.20)",
     )
+    ap.add_argument(
+        "--sleeve", type=float, default=None,
+        help="pre-registered sleeve weight to evaluate alongside --target "
+             "(default: leave config.SLEEVES as deployed, 0.40)",
+    )
     args = ap.parse_args(argv)
     target_vol = float(args.target)
+    sleeve = float(args.sleeve) if args.sleeve is not None else None
 
     px = load(TICKERS)
     tbill_path = CACHE / "TBILL.parquet"
@@ -86,23 +92,45 @@ def main(argv=None) -> int:
     slippage_bps = float(config.BACKTEST["slippage"]) * 10_000.0
     commission_bps = float(config.BACKTEST["commission"]) * 10_000.0
 
-    def run(book_vol_target: float) -> pd.Series:
-        bt = PortfolioBacktester(
-            histories=px,
-            initial_capital=float(config.BACKTEST["initial_capital"]),
-            transaction_cost_bps=commission_bps,
-            slippage_bps=slippage_bps,
-            cash_yield_series=tbill,
-            book_vol_target=book_vol_target,
-            vol_target_lookback=VOL_LOOKBACK,
+    original_sleeves = {
+        "core_scale": config.SLEEVES["core_scale"],
+        "levered": [dict(spec) for spec in config.SLEEVES["levered"]],
+    }
+
+    def _set_sleeve(weight):
+        """None = leave config.SLEEVES exactly as deployed."""
+        if weight is None:
+            config.SLEEVES["core_scale"] = original_sleeves["core_scale"]
+            config.SLEEVES["levered"] = [dict(s) for s in original_sleeves["levered"]]
+            return
+        config.SLEEVES["core_scale"] = round(1.0 - weight, 6)
+        config.SLEEVES["levered"] = (
+            [{"ticker": "QLD", "signal": "QQQ", "weight": weight}] if weight > 0 else []
         )
-        return bt.run().returns
+
+    def run(book_vol_target: float, sleeve_weight=None) -> pd.Series:
+        _set_sleeve(sleeve_weight)
+        try:
+            bt = PortfolioBacktester(
+                histories=px,
+                initial_capital=float(config.BACKTEST["initial_capital"]),
+                transaction_cost_bps=commission_bps,
+                slippage_bps=slippage_bps,
+                cash_yield_series=tbill,
+                book_vol_target=book_vol_target,
+                vol_target_lookback=VOL_LOOKBACK,
+            )
+            return bt.run().returns
+        finally:
+            _set_sleeve(None)
 
     # Full history (natural start), never start_date-clipped: clipping would
     # both shift the effective simulation start (H3) and rob the vol-target's
     # own lookback of pre-holdout history to warm up on.
-    baseline_full = run(0.0)
-    candidate_full = run(target_vol)
+    # Baseline is ALWAYS the deployed configuration (sleeve 0.40, no
+    # vol-target) so every pre-registration is scored against the same book.
+    baseline_full = run(0.0, None)
+    candidate_full = run(target_vol, sleeve)
 
     holdout_start = pd.Timestamp(config.HOLDOUT_START)
     baseline = baseline_full[baseline_full.index >= holdout_start]
@@ -115,13 +143,17 @@ def main(argv=None) -> int:
     c = stats(candidate)
 
     print("=" * 78)
+    key = (round(target_vol, 4), round(sleeve, 4) if sleeve is not None else None)
     prereg = {
-        0.20: "preregistration_2026-08-24_book_vol_target.md",
-        0.12: "preregistration_2026-08-25_tighter_vol_target.md",
-    }.get(round(target_vol, 4), "NO PRE-REGISTRATION ON FILE FOR THIS TARGET")
+        (0.20, None): "preregistration_2026-08-24_book_vol_target.md",
+        (0.12, None): "preregistration_2026-08-25_tighter_vol_target.md",
+        (0.20, 0.30): "preregistration_2026-08-25_combination.md",
+    }.get(key, "NO PRE-REGISTRATION ON FILE FOR THIS CONFIGURATION")
     print(f"vol_target_holdout_eval.py — {prereg}")
     print("=" * 78)
-    print(f"candidate      book_vol_target={target_vol:.0%}  lookback={VOL_LOOKBACK}d")
+    sleeve_str = f"{sleeve:.0%}" if sleeve is not None else "40% (deployed, unchanged)"
+    print(f"candidate      book_vol_target={target_vol:.0%}  lookback={VOL_LOOKBACK}d  "
+          f"sleeve={sleeve_str}")
     print(f"holdout        {config.HOLDOUT_START} .. today "
           f"({baseline.index[0].date()} .. {baseline.index[-1].date()}, {len(baseline)} bars)")
     print(f"costs          {slippage_bps:.1f} bp slippage + {commission_bps:.1f} bp commission")

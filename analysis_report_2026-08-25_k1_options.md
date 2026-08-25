@@ -1,11 +1,11 @@
 # K1 — the sleeve tail risk: what every available lever actually costs
 
-2026-08-25. Consolidates the four measurements run against finding K1 of the
+2026-08-25. Consolidates the five measurements run against finding K1 of the
 2026-08-24 audit. **This memo does not choose. It puts the price tag on each option so
 the owner can.**
 
 Reproduce: `scripts/dotcom_reconstruction.py`, `scripts/sleeve_weight_scan.py`,
-`scripts/vol_target_holdout_eval.py [--target N]`.
+`scripts/vol_target_holdout_eval.py [--target N] [--sleeve N]`.
 
 ## The finding, restated precisely
 
@@ -37,6 +37,7 @@ QLD. Pinned costs throughout (2 bp slippage, ^IRX cash).
 | **Deployed (sleeve 40%, no vol-target)** | **17.90%** | **1.08** | **−21.31%** | **−52.22%** | **YES 2000-07** |
 | Vol-target 20% | 17.14% | 1.07 | −21.02% | −41.58% | YES 2002-12 |
 | Sleeve 30% | 16.04% | 1.13 | −18.37% | −45.39% | YES 2001-12 |
+| Sleeve 30% + vol-target 20% | 15.66% | 1.12 | −18.31% | −38.30% | YES 2003-01 |
 | Vol-target 12% | 14.92% | 1.10 | −17.47% | −32.41% | no |
 | Sleeve 20% | 14.13% | 1.20 | −15.35% | −37.80% | YES 2003-01 |
 | Sleeve 10% | 12.16% | 1.28 | −12.25% | −29.41% | no |
@@ -70,14 +71,20 @@ CAGR (~14-15%), vol-target 12% and sleeve 20% diverge sharply:
 - **Vol-target 12%** wins the tail — recon maxDD −32.4% vs −37.8%, and clears the HALT
   where sleeve 20% does not.
 
-That makes sense mechanically: cutting the sleeve is a static reduction that helps
-everywhere proportionally, while the vol-target is *reactive* — it only binds once
-realised volatility rises, which is exactly the dotcom grind's signature. **A combination
-(moderate sleeve cut + moderate vol-target) may well dominate either alone.** That is a
-genuine hypothesis, and it is untested: it would need its own pre-registration and its
-own holdout run. It has deliberately not been swept here — `config.py` explicitly
-forbids re-optimising this split by grid search, and running a 2-D scan and keeping the
-best cell is precisely the failure mode the frozen holdout exists to prevent.
+That suggested a combination might dominate either alone, since cutting the sleeve is a
+static reduction while the vol-target is *reactive*. **That hypothesis was
+pre-registered, tested on 2026-08-25, and refuted** — see
+`preregistration_2026-08-25_combination.md`. Sleeve 30% + vol-target 20% costs 224 bp
+for a −38.30% reconstructed drawdown, while a pure vol-target at the same price
+interpolates to roughly −35.5%. Adding a static sleeve cut on top of a vol-target
+spends return less efficiently than simply tightening the vol-target.
+
+The corrected reading: **the vol-target is the efficient lever and the sleeve weight is
+not.** Every sleeve-only configuration in the table above is dominated by some
+vol-target configuration that costs less and protects better. Only one combination was
+tested and no more will be — `config.py` forbids re-optimising this split by grid
+search, and trying pairs until one passes is that search conducted one commit at a
+time.
 
 ## The options, with the case against each
 
@@ -108,8 +115,13 @@ a threshold near 60% — which is not a protection mechanism, it is its removal.
 option closes the finding by widening the tolerance rather than reducing the risk. If
 chosen, it should be chosen with that stated plainly.
 
-**F. Combination (untested).** See point 3. Most promising on mechanism; zero evidence
-behind it today.
+**F. Combination — tested 2026-08-25, and it does not help.** See
+`preregistration_2026-08-25_combination.md`. Sleeve 30% + vol-target 20% costs 224 bp
+and reaches a −38.30% reconstructed drawdown, still short of clearing the HALT. More
+importantly it is *less efficient* than pure vol-targeting: a vol-target alone at the
+same 224 bp cost would land near −35.5%. The mechanism claim in point 3 above is
+therefore refuted — the two levers behave as substitutes, and the reactive one is
+strictly the better buy. Sleeve-only configurations are dominated outright.
 
 ## What is NOT recommended, and why
 

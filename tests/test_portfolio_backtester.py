@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -437,3 +438,98 @@ def test_tradable_universe_contains_validated_diversifiers():
 
     # DBC bleibt optional und soll aktuell noch nicht live gehandelt werden.
     assert "DBC" not in universe
+
+
+# ---------------------------------------------------------------------------
+# Book-level vol target (2026-08-24 audit, Phase 3 / Section F candidate)
+# ---------------------------------------------------------------------------
+
+class TestBookVolTarget:
+
+    def test_disabled_by_default(self):
+        bt = PortfolioBacktester(histories={})
+        assert bt.book_vol_target == 0.0
+        assert bt._vol_target_scale([0.05] * 30) == 1.0
+
+    def test_explicit_zero_is_also_a_no_op(self):
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.0)
+        assert bt._vol_target_scale([0.05, -0.08] * 20) == 1.0
+
+    def test_scale_is_one_before_the_lookback_window_fills(self):
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.15, vol_target_lookback=21)
+        assert bt._vol_target_scale([0.05] * 20) == 1.0  # 20 < 21
+
+    def test_scale_shrinks_when_realised_vol_exceeds_target(self):
+        rng = np.random.default_rng(7)
+        # ~40% annualised daily vol, well above the 15% target below.
+        returns = list(rng.normal(0.0, 0.40 / (252 ** 0.5), 60))
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.15, vol_target_lookback=21)
+        scale = bt._vol_target_scale(returns)
+        assert 0.0 < scale < 1.0
+
+    def test_scale_never_exceeds_one_when_realised_vol_is_low(self):
+        # A near-flat window implies realised vol -> 0, so target/realised
+        # explodes — must clamp to 1.0, never manufacture leverage.
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.50, vol_target_lookback=21)
+        assert bt._vol_target_scale([0.0001] * 25) == 1.0
+
+    def test_scale_handles_a_perfectly_flat_window(self):
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.15, vol_target_lookback=21)
+        assert bt._vol_target_scale([0.0] * 25) == 1.0
+
+    def test_zero_vol_target_matches_default_behavior(self):
+        rng = np.random.default_rng(11)
+        n = 260
+        idx = pd.bdate_range("2021-01-01", periods=n, freq="B")
+        shock = np.exp(np.cumsum(rng.normal(0.0003, 0.02, n)))
+        close = pd.Series(100.0 * shock, index=idx)
+        df = pd.DataFrame(
+            {"open": close, "high": close * 1.01, "low": close * 0.99,
+             "close": close, "volume": 1_000_000.0},
+            index=idx,
+        )
+        histories = {"SPY": df, "QQQ": df.copy()}
+
+        default_bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
+        explicit_off_bt = PortfolioBacktester(
+            histories=histories, initial_capital=100_000, book_vol_target=0.0,
+        )
+        pd.testing.assert_series_equal(
+            default_bt.run().returns, explicit_off_bt.run().returns,
+        )
+
+    def test_run_shrinks_gross_exposure_in_a_high_vol_book(self):
+        rng = np.random.default_rng(3)
+        n = 260
+        idx = pd.bdate_range("2021-01-01", periods=n, freq="B")
+        # Deliberately high-vol synthetic series (~45% annualised) so a 5%
+        # target should visibly bind after the lookback warmup.
+        shock = np.exp(np.cumsum(rng.normal(0.0, 0.028, n)))
+        close = pd.Series(100.0 * shock, index=idx)
+        df = pd.DataFrame(
+            {"open": close, "high": close * 1.01, "low": close * 0.99,
+             "close": close, "volume": 1_000_000.0},
+            index=idx,
+        )
+        histories = {"SPY": df, "QQQ": df.copy()}
+
+        baseline = PortfolioBacktester(histories=histories, initial_capital=100_000).run()
+        targeted = PortfolioBacktester(
+            histories=histories, initial_capital=100_000,
+            book_vol_target=0.05, vol_target_lookback=21,
+        ).run()
+
+        shared = baseline.weights.index.intersection(targeted.weights.index)[21:]
+        baseline_gross = baseline.weights.reindex(shared).abs().sum(axis=1)
+        targeted_gross = targeted.weights.reindex(shared).abs().sum(axis=1)
+
+        assert targeted_gross.mean() < baseline_gross.mean()
+        assert (targeted_gross <= baseline_gross + 1e-9).all()
+
+    def test_metadata_reports_the_configured_target(self):
+        bt = PortfolioBacktester(
+            histories={"SPY": _make_data(260)}, book_vol_target=0.20, vol_target_lookback=30,
+        )
+        result = bt.run()
+        assert result.metadata["book_vol_target"] == pytest.approx(0.20)
+        assert result.metadata["vol_target_lookback"] == 30

@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from core.universe import build_views, AssetView
@@ -71,6 +72,8 @@ class PortfolioBacktester:
         cash_yield_annual: float = 0.0,
         execution_model: str = "next_open",
         cash_yield_series: Optional[pd.Series] = None,
+        book_vol_target: float = 0.0,
+        vol_target_lookback: int = 21,
     ):
         """
         cash_yield_series : optional ANNUALISED risk-free yields (decimals,
@@ -80,6 +83,20 @@ class PortfolioBacktester:
             core.backtester.Backtester, which has taken real T-bill yields
             since 2026-07-10; a trend book sits in cash for long stretches, so
             crediting a flat rate misprices exactly those stretches.
+
+        book_vol_target : annualised target volatility for the WHOLE BOOK
+            (e.g. 0.20). 0.0 (default) is a no-op — every target weight is
+            used exactly as compose_book() produced it, unchanged from
+            before this parameter existed. When > 0, every weight is scaled
+            by min(1, book_vol_target / realised_vol), where realised_vol is
+            the annualised std of the book's own trailing
+            `vol_target_lookback` daily returns — the returns this same
+            backtest already produced up to the decision bar, so the scale
+            is causal (no lookahead) by construction. This is an evaluation
+            knob, not a deployed one: the live path (main.py /
+            core/sleeves.py) does not read it. See the 2026-08-24 audit,
+            finding K1 / Section F, and scripts/vol_target_holdout_eval.py
+            for the pre-registered decision this exists to test.
         """
         self.histories = histories
         self.initial_capital = float(initial_capital)
@@ -88,6 +105,8 @@ class PortfolioBacktester:
         self.cash_yield_annual = float(cash_yield_annual)
         self.execution_model = str(execution_model)
         self.cash_yield_series = cash_yield_series
+        self.book_vol_target = float(book_vol_target)
+        self.vol_target_lookback = int(vol_target_lookback)
 
         if self.execution_model not in {"next_open", "close_to_close"}:
             raise ValueError(
@@ -175,6 +194,27 @@ class PortfolioBacktester:
         views = select_decorrelated_views(views, sliced_histories)
         return compose_book(target_weights(views), trend_states)
 
+    def _vol_target_scale(self, realised_returns: List[float]) -> float:
+        """Scale factor applied to every target weight when book_vol_target
+        is set: min(1, target / realised), never leverages up.
+
+        `realised_returns` is this SAME backtest's own portfolio return
+        history up to (not including) the current decision — already fully
+        causal, so no separate lookback slicing of raw prices is needed
+        here. Returns 1.0 (no scaling) until enough history exists, and
+        whenever realised vol is degenerate (zero/undefined), so a cold
+        start or a dead-flat window never manufactures leverage.
+        """
+        if self.book_vol_target <= 0:
+            return 1.0
+        if len(realised_returns) < self.vol_target_lookback:
+            return 1.0
+        window = np.asarray(realised_returns[-self.vol_target_lookback:], dtype=float)
+        realised_vol = float(window.std(ddof=1)) * (252.0 ** 0.5)
+        if not realised_vol > 0:
+            return 1.0
+        return min(1.0, self.book_vol_target / realised_vol)
+
     def run(
         self,
         start_date: Optional[pd.Timestamp] = None,
@@ -215,6 +255,9 @@ class PortfolioBacktester:
             current_date = idx[i]
 
             weights = self.compute_daily_targets(decision_date)
+            vol_scale = self._vol_target_scale(portfolio_returns)
+            if vol_scale != 1.0:
+                weights = {k: v * vol_scale for k, v in weights.items()}
             turnover = self._calculate_turnover(previous_weights, weights)
             turnover_cost = turnover * self.transaction_cost_bps / 10_000.0
             slippage_cost = turnover * self.slippage_bps / 10_000.0
@@ -309,5 +352,7 @@ class PortfolioBacktester:
                 "core_scale": core_scale(),
                 "sleeves": [s.get("ticker") for s in sleeve_definitions()],
                 "execution_model": self.execution_model,
+                "book_vol_target": self.book_vol_target,
+                "vol_target_lookback": self.vol_target_lookback,
             },
         )

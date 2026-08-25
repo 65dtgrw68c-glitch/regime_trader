@@ -2,18 +2,26 @@
 against the frozen holdout, per the accept/reject rule fixed BEFORE this
 script ran (preregistration_2026-08-24_book_vol_target.md).
 
-Do not change the candidate (target_vol, lookback) or the accept/reject
-thresholds in this file to match a result — that would defeat the entire
-point of pre-registering them first. If the candidate is rejected, that is
-the answer; write it up, don't retune and rerun.
+Do not change the accept/reject thresholds in this file to match a result —
+that would defeat the entire point of pre-registering them first. If a
+candidate is rejected, that is the answer; write it up, don't retune the
+bar and rerun.
 
-    python scripts/vol_target_holdout_eval.py
+    python scripts/vol_target_holdout_eval.py               # pre-reg #1, 20%
+    python scripts/vol_target_holdout_eval.py --target 0.12 # pre-reg #2, 12%
+
+`--target` exists so a SEPARATELY pre-registered candidate can be run
+against the same unchanged rule (see
+preregistration_2026-08-25_tighter_vol_target.md). It is not a sweep knob:
+running a range of targets here and keeping whichever one passes is exactly
+the in-sample selection this whole exercise exists to prevent.
 
 Data: Yahoo adjusted parquet under data_cache/yahoo/ (same source as
 scripts/reproduce_headline.py).
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -28,8 +36,10 @@ from settings import config                                 # noqa: E402
 CACHE = Path(__file__).resolve().parents[1] / "data_cache" / "yahoo"
 TICKERS = ["SPY", "QQQ", "GLD", "IEF", "QLD"]
 
-# --- pre-registered candidate — do not tune against the result below -------
-TARGET_VOL = 0.20
+# --- pre-registered candidates ---------------------------------------------
+# 0.20: preregistration_2026-08-24_book_vol_target.md (default)
+# 0.12: preregistration_2026-08-25_tighter_vol_target.md (--target 0.12)
+DEFAULT_TARGET_VOL = 0.20
 VOL_LOOKBACK = 21
 # --- pre-registered accept/reject rule --------------------------------------
 MAX_SHARPE_GIVEUP = 0.05
@@ -59,6 +69,16 @@ def stats(r: pd.Series) -> dict[str, float]:
 
 
 def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--target", type=float, default=DEFAULT_TARGET_VOL,
+        help="pre-registered book_vol_target to evaluate (default 0.20)",
+    )
+    args = ap.parse_args(argv)
+    target_vol = float(args.target)
+
     px = load(TICKERS)
     tbill_path = CACHE / "TBILL.parquet"
     tbill = pd.read_parquet(tbill_path)["y"]
@@ -82,7 +102,7 @@ def main(argv=None) -> int:
     # both shift the effective simulation start (H3) and rob the vol-target's
     # own lookback of pre-holdout history to warm up on.
     baseline_full = run(0.0)
-    candidate_full = run(TARGET_VOL)
+    candidate_full = run(target_vol)
 
     holdout_start = pd.Timestamp(config.HOLDOUT_START)
     baseline = baseline_full[baseline_full.index >= holdout_start]
@@ -95,9 +115,13 @@ def main(argv=None) -> int:
     c = stats(candidate)
 
     print("=" * 78)
-    print("vol_target_holdout_eval.py — preregistration_2026-08-24_book_vol_target.md")
+    prereg = {
+        0.20: "preregistration_2026-08-24_book_vol_target.md",
+        0.12: "preregistration_2026-08-25_tighter_vol_target.md",
+    }.get(round(target_vol, 4), "NO PRE-REGISTRATION ON FILE FOR THIS TARGET")
+    print(f"vol_target_holdout_eval.py — {prereg}")
     print("=" * 78)
-    print(f"candidate      book_vol_target={TARGET_VOL:.0%}  lookback={VOL_LOOKBACK}d")
+    print(f"candidate      book_vol_target={target_vol:.0%}  lookback={VOL_LOOKBACK}d")
     print(f"holdout        {config.HOLDOUT_START} .. today "
           f"({baseline.index[0].date()} .. {baseline.index[-1].date()}, {len(baseline)} bars)")
     print(f"costs          {slippage_bps:.1f} bp slippage + {commission_bps:.1f} bp commission")

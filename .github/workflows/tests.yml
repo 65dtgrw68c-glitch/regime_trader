@@ -31,8 +31,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Test-time deps only — enough to import and exercise the modules.
-          pip install numpy pandas scikit-learn hmmlearn pytest pytest-cov
+          # Installed from the pinned manifest, not a hand-picked subset —
+          # a hardcoded list here previously omitted alpaca-py, pyarrow,
+          # requests and python-dotenv, so the parquet cache path and the
+          # Alpaca request construction were never exercised in CI.
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: |
+          ruff check .
 
       - name: Run test suite
         run: |

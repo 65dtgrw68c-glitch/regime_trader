@@ -455,6 +455,32 @@ BACKTEST = {
 }
 
 # ---------------------------------------------------------------------------
+# Frozen holdout — set 2026-08-24, Phase 0 of that audit's remediation plan
+# ---------------------------------------------------------------------------
+# core_scale/sleeve weight (SLEEVES above), cb_max_drawdown_halt and every
+# class/gross cap in RISK were all chosen by looking at performance over the
+# FULL history back to 2007. That is fine for picking a structure once, but
+# it means the full history can no longer tell you whether a NEW change
+# (e.g. the Section-F book-level vol-target candidate) generalises or was
+# just fit to what's already been seen — the two questions need different
+# data.
+#
+# HOLDOUT_START marks the boundary: every date >= this is off-limits for
+# choosing or justifying a parameter, threshold, or structural change. It
+# may be used only to evaluate a change that was fully specified (formula,
+# parameter values, accept/reject rule) BEFORE looking at data in this
+# window — i.e. this can confirm or reject a candidate, never help select
+# one. Chosen to include both 2022 (a slow bear) and the 2025-02..05 tariff
+# shock (a fast one), the two crisis shapes the book behaves most
+# differently under (Section D of the audit).
+#
+# This is a policy marker, not an enforced code path — no function filters
+# on it today. It exists so future analysis scripts have one place to read
+# the boundary from, and so a report that touches this window without
+# saying why is a visible policy violation, not just an omission.
+HOLDOUT_START = "2021-01-01"
+
+# ---------------------------------------------------------------------------
 # Monitoring intervals
 # ---------------------------------------------------------------------------
 MONITORING = {

@@ -4,7 +4,7 @@ import logging
 import math
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from broker.base import is_non_transient_error

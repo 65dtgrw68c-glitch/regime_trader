@@ -1,0 +1,8 @@
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# E/F: pycodestyle + pyflakes — real bugs (unused imports/vars, undefined
+# names, syntax issues) and basic style, not a full reformat of a codebase
+# that predates this config. Widen deliberately, not by accident.
+select = ["E", "F"]

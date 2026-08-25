@@ -72,7 +72,8 @@ def _stub_alpaca(monkeypatch):
     requests.ReplaceOrderRequest = _Req
 
     class OrderSide:
-        BUY = "buy"; SELL = "sell"
+        BUY = "buy"
+        SELL = "sell"
     class TimeInForce:
         DAY = "day"
     enums.OrderSide = OrderSide

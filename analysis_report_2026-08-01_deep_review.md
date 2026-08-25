@@ -608,3 +608,20 @@ klarer Verlust. Damit ist diese Idee jetzt eine abgeschlossene, getestete
 Entscheidung — nicht mehr offene "schwache Evidenz". Der Tail-Risiko-Vorbehalt
 (schnelle Crashs) bleibt unverändert bestehen; ein Vol-Gate ist nicht die
 Lösung dafür.
+
+---
+
+## Nachtrag 2026-08-24 — Reproduzierbarkeit der 13,66%-Zahl (Befund H3)
+
+Der Vollaudit vom 2026-08-24 hat bemängelt, dass für dasselbe Buch mehrere
+CAGR-Zahlen im Repo kursieren (hier 13,66%, `analysis_report_2026-08-13_rendite.md`
+12,95%) ohne festgeschriebenes Reproduktionsskript. Beide Zahlen sind korrekt —
+sie messen unterschiedliche Zeitfenster, wie der 08-13-Report selbst bereits
+dokumentiert hatte. Die 13,66% oben (Span 2007-04-10 … 2026-08-10, per
+`scripts/sleeve_check.py`) sind die **kanonische** Zahl: der natürliche Beginn
+des gemeinsamen Datenindex nach dem 200-Bar-SMA-Warmup, ohne künstlichen
+`start_date`-Clip. `scripts/reproduce_headline.py` (neu) reproduziert sie jetzt
+direkt aus `core/portfolio_backtester.py` mit Commit-Hash, Datenstand-Hash,
+Span und Kostenzeile im Output: aktuell 13,67% CAGR / Sharpe 0,86 / maxDD
+−24,76% (die 1bp CAGR-Differenz zur hier dokumentierten Zahl liegt innerhalb
+normaler Datenrevision seit 2026-08-01, keine Regressionsursache).

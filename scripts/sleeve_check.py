@@ -204,7 +204,9 @@ def validate_against_production(px: dict, tbill: pd.Series, trade: str) -> int:
     c2, _, s2, d2 = stats(pr)
     print(f"{'Delta':<14}{c2-c1:>+9.2%}{'':>8}{s2-s1:>+8.2f}{d2-d1:>+9.2%}")
     ok = abs(c2 - c1) < 0.005 and abs(d2 - d1) < 0.01
-    print(f"\n{'OK — Abweichung im erwarteten Bereich (Intra-Bar-Verkettung)' if ok else 'WARNUNG — Abweichung zu gross, Verdrahtung pruefen'}")
+    verdict = ("OK — Abweichung im erwarteten Bereich (Intra-Bar-Verkettung)"
+               if ok else "WARNUNG — Abweichung zu gross, Verdrahtung pruefen")
+    print(f"\n{verdict}")
     return 0 if ok else 1
 
 

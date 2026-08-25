@@ -512,3 +512,31 @@ zweiten Aufruf).
 
 Alle 434 Tests grün, 1 vorbestehend übersprungen (`pytest -q`). Nichts von alledem berührt SMA-200, Vol-Target,
 Breaker-Schwellen, 60/40 oder das Universum.
+
+---
+
+## Nachtrag 2026-08-24 — 12,95% ist nicht die kanonische CAGR-Zahl (Befund H3)
+
+Der Vollaudit vom 2026-08-24 listet die 12,95% CAGR oben neben den 13,66%
+aus `analysis_report_2026-08-01_deep_review.md` als unreproduzierbaren
+Widerspruch und vermutet unterschiedliche Kostenannahmen (10 bp statt 2 bp)
+als Ursache. Beide Berichte rechneten tatsächlich mit denselben 2 bp — die
+Vermutung ist falsch. Die Kopfzeile dieses Reports (Zeile 9-11) hatte den
+echten Grund schon benannt: dieser Report spannte absichtlich ab
+**2007-01-03** statt dem natürlichen Indexbeginn 2007-04-10, um einen
+Kalenderdatum-Anker für den Varianten-Vergleich in diesem Dokument zu haben.
+Nachgerechnet mit `core/portfolio_backtester.py`:
+
+| Span-Wahl | Bars | CAGR |
+|---|---:|---:|
+| natürlicher Start (2007-04-10) | 4865 | 13,67% |
+| `start_date="2007-01-03"` (effektiv ab 2007-10-18) | 4731 | 12,99% |
+
+4731 Bars trifft die hier dokumentierten "4731 Bars nach SMA-Warmup" exakt;
+12,99% liegt 4bp über den hier publizierten 12,95% — innerhalb normaler
+Datenrevision, keine zusätzliche, unerklärte Lücke. Die **kanonische** Zahl
+für das Buch ist die 13,66-13,67%-Reihe (natürlicher Span, keine
+`start_date`-Clip), ab jetzt reproduzierbar über `scripts/reproduce_headline.py`.
+Die 12,95% in diesem Report bleiben intern für die Varianten-Tabellen gültig
+(alle Vergleiche darin nutzen denselben geclippten Span, also denselben
+Maßstab), sollten aber nicht als das Buch-Headline-CAGR zitiert werden.

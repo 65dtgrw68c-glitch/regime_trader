@@ -5,7 +5,6 @@ Run with:  pytest tests/test_hmm.py -v
 """
 
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +18,6 @@ from core.feature_engineering import FeatureEngineer
 from core.hmm_engine import (
     HMMEngine,
     _CONFIRM_BARS,
-    _FLICKER_LIMIT,
     _FLICKER_WINDOW,
     _LABEL_MAPS,
     _MAX_COMPONENTS,

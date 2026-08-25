@@ -59,7 +59,7 @@ from core.regime_strategies import (
     realised_vol_from_close,
     shares_for_target_weight,
 )
-from core.risk_manager import CBLevel, RiskManager
+from core.risk_manager import RiskManager
 from settings import config
 
 logger = logging.getLogger(__name__)

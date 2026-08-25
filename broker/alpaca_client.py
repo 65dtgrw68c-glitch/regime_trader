@@ -65,7 +65,10 @@ def with_retry(max_retries: int = 3, delay: float = 1.0):
                         )
                         raise
                     last_exc = exc
-                    logger.warning("API Call %s fehlgeschlagen (Versuch %d/%d): %s", func.__name__, attempt, max_retries, exc)
+                    logger.warning(
+                        "API Call %s fehlgeschlagen (Versuch %d/%d): %s",
+                        func.__name__, attempt, max_retries, exc,
+                    )
                     if attempt < max_retries:
                         # +/-20% jitter so concurrent callers hitting the
                         # same transient error don't retry in lockstep.

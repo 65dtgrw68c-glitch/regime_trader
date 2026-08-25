@@ -28,7 +28,7 @@ import os
 import random
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -46,7 +46,7 @@ from core.regime_strategies import (
 from core.risk_manager import CBLevel, RiskManager
 from broker.base import is_non_transient_error
 from monitoring.alerts import AlertManager, SEVERITY_CRITICAL, SEVERITY_WARNING
-from monitoring.logger import configure_logging, get_logger, TradeLogger
+from monitoring.logger import configure_logging, TradeLogger
 from settings import config
 
 logger = logging.getLogger(__name__)

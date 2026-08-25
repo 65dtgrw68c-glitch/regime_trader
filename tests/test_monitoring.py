@@ -19,7 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from monitoring.alerts import (
-    AlertManager, SEVERITY_CRITICAL, SEVERITY_WARNING,
+    AlertManager, SEVERITY_CRITICAL,
 )
 from monitoring.logger import TradeLogger
 from monitoring import dashboard as dash

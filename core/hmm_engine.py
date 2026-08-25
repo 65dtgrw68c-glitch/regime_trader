@@ -378,7 +378,6 @@ class HMMEngine:
         (n_components,) log-alpha for the current bar.
         """
         model = self._model
-        k     = model.n_components
         log_transmat = np.log(model.transmat_ + 1e-300)
 
         # Emission log-probability for each state given obs

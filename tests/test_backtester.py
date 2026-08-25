@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.backtester import Backtester, BacktestResult, WalkForwardSplit
+from core.backtester import Backtester, BacktestResult
 from core.performance import (
     PerformanceAnalyser,
     annualised_return,

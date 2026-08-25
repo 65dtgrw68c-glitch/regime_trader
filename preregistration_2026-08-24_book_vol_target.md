@@ -125,4 +125,56 @@ pre-registration explicitly deferred to "if accepted" and did not do here.
 
 **Not done as part of this evaluation, deliberately out of scope per the rule above:**
 turning `book_vol_target` on in the deployed live config; re-running the dotcom
-reconstruction against this implementation; resetting the HALT threshold.
+reconstruction against this implementation; resetting the HALT threshold. The dotcom
+re-run is done separately below.
+
+---
+
+## Dotcom re-validation — 2026-08-24, `scripts/dotcom_reconstruction.py`
+
+This is not part of the accept/reject rule above (that rule only covers the frozen
+holdout) — it is a separate check of the audit's finding K1, which cited a
+reconstructed dotcom scenario, not the holdout, as the actual justification for this
+candidate. The audit's own dotcom numbers came from a scratchpad script this repo does
+not have, so they were re-derived independently, against the real shipped
+`core.portfolio_backtester.PortfolioBacktester` (same `compute_daily_targets` and
+`_vol_target_scale` as everywhere else in this session), not copied.
+
+**Calibration check (confirms the reconstruction, not the candidate):** a synthetic
+QLD built as `2×QQQ − 3.19%/yr drag` (fit from the real QQQ/QLD overlap, independent of
+the audit's quoted 3.27%/yr) reproduces real QLD's 2006-2026 CAGR almost exactly
+(25.34% vs 25.34%) and maxDD closely (−82.60% vs −83.13%). The baseline (no vol-target)
+book maxDD in the reconstruction is −52.22%, matching the audit's quoted −52.1%, and
+the HALT does fire (2000-07-28) — both consistent with the original finding.
+
+**The candidate's claim does not hold up.** The audit stated `book_vol_target=0.20`
+keeps the reconstructed book's drawdown at −34.7% and the HALT does not fire. Re-run
+here: maxDD −41.58%, **HALT still fires** (2002-12-04, ~2.4 years later than baseline,
+not prevented). A full sweep for context (informational only — these were not
+pre-registered or tested against the holdout, and picking one after seeing this table
+would be exactly the in-sample selection this whole exercise exists to avoid):
+
+| target_vol | CAGR | Sharpe | maxDD | HALT fires? |
+|---:|---:|---:|---:|---|
+| 0% (baseline) | 9.56% | 0.61 | −52.22% | YES 2000-07-28 |
+| 10% | 8.22% | 0.70 | −29.10% | no |
+| 12% | 8.65% | 0.69 | −32.41% | no |
+| 15% | 9.11% | 0.68 | −36.77% | YES 2003-01-17 |
+| **20% (accepted candidate)** | **9.49%** | **0.66** | **−41.58%** | **YES 2002-12-04** |
+| 25% | 9.77% | 0.65 | −45.04% | YES 2001-12-31 |
+| 30% | 9.85% | 0.65 | −47.22% | YES 2001-12-20 |
+
+Only ~10-12% targets keep the reconstructed book under the existing 35% HALT threshold
+— roughly half the 20% level this candidate was pre-registered and holdout-tested at.
+
+**Net assessment.** `book_vol_target=0.20` is not nothing: it cuts the dotcom-scenario
+maxDD by ~11 points (−52% → −42%), the calendar-2000 loss from −17.9% to −13.2%, and
+delays the HALT by over two years. But it does not deliver the specific "HALT no
+longer fires" result the original K1 finding used to justify itself, at least not in
+this independent reconstruction. Two things follow: (1) K1 remains only partially
+addressed by the accepted candidate — the sleeve's dotcom-scenario tail risk is smaller
+with vol-targeting on, not solved; (2) a tighter target (~10-12%) is a DIFFERENT,
+untested candidate — it has not been pre-registered or run against the 2021-2026
+holdout, so it must not be treated as validated just because it happens to clear the
+HALT in this one reconstruction. Resetting `cb_max_drawdown_halt` on the strength of
+the 20% candidate alone is not supported by this data.

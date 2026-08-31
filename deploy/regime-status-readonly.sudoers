@@ -1,0 +1,1 @@
+ubuntu ALL=(regime) NOPASSWD: /opt/regime_trader/deploy/ssh_status_dispatch.sh

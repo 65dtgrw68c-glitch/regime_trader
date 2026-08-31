@@ -1,0 +1,1 @@
+command="sudo -n -u regime /opt/regime_trader/deploy/ssh_status_dispatch.sh \"$SSH_ORIGINAL_COMMAND\"",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILYvDS8WxEEauSXcTI5Ki+Blq6aWTU7UDxdwuJQG9eGX codespace-status-readonly

@@ -166,8 +166,15 @@ def validate_against_production(px: dict, tbill: pd.Series, trade: str) -> int:
         common = df.index if common is None else common.intersection(df.index)
     aligned = {s: df.loc[common] for s, df in px.items()}
 
+    # book_vol_target pinned OFF: this script validates the production
+    # weight construction against an independent core+sleeve reference that
+    # has no vol-target term, and its published 2007-2026 numbers (quoted in
+    # config.py's SLEEVES and cb_max_drawdown_halt comments) were produced
+    # before the 2026-08-31 vol target existed.  Leaving it at the deployed
+    # default would compare two different books and report the difference as
+    # a wiring fault.
     bt = PortfolioBacktester(histories=aligned, slippage_bps=SLIP_BPS,
-                             cash_yield_series=tbill)
+                             cash_yield_series=tbill, book_vol_target=0.0)
     prod = bt.run()
 
     r_core, _ = core_book_returns(aligned, tbill)

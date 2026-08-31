@@ -25,7 +25,8 @@ position that is in the book on purpose.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Mapping, Optional
+import math
+from typing import Dict, Mapping, Optional, Sequence
 
 from settings import config
 
@@ -77,6 +78,61 @@ def sleeve_weights(trend_states: Mapping[str, Optional[bool]]) -> Dict[str, floa
         if weight > 0:
             out[spec["ticker"]] = out.get(spec["ticker"], 0.0) + weight
     return out
+
+
+def book_vol_target() -> float:
+    """Configured annualised book vol target (0.0 = mechanism off)."""
+    cfg = getattr(config, "BOOK_VOL_TARGET", {}) or {}
+    return max(0.0, float(cfg.get("target", 0.0)))
+
+
+def vol_target_lookback() -> int:
+    """Trading days of the book's own returns used to estimate realised vol."""
+    cfg = getattr(config, "BOOK_VOL_TARGET", {}) or {}
+    return max(1, int(cfg.get("lookback", 21)))
+
+
+def vol_target_scale(
+    realised_returns: Sequence[float],
+    target: Optional[float] = None,
+    lookback: Optional[int] = None,
+) -> float:
+    """Scale applied to every target weight: min(1, target / realised_vol).
+
+    `realised_returns` is the BOOK's own trailing daily return history, most
+    recent last, up to but NOT including the bar being decided — so the scale
+    is causal by construction, in the backtest and live alike.
+
+    Returns 1.0 (no scaling) when the mechanism is off, when fewer than
+    `lookback` returns exist, and whenever realised vol is degenerate
+    (zero/undefined) — a cold start or a dead-flat window must never
+    manufacture leverage.
+
+    This lives here, next to compose_book(), for the same reason compose_book()
+    does: main.py (live) and core/portfolio_backtester.py (evaluation) must
+    scale the book with ONE piece of code.  The 2026-08-01 review found the
+    live path had silently diverged from the validated one; a vol target that
+    existed only in the backtester would have been that same bug, pre-shipped.
+    """
+    tgt = book_vol_target() if target is None else max(0.0, float(target))
+    if tgt <= 0:
+        return 1.0
+
+    window_n = vol_target_lookback() if lookback is None else max(1, int(lookback))
+    if len(realised_returns) < window_n:
+        return 1.0
+
+    window = [float(x) for x in realised_returns[-window_n:]]
+    if len(window) < 2:
+        return 1.0
+
+    mean = sum(window) / len(window)
+    var = sum((x - mean) ** 2 for x in window) / (len(window) - 1)   # ddof=1
+    realised_vol = math.sqrt(var) * math.sqrt(252.0)
+    if not realised_vol > 0:
+        return 1.0
+
+    return min(1.0, tgt / realised_vol)
 
 
 def compose_book(

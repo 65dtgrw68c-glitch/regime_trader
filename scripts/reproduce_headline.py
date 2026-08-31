@@ -106,6 +106,16 @@ def main(argv=None) -> int:
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--refresh", action="store_true",
                      help="re-fetch Yahoo data before running")
+    ap.add_argument(
+        "--book-vol-target", type=float, default=None, metavar="X",
+        help="override settings.config.BOOK_VOL_TARGET for this run. "
+             "Default: the DEPLOYED value, i.e. the book that actually "
+             "trades. Pass 0 to reproduce the pre-2026-08-31 headline "
+             "(the same book without the vol target) — the only comparison "
+             "this flag exists for. It is not a sweep knob: scanning "
+             "targets here and keeping the best is exactly the in-sample "
+             "selection the frozen holdout exists to prevent.",
+    )
     args = ap.parse_args(argv)
 
     if args.refresh:
@@ -126,6 +136,7 @@ def main(argv=None) -> int:
         transaction_cost_bps=commission_bps,
         slippage_bps=slippage_bps,
         cash_yield_series=tbill,
+        book_vol_target=args.book_vol_target,   # None = the deployed value
     )
     result = bt.run()
     r = result.returns
@@ -150,6 +161,10 @@ def main(argv=None) -> int:
           f"(source={result.metadata.get('cash_yield_source')})")
     print(f"book           core_scale={result.metadata.get('core_scale')}  "
           f"sleeves={result.metadata.get('sleeves')}")
+    _vt = float(result.metadata.get("book_vol_target", 0.0) or 0.0)
+    print(f"vol target     {_vt:.0%} annualised over "
+          f"{result.metadata.get('vol_target_lookback')} bars"
+          if _vt > 0 else "vol target     off")
     print("-" * 72)
     print(f"CAGR           {m['cagr']:.2%}")
     print(f"Vol            {m['vol']:.2%}")

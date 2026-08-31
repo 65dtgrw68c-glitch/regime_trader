@@ -1407,3 +1407,78 @@ class TestCrashDuringRebalanceRecovery:
                                     client_order_id="rt-AAA-2026-08-25-buy-25.0000")
         assert recovered == "oid-1", "live order was dropped instead of recovered"
         assert len(broker.submitted) == 1
+
+
+# ---------------------------------------------------------------------------
+# Book vol target in the LIVE path (owner decision 2026-08-31, finding K1)
+# ---------------------------------------------------------------------------
+
+class TestLiveBookVolTarget:
+    """settings.config.BOOK_VOL_TARGET must actually reach the submitted book.
+
+    Before 2026-08-31 the vol target existed only inside
+    core/portfolio_backtester.py, explicitly documented as "an evaluation
+    knob, not a deployed one". Adopting it means the live loop applies it too
+    — these tests are what make that true rather than intended.
+    """
+
+    def _feed_returns(self, sys_, returns):
+        equity = 100_000.0
+        sys_._risk.end_of_day(equity)
+        for r in returns:
+            equity *= 1.0 + r
+            sys_._risk.end_of_day(equity)
+
+    def test_quiet_book_is_not_scaled(self, tmp_path):
+        sys_ = _make_system(tmp_path)
+        assert sys_.startup() is True
+        self._feed_returns(sys_, [0.0002, -0.0002] * 20)
+
+        assert sys_._risk.book_vol_scale() == 1.0
+
+    def test_volatile_book_is_scaled_down_before_submission(self, tmp_path, monkeypatch):
+        sys_ = _make_system(tmp_path)
+        assert sys_.startup() is True
+
+        from core import sleeves
+
+        monkeypatch.setattr(
+            sleeves, "compose_book", lambda core, trends: {"AAA": 0.80},
+        )
+        self._feed_returns(sys_, [0.03, -0.03] * 20)   # ~48% annualised
+
+        scale = sys_._risk.book_vol_scale()
+        assert 0.0 < scale < 1.0
+
+        book = sys_._compute_live_target_book()
+        assert book["AAA"] == pytest.approx(0.80 * scale)
+
+    def test_cold_start_ships_the_unscaled_book(self, tmp_path, monkeypatch):
+        """Matches the backtester's own cold start: no window, no scaling."""
+        sys_ = _make_system(tmp_path)
+        assert sys_.startup() is True
+
+        from core import sleeves
+
+        monkeypatch.setattr(
+            sleeves, "compose_book", lambda core, trends: {"AAA": 0.80},
+        )
+        assert sys_._risk.book_vol_scale() == 1.0
+        assert sys_._compute_live_target_book()["AAA"] == pytest.approx(0.80)
+
+    def test_scaling_lowers_gross_exposure_the_risk_layer_sees(self, tmp_path, monkeypatch):
+        """The scale is applied BEFORE validate_book, so risk validates the
+        book that is actually submitted — not a larger one."""
+        sys_ = _make_system(tmp_path)
+        assert sys_.startup() is True
+
+        from core import sleeves
+
+        monkeypatch.setattr(
+            sleeves, "compose_book", lambda core, trends: {"AAA": 0.60, "BBB": 0.40},
+        )
+        self._feed_returns(sys_, [0.03, -0.03] * 20)
+
+        book = sys_._compute_live_target_book()
+        gross = sum(abs(w) for w in book.values())
+        assert gross < 1.0 - 1e-9

@@ -32,6 +32,18 @@ Abschnitt J.
 > geschlossen (Commits `63fb0ad`, `e4cac23`, `99f6690`) — siehe die jeweiligen
 > Commit-Messages für den genauen Fix. Diese Datei ist als historisches Dokument
 > unverändert belassen; der aktuelle Stand steht im Git-Log, nicht hier.
+>
+> **Korrektur 2026-08-31: K1 war am 24./25.08. NICHT geschlossen.** Die Zeile oben
+> war falsch. Gemessen und dokumentiert wurde K1 damals (drei Pre-Registrierungen,
+> `analysis_report_2026-08-25_k1_options.md`), entschieden wurde nichts — der Memo
+> schloss selbst mit „Status of K1: **Open**", und `book_vol_target` blieb `0.0`.
+> Geschlossen ist K1 seit 2026-08-31 mit `BOOK_VOL_TARGET = 0.12`, live verdrahtet
+> und nicht mehr nur im Backtester: siehe `decision_2026-08-31_k1_book_vol_target.md`.
+> Die in K1 unten vorgeschlagene Lösung (Buch-Vol-Target) ist damit umgesetzt; die
+> zweite Hälfte des Vorschlags — „HALT-Schwelle gegen die rekonstruierte Historie neu
+> setzen" — wurde bewusst NICHT umgesetzt: eine Schwelle, die auf ~60 % angehoben
+> wird, damit das aktuelle Buch darunter passt, ist keine Absicherung mehr, sondern
+> deren Abschaffung (Option E im Memo).
 
 ---
 

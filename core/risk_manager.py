@@ -33,6 +33,7 @@ from typing import Mapping, Optional
 
 import numpy as np
 
+from core import sleeves
 from settings import config
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,16 @@ class RiskManager:
         self._current_equity:   Optional[float] = None
         # Rolling history of daily-close equities for the weekly breaker
         self._equity_history:   list[float] = []
+        # Rolling history of daily BOOK RETURNS, feeding the book vol target
+        # (core.sleeves.vol_target_scale).  Deliberately SEPARATE from
+        # _equity_history: that list is the weekly breaker's baseline and is
+        # wiped by clear_halt(), whereas the realised-vol estimate must
+        # survive a halt clear.  Resuming after a crash with an empty vol
+        # window would run the book at FULL exposure for a whole lookback
+        # period, starting on the most volatile day in years — the exact
+        # opposite of what the target is for.
+        self._book_returns:     list[float] = []
+        self._last_eod_equity:  Optional[float] = None
 
         # ── Circuit-breaker state ────────────────────────────────────────
         self._cb_level: CBLevel = CBLevel.NONE
@@ -178,8 +189,20 @@ class RiskManager:
             self._equity_history = [
                 float(x) for x in history if isinstance(x, (int, float))
             ]
-        logger.info("Restored risk state: peak_equity=%.2f, %d daily closes.",
-                    self._peak_equity or 0.0, len(self._equity_history))
+        book_returns = data.get("book_returns")
+        if isinstance(book_returns, list):
+            self._book_returns = [
+                float(x) for x in book_returns if isinstance(x, (int, float))
+            ]
+        last_eod = data.get("last_eod_equity")
+        if isinstance(last_eod, (int, float)) and last_eod > 0:
+            self._last_eod_equity = float(last_eod)
+        logger.info(
+            "Restored risk state: peak_equity=%.2f, %d daily closes, "
+            "%d book returns.",
+            self._peak_equity or 0.0, len(self._equity_history),
+            len(self._book_returns),
+        )
 
     def _save_state(self) -> None:
         """Persist peak equity + daily-close history (best effort, never fatal)."""
@@ -191,6 +214,8 @@ class RiskManager:
             tmp.write_text(json.dumps({
                 "peak_equity": self._peak_equity,
                 "equity_history": self._equity_history,
+                "book_returns": self._book_returns,
+                "last_eod_equity": self._last_eod_equity,
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
             }))
             tmp.replace(self._state_path)   # atomic: never leave a torn file
@@ -214,12 +239,62 @@ class RiskManager:
             self._cb_level = CBLevel.NONE
 
     def end_of_day(self, equity: float) -> None:
-        """Record the closing equity for the rolling weekly-loss breaker."""
-        self._equity_history.append(float(equity))
+        """Record the closing equity for the weekly breaker and the book vol
+        target's realised-vol window."""
+        equity = float(equity)
+
+        self._record_book_return(equity)
+
+        self._equity_history.append(equity)
         lookback = self._cfg["weekly_lookback_days"] + 1
         if len(self._equity_history) > lookback:
             self._equity_history = self._equity_history[-lookback:]
         self._save_state()
+
+    # Daily book moves larger than this are treated as a deposit/withdrawal
+    # rather than a market return.  The book is gross-capped at 1.0 and its
+    # most levered holding is 2x, so a genuine one-day move of this size
+    # cannot happen; letting a cash transfer through would poison the
+    # realised-vol estimate for a full lookback window.
+    _MAX_PLAUSIBLE_DAILY_RETURN = 0.50
+
+    def _record_book_return(self, equity: float) -> None:
+        """Append today's book return to the vol-target window."""
+        previous = self._last_eod_equity
+        self._last_eod_equity = equity
+
+        if previous is None or previous <= 0 or equity <= 0:
+            return
+
+        ret = equity / previous - 1.0
+        if abs(ret) > self._MAX_PLAUSIBLE_DAILY_RETURN:
+            logger.warning(
+                "End-of-day equity moved %.1f%% (%.2f -> %.2f) — treating as a "
+                "cash transfer, not a book return, and excluding it from the "
+                "vol-target window.", ret * 100.0, previous, equity,
+            )
+            return
+
+        self._book_returns.append(ret)
+        cap = max(2, sleeves.vol_target_lookback() * 2)
+        if len(self._book_returns) > cap:
+            self._book_returns = self._book_returns[-cap:]
+
+    def book_returns(self) -> list[float]:
+        """Trailing daily book returns, oldest first — the vol-target window.
+
+        Returns a copy: callers must not be able to mutate risk state.
+        """
+        return list(self._book_returns)
+
+    def book_vol_scale(self) -> float:
+        """Scale the live book should be multiplied by, per the vol target.
+
+        Delegates to core.sleeves.vol_target_scale — the SAME function
+        core.portfolio_backtester calls — so the deployed book and every
+        backtested number are produced by one implementation.
+        """
+        return sleeves.vol_target_scale(self._book_returns)
 
     def update_equity(
         self,
@@ -634,6 +709,12 @@ class RiskManager:
             if self._current_equity:
                 self._peak_equity = float(self._current_equity)
             self._equity_history = []
+            # NOTE: _book_returns is deliberately NOT cleared. That list feeds
+            # the book vol target's realised-vol estimate, which is a
+            # statement about market conditions, not about this breaker's
+            # baseline. Wiping it here would resume trading at FULL exposure
+            # for a whole lookback window, starting the day after whatever
+            # crash caused the halt.
             self._save_state()
             logger.info(
                 "Risk lock cleared — peak equity re-anchored to %.2f, "

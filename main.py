@@ -1127,6 +1127,7 @@ class TradingSystem:
         from core.universe import build_views
         from core.selector import select_decorrelated_views
         from core.allocator import target_weights
+        from core import sleeves as sleeves_mod
         from core.sleeves import compose_book
 
         histories = {}
@@ -1143,6 +1144,36 @@ class TradingSystem:
         views = build_views(histories, trend_states)
         selected_views = select_decorrelated_views(views, histories)
         target_book = compose_book(target_weights(selected_views), trend_states)
+
+        # Book-level vol target (settings.config.BOOK_VOL_TARGET, owner
+        # decision 2026-08-31 on finding K1).  Applied HERE, after
+        # compose_book and before validate_book, which is exactly where
+        # core.portfolio_backtester.run() applies it — same function, same
+        # position in the pipeline, so the live book and the backtested book
+        # stay one book.  The scale reads the RiskManager's own trailing
+        # daily book returns; it is 1.0 (no scaling) until that window fills,
+        # matching the backtester's cold start.
+        if self._risk is None:
+            # Only reachable before startup() (tests, direct calls). The live
+            # loop and scripts/reconcile.py both build the book through a
+            # started system, so this must never happen in production —
+            # warn rather than silently ship an unscaled book.
+            logger.warning(
+                "No RiskManager yet — book vol target NOT applied to this "
+                "target book. Expected only before startup()."
+            )
+            vol_scale = 1.0
+        else:
+            vol_scale = self._risk.book_vol_scale()
+
+        if vol_scale != 1.0:
+            target_book = {t: w * vol_scale for t, w in target_book.items()}
+            logger.info(
+                "Book vol target: scaling every weight by %.3f "
+                "(target %.0f%% annualised, %d-day realised window).",
+                vol_scale, sleeves_mod.book_vol_target() * 100.0,
+                sleeves_mod.vol_target_lookback(),
+            )
 
         # Include every live state explicitly. Missing tickers are target zero.
         for asset in self._states:
@@ -1667,6 +1698,10 @@ def run_backtest() -> int:
     print(f"Tickers:        {sorted(histories.keys())}")
     print(f"Core scale:     {result.metadata.get('core_scale')}")
     print(f"Sleeves:        {result.metadata.get('sleeves')}")
+    _vt = float(result.metadata.get("book_vol_target", 0.0) or 0.0)
+    print(f"Book vol target:{_vt:>7.0%} over "
+          f"{result.metadata.get('vol_target_lookback')} bars"
+          if _vt > 0 else "Book vol target: off")
     print(f"Costs:          {bt.transaction_cost_bps + bt.slippage_bps:.1f} bps "
           f"per unit turnover, cash {bt.cash_yield_annual:.2%} p.a.")
     print(f"Initial equity: ${result.initial_capital:,.2f}")

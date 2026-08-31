@@ -106,6 +106,68 @@ SLEEVES = {
 }
 
 # ---------------------------------------------------------------------------
+# Book-level volatility target  (owner decision 2026-08-31, finding K1)
+# ---------------------------------------------------------------------------
+# Scales EVERY target weight of the composed book by
+# min(1, target / realised_vol), where realised_vol is the annualised std of
+# the book's own trailing `lookback` daily returns.  Never leverages up.
+#
+# WHY 0.12, and why this overrides a pre-registered rejection
+# ----------------------------------------------------------
+# This exact candidate was REJECTED on the frozen holdout — it gives up 298 bp
+# of CAGR against a 150 bp limit (preregistration_2026-08-25_tighter_vol_target
+# .md).  That verdict stands and has NOT been retuned.  It is overridden here
+# deliberately, on a measurement the holdout rule never looked at.
+#
+# The holdout rule scores candidates on 2021-2026 CAGR.  That window contains
+# no regime in which this book's -35% HALT fires, so the rule is structurally
+# blind to the one event that dominates the book's long-run return: the HALT
+# is STICKY (RiskManager never re-arms it), so firing it does not mean "a bad
+# year", it means flat forever until a human intervenes.
+#
+# scripts/k1_return_ledger.py prices exactly that, over the 2000-2026
+# reconstruction with the sticky HALT applied (terminal wealth, 26 years):
+#
+#   sleeve 40%, no vol-target (was deployed)  halts 2000-07-28   0.82x capital
+#   sleeve 40%, vol-target 20%                halts 2002-12-04   0.72x capital
+#   sleeve 30% + vol-target 20%               halts 2003-01-17   0.72x capital
+#   sleeve 20%                                halts 2003-01-17   0.76x capital
+#   sleeve 10%                                never halts        6.51x capital
+#   sleeve 0% (core only)                     never halts        5.19x capital
+#   sleeve 40%, vol-target 12%   <- THIS      never halts        9.04x capital
+#
+# Every configuration that halts ends 26 years UNDER water.  Among the three
+# that survive, 0.12 keeps the most holdout return (14.92% CAGR vs 12.16% at
+# sleeve 10% and 10.15% core-only) AND the most reconstructed terminal wealth.
+# It is the return-maximising choice on both windows at once — the 298 bp
+# holdout give-up buys an 11x difference in the tail.
+#
+# Note the ordering this exposes: vol-target 20% and the sleeve cuts are all
+# WORSE than doing nothing on the reconstruction.  They soften the drawdown
+# without preventing the breach, so the HALT fires later and at a lower equity
+# level.  Partial mitigation of a sticky breaker is not partial protection.
+#
+# KNOWN FRAGILITY, stated plainly: 0.12 clears the -35% HALT with 2.6 pp of
+# margin (reconstructed maxDD -32.41%).  That margin rests on a MODEL — QLD
+# before 2006-06 is synthetic (2x QQQ less 3.19%/yr drag, fit from the real
+# overlap).  If the real tail were ~3 pp deeper than the reconstruction, this
+# configuration halts too and lands with the 0.7-0.8x rows.  This is a
+# materially better bet than the alternatives, not a guarantee.
+#
+# Do NOT re-optimise this number by scanning targets until one looks best.
+# 0.12 was specified and rejected BEFORE this ledger was computed, which is
+# the only reason it can be adopted on the ledger's evidence without that
+# being selection.  Same rule as SLEEVES above.
+BOOK_VOL_TARGET = {
+    # Annualised target vol for the whole book. 0.0 disables the mechanism
+    # entirely (the pre-2026-08-31 behaviour).
+    "target": 0.12,
+    # Trading days of the book's OWN realised returns used to estimate vol.
+    # 21 is carried over unchanged from all three pre-registrations.
+    "lookback": 21,
+}
+
+# ---------------------------------------------------------------------------
 # Broker / Alpaca settings
 # ---------------------------------------------------------------------------
 BROKER = {

@@ -631,3 +631,125 @@ class TestEconomicExposureCap:
     def test_unlevered_book_is_unaffected(self, tmp_path):
         v = self._rm(tmp_path).validate_book({"SPY": 0.5, "GLD": 0.2})
         assert v.approved, v.reason
+
+
+# ---------------------------------------------------------------------------
+# Book vol target — the realised-vol window that feeds
+# core.sleeves.vol_target_scale (owner decision 2026-08-31, finding K1)
+# ---------------------------------------------------------------------------
+
+class TestBookReturnWindow:
+
+    def test_end_of_day_records_book_returns(self, rm):
+        rm.start_new_day(100_000.0)
+        rm.end_of_day(100_000.0)
+        rm.end_of_day(101_000.0)
+        rm.end_of_day(99_990.0)
+
+        returns = rm.book_returns()
+        assert len(returns) == 2
+        assert returns[0] == pytest.approx(0.01)
+        assert returns[1] == pytest.approx(99_990.0 / 101_000.0 - 1.0)
+
+    def test_first_close_produces_no_return(self, rm):
+        rm.end_of_day(100_000.0)
+        assert rm.book_returns() == []
+
+    def test_window_outlives_the_weekly_breaker_history(self, rm):
+        """The weekly breaker keeps 6 closes; the vol target needs 21 returns.
+
+        Before 2026-08-31 end_of_day() trimmed to weekly_lookback+1, so a
+        21-day realised-vol estimate could never fill and the vol target would
+        have been a permanent no-op in live trading.
+        """
+        for i in range(40):
+            rm.end_of_day(100_000.0 * (1.0 + 0.001 * i))
+
+        assert len(rm._equity_history) == BASE_CFG["weekly_lookback_days"] + 1
+        assert len(rm.book_returns()) >= 21
+
+    def test_cash_transfer_is_not_recorded_as_a_book_return(self, rm):
+        """A deposit doubles equity overnight. The book cannot do that, and
+        letting it into the window would crush exposure for a full lookback."""
+        rm.end_of_day(100_000.0)
+        rm.end_of_day(101_000.0)
+        rm.end_of_day(500_000.0)      # deposit, not a +395% day
+        rm.end_of_day(505_000.0)
+
+        returns = rm.book_returns()
+        assert all(abs(r) < 0.5 for r in returns)
+        assert returns[-1] == pytest.approx(505_000.0 / 500_000.0 - 1.0)
+
+    def test_window_survives_clear_halt(self, rm):
+        """clear_lock() wipes the weekly breaker's baseline on purpose. It must
+        NOT wipe the realised-vol window: resuming after a crash with an empty
+        window would run the book at full exposure on the most volatile days
+        in years — the precise scenario the target exists for."""
+        rm.start_new_day(100_000.0)
+        for i in range(30):
+            rm.end_of_day(100_000.0 * (1.0 - 0.01 * i))
+        before = rm.book_returns()
+        assert len(before) >= 21
+
+        rm.update_equity(50_000.0)          # deep drawdown -> HALT + lock file
+        assert rm.is_halted()
+        rm.clear_lock()
+
+        assert rm._equity_history == []
+        assert rm.book_returns() == before
+
+    def test_window_is_a_copy_not_the_live_list(self, rm):
+        rm.end_of_day(100_000.0)
+        rm.end_of_day(101_000.0)
+        rm.book_returns().append(99.0)
+        assert all(abs(r) < 1.0 for r in rm.book_returns())
+
+    def test_book_vol_scale_is_one_before_the_window_fills(self, rm):
+        rm.end_of_day(100_000.0)
+        rm.end_of_day(101_000.0)
+        assert rm.book_vol_scale() == 1.0
+
+    def test_book_vol_scale_shrinks_a_volatile_book(self, rm):
+        rng = np.random.default_rng(5)
+        equity = 100_000.0
+        rm.end_of_day(equity)
+        for r in rng.normal(0.0, 0.45 / (252 ** 0.5), 60):
+            equity *= 1.0 + float(r)
+            rm.end_of_day(equity)
+
+        scale = rm.book_vol_scale()
+        assert 0.0 < scale < 1.0
+
+    def test_book_vol_scale_matches_the_shared_helper(self, rm):
+        """Live scaling and backtest scaling must be the same function."""
+        from core import sleeves
+
+        rng = np.random.default_rng(9)
+        equity = 100_000.0
+        rm.end_of_day(equity)
+        for r in rng.normal(0.0, 0.30 / (252 ** 0.5), 40):
+            equity *= 1.0 + float(r)
+            rm.end_of_day(equity)
+
+        assert rm.book_vol_scale() == pytest.approx(
+            sleeves.vol_target_scale(rm.book_returns())
+        )
+
+    def test_window_survives_a_process_restart(self, tmp_path):
+        """The bot is deployed as a daily --once oneshot: without persistence
+        the realised-vol window would reset to empty every morning and the
+        target would never bind, exactly like the drawdown breaker before its
+        peak equity was persisted."""
+        lock = tmp_path / "RISK_HALT.lock"
+
+        first = RiskManager(cfg=dict(BASE_CFG), lock_file_path=str(lock))
+        equity = 100_000.0
+        first.end_of_day(equity)
+        for i in range(30):
+            equity *= 1.0 + (0.01 if i % 2 else -0.012)
+            first.end_of_day(equity)
+        expected = first.book_returns()
+
+        second = RiskManager(cfg=dict(BASE_CFG), lock_file_path=str(lock))
+        assert second.book_returns() == pytest.approx(expected)
+        assert second.book_vol_scale() == pytest.approx(first.book_vol_scale())

@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core import sleeves
 from core.portfolio_backtester import PortfolioBacktester
 from settings import config
 
@@ -360,8 +361,14 @@ def test_fully_invested_book_reproduces_buy_and_hold_exactly(execution_model):
     8.3%.  This assertion would have caught it on day one.
     """
     data = _gapping_data(260)
+    # book_vol_target pinned OFF: this asserts the EXECUTION accounting, and
+    # needs the book to stay permanently 100% long. The deployed default
+    # (config.BOOK_VOL_TARGET) would scale the weights down once the realised
+    # window fills, so the book would no longer be buy & hold — a correct
+    # scaling, but not what this test measures.
     bt = PortfolioBacktester(histories={"AAA": data},
-                             execution_model=execution_model)
+                             execution_model=execution_model,
+                             book_vol_target=0.0)
     bt.compute_daily_targets = lambda _date: {"AAA": 1.0}
     returns = bt.run().returns
 
@@ -446,10 +453,35 @@ def test_tradable_universe_contains_validated_diversifiers():
 
 class TestBookVolTarget:
 
-    def test_disabled_by_default(self):
+    def test_default_follows_the_deployed_config(self):
+        """No argument == the book that actually trades.
+
+        Before 2026-08-31 the default was a hardcoded 0.0 while the deployed
+        book had no vol target either, so the two agreed by accident. Now
+        the deployed book HAS one (config.BOOK_VOL_TARGET), and an
+        evaluation that says nothing must evaluate that book — a silent
+        default pointing at a non-deployed configuration is precisely how
+        the live path diverged from the validated one in 2026-08 (Befund 0).
+        """
         bt = PortfolioBacktester(histories={})
-        assert bt.book_vol_target == 0.0
-        assert bt._vol_target_scale([0.05] * 30) == 1.0
+        assert bt.book_vol_target == pytest.approx(config.BOOK_VOL_TARGET["target"])
+        assert bt.vol_target_lookback == config.BOOK_VOL_TARGET["lookback"]
+
+    def test_explicit_value_overrides_the_config_default(self):
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.33, vol_target_lookback=10)
+        assert bt.book_vol_target == pytest.approx(0.33)
+        assert bt.vol_target_lookback == 10
+
+    def test_scale_delegates_to_the_shared_sleeves_helper(self):
+        """The live path calls core.sleeves.vol_target_scale directly. If the
+        backtester ever grows its own copy of this maths, the two books drift
+        apart silently — which is the failure this test exists to catch."""
+        rng = np.random.default_rng(21)
+        returns = list(rng.normal(0.0, 0.35 / (252 ** 0.5), 60))
+        bt = PortfolioBacktester(histories={}, book_vol_target=0.15, vol_target_lookback=21)
+        assert bt._vol_target_scale(returns) == pytest.approx(
+            sleeves.vol_target_scale(returns, 0.15, 21)
+        )
 
     def test_explicit_zero_is_also_a_no_op(self):
         bt = PortfolioBacktester(histories={}, book_vol_target=0.0)
@@ -477,7 +509,7 @@ class TestBookVolTarget:
         bt = PortfolioBacktester(histories={}, book_vol_target=0.15, vol_target_lookback=21)
         assert bt._vol_target_scale([0.0] * 25) == 1.0
 
-    def test_zero_vol_target_matches_default_behavior(self):
+    def test_zero_vol_target_matches_pre_target_behavior(self):
         rng = np.random.default_rng(11)
         n = 260
         idx = pd.bdate_range("2021-01-01", periods=n, freq="B")
@@ -490,12 +522,15 @@ class TestBookVolTarget:
         )
         histories = {"SPY": df, "QQQ": df.copy()}
 
-        default_bt = PortfolioBacktester(histories=histories, initial_capital=100_000)
-        explicit_off_bt = PortfolioBacktester(
+        off_bt = PortfolioBacktester(
             histories=histories, initial_capital=100_000, book_vol_target=0.0,
         )
+        also_off_bt = PortfolioBacktester(
+            histories=histories, initial_capital=100_000,
+            book_vol_target=0.0, vol_target_lookback=21,
+        )
         pd.testing.assert_series_equal(
-            default_bt.run().returns, explicit_off_bt.run().returns,
+            off_bt.run().returns, also_off_bt.run().returns,
         )
 
     def test_run_shrinks_gross_exposure_in_a_high_vol_book(self):
@@ -513,7 +548,9 @@ class TestBookVolTarget:
         )
         histories = {"SPY": df, "QQQ": df.copy()}
 
-        baseline = PortfolioBacktester(histories=histories, initial_capital=100_000).run()
+        baseline = PortfolioBacktester(
+            histories=histories, initial_capital=100_000, book_vol_target=0.0,
+        ).run()
         targeted = PortfolioBacktester(
             histories=histories, initial_capital=100_000,
             book_vol_target=0.05, vol_target_lookback=21,
@@ -525,6 +562,36 @@ class TestBookVolTarget:
 
         assert targeted_gross.mean() < baseline_gross.mean()
         assert (targeted_gross <= baseline_gross + 1e-9).all()
+
+    def test_live_and_backtest_produce_the_same_scale(self, tmp_path):
+        """GOLDEN TEST for the 2026-08-31 vol target: the live loop and the
+        backtester must scale the book by the SAME number given the same
+        return history.
+
+        The live path reads its window from RiskManager (daily equity closes,
+        persisted across the --once restarts); the backtester reads its own
+        in-memory portfolio returns. Two sources, one required answer — if
+        they can disagree, the deployed book is not the backtested book,
+        which is the failure mode analysis_report_2026-08-01_deep_review.md
+        Befund 0 was about.
+        """
+        from core.risk_manager import RiskManager
+
+        rng = np.random.default_rng(31)
+        book_returns = [float(x) for x in rng.normal(0.0, 0.30 / (252 ** 0.5), 45)]
+
+        risk = RiskManager(lock_file_path=str(tmp_path / "RISK_HALT.lock"))
+        equity = 100_000.0
+        risk.end_of_day(equity)
+        for r in book_returns:
+            equity *= 1.0 + r
+            risk.end_of_day(equity)
+
+        bt = PortfolioBacktester(histories={})
+        assert bt.book_vol_target == pytest.approx(config.BOOK_VOL_TARGET["target"])
+        assert risk.book_vol_scale() == pytest.approx(
+            bt._vol_target_scale(risk.book_returns())
+        )
 
     def test_metadata_reports_the_configured_target(self):
         bt = PortfolioBacktester(

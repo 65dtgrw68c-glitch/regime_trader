@@ -4,6 +4,19 @@
 2026-08-24 audit. **This memo does not choose. It puts the price tag on each option so
 the owner can.**
 
+> **Update 2026-08-31 — the owner chose D, and one column below was misleading.**
+> `book_vol_target = 0.12` is deployed; K1 is closed. See
+> `decision_2026-08-31_k1_book_vol_target.md`.
+>
+> The table below prices the reconstruction as a **drawdown on the un-halted return
+> stream** — the path the book would take if the −35% breaker did not exist. It does
+> exist, and it is sticky. `scripts/k1_return_ledger.py` re-scores the same eight rows
+> on terminal wealth with the HALT applied, and the ranking inverts: every option that
+> halts ends 26 years **under water** (0.72×–0.82× capital), while vol-target 12% ends
+> at **9.04×**. Option B, recommended below as cheap harm reduction, is the **worst**
+> row on that measure — it delays the breach to 2002-12 and so halts later and lower
+> than doing nothing. Read "Three things this table says" with that correction in hand.
+
 Reproduce: `scripts/dotcom_reconstruction.py`, `scripts/sleeve_weight_scan.py`,
 `scripts/vol_target_holdout_eval.py [--target N] [--sleeve N]`.
 
@@ -139,6 +152,26 @@ even approximately right, ends the strategy's life the one time it matters most.
 
 ## Status of K1
 
-**Open.** Partially mitigated if option B is adopted; closed only under C (at 10%), D,
-or a validated F. No configuration change has been made — `book_vol_target` remains
-`0.0` (off) and `SLEEVES` remains 0.60/0.40 as deployed.
+**Closed 2026-08-31 under option D.** `settings.config.BOOK_VOL_TARGET` is
+`{"target": 0.12, "lookback": 21}` and the mechanism is wired into the live path, not
+just the backtester. `SLEEVES` is unchanged at 0.60/0.40 — the sleeve lever was not
+used, because the ledger shows every sleeve-only configuration is either dominated
+(30%, 20%) or costs more return than the vol target for less protection (10%).
+
+The decision overrides the pre-registered rejection of 0.12
+(`preregistration_2026-08-25_tighter_vol_target.md`, 298 bp against a 150 bp limit).
+That rule was not retuned and still stands as written; it is overridden because it
+scores on a holdout window in which the HALT never fires, so it cannot price the term
+that dominates long-run return. The full reasoning, including what would make this
+decision wrong, is in `decision_2026-08-31_k1_book_vol_target.md`.
+
+Cost paid, measured on the full 2007-2026 span
+(`scripts/reproduce_headline.py`, `--book-vol-target 0` for the before):
+
+| | CAGR | Vol | Sharpe | maxDD |
+|---|---:|---:|---:|---:|
+| Before (no vol target) | 13.67% | 16.58% | 0.86 | −24.76% |
+| Deployed (vol target 12%) | 11.75% | 13.41% | 0.90 | −20.78% |
+
+−192 bp of CAGR on the full history (−298 bp on the holdout), for +0.04 Sharpe, 4.0 pp
+less drawdown, and a book that no longer halts permanently in the reconstruction.

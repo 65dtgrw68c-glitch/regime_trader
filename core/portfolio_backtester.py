@@ -26,12 +26,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 from core.universe import build_views, AssetView
 from core.allocator import target_weights
 from core.selector import select_decorrelated_views
+from core import sleeves
 from core.sleeves import compose_book, core_scale, sleeve_definitions
 from core.regime_strategies import is_trend_confirmed
 
@@ -72,8 +72,8 @@ class PortfolioBacktester:
         cash_yield_annual: float = 0.0,
         execution_model: str = "next_open",
         cash_yield_series: Optional[pd.Series] = None,
-        book_vol_target: float = 0.0,
-        vol_target_lookback: int = 21,
+        book_vol_target: Optional[float] = None,
+        vol_target_lookback: Optional[int] = None,
     ):
         """
         cash_yield_series : optional ANNUALISED risk-free yields (decimals,
@@ -84,19 +84,25 @@ class PortfolioBacktester:
             since 2026-07-10; a trend book sits in cash for long stretches, so
             crediting a flat rate misprices exactly those stretches.
 
-        book_vol_target : annualised target volatility for the WHOLE BOOK
-            (e.g. 0.20). 0.0 (default) is a no-op — every target weight is
-            used exactly as compose_book() produced it, unchanged from
-            before this parameter existed. When > 0, every weight is scaled
-            by min(1, book_vol_target / realised_vol), where realised_vol is
-            the annualised std of the book's own trailing
-            `vol_target_lookback` daily returns — the returns this same
-            backtest already produced up to the decision bar, so the scale
-            is causal (no lookahead) by construction. This is an evaluation
-            knob, not a deployed one: the live path (main.py /
-            core/sleeves.py) does not read it. See the 2026-08-24 audit,
-            finding K1 / Section F, and scripts/vol_target_holdout_eval.py
-            for the pre-registered decision this exists to test.
+        book_vol_target : annualised target volatility for the WHOLE BOOK.
+            None (default) reads settings.config.BOOK_VOL_TARGET — i.e. the
+            DEPLOYED value, so an evaluation that says nothing evaluates the
+            book that actually trades. Pass an explicit number only to
+            measure a configuration other than the deployed one, and 0.0 to
+            switch the mechanism off entirely.
+
+            When > 0, every weight is scaled by
+            min(1, book_vol_target / realised_vol), where realised_vol is the
+            annualised std of the book's own trailing `vol_target_lookback`
+            daily returns — the returns this same backtest already produced
+            up to the decision bar, so the scale is causal (no lookahead) by
+            construction.
+
+            The scale itself is core.sleeves.vol_target_scale(), shared with
+            the live path (main.py) so the two cannot drift apart. It became
+            a deployed knob on 2026-08-31 (owner decision on finding K1 —
+            see the BOOK_VOL_TARGET comment in settings/config.py and
+            scripts/k1_return_ledger.py); before that it was evaluation-only.
         """
         self.histories = histories
         self.initial_capital = float(initial_capital)
@@ -105,8 +111,14 @@ class PortfolioBacktester:
         self.cash_yield_annual = float(cash_yield_annual)
         self.execution_model = str(execution_model)
         self.cash_yield_series = cash_yield_series
-        self.book_vol_target = float(book_vol_target)
-        self.vol_target_lookback = int(vol_target_lookback)
+        self.book_vol_target = (
+            sleeves.book_vol_target() if book_vol_target is None
+            else max(0.0, float(book_vol_target))
+        )
+        self.vol_target_lookback = (
+            sleeves.vol_target_lookback() if vol_target_lookback is None
+            else int(vol_target_lookback)
+        )
 
         if self.execution_model not in {"next_open", "close_to_close"}:
             raise ValueError(
@@ -200,20 +212,16 @@ class PortfolioBacktester:
 
         `realised_returns` is this SAME backtest's own portfolio return
         history up to (not including) the current decision — already fully
-        causal, so no separate lookback slicing of raw prices is needed
-        here. Returns 1.0 (no scaling) until enough history exists, and
-        whenever realised vol is degenerate (zero/undefined), so a cold
-        start or a dead-flat window never manufactures leverage.
+        causal, so no separate lookback slicing of raw prices is needed here.
+
+        Thin wrapper over core.sleeves.vol_target_scale(), which the live
+        path calls with the same arguments. The maths must live in exactly
+        one place: a backtest-only copy is how the live book silently
+        diverged from the validated one once already (2026-08-01, Befund 0).
         """
-        if self.book_vol_target <= 0:
-            return 1.0
-        if len(realised_returns) < self.vol_target_lookback:
-            return 1.0
-        window = np.asarray(realised_returns[-self.vol_target_lookback:], dtype=float)
-        realised_vol = float(window.std(ddof=1)) * (252.0 ** 0.5)
-        if not realised_vol > 0:
-            return 1.0
-        return min(1.0, self.book_vol_target / realised_vol)
+        return sleeves.vol_target_scale(
+            realised_returns, self.book_vol_target, self.vol_target_lookback,
+        )
 
     def run(
         self,

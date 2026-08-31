@@ -22,6 +22,15 @@ which structurally cannot show the sleeve's worst case.
 Any weight chosen from this table would need its own pre-registration and its
 own holdout run before it could be called validated.
 
+_NOTE_ (2026-08-31): `book_vol_target=0.0` is now pinned explicitly in both
+runs below. The deployed configuration gained a 12% book vol target on
+2026-08-31 (settings.config.BOOK_VOL_TARGET), and PortfolioBacktester's
+default follows the deployed value — so without this pin the table would
+silently become "sleeve weight WITH a vol target", which is not what it
+measures and not what the numbers quoted in
+analysis_report_2026-08-25_k1_options.md were produced with. The sleeve
+lever in isolation is the whole point of this script, so it stays isolated.
+
     python scripts/sleeve_weight_scan.py
 """
 from __future__ import annotations
@@ -86,6 +95,7 @@ def main() -> int:
                 transaction_cost_bps=commission_bps,
                 slippage_bps=slippage_bps,
                 cash_yield_series=tbill,
+                book_vol_target=0.0,   # see _NOTE_ below
             )
             full = holdout_bt.run().returns
             hold = full[full.index >= holdout_start]
@@ -96,6 +106,7 @@ def main() -> int:
                 transaction_cost_bps=commission_bps,
                 slippage_bps=slippage_bps,
                 cash_yield_series=tbill,
+                book_vol_target=0.0,   # see _NOTE_ below
             )
             recon_full = recon_bt.run().returns
             recon = recon_full[recon_full.index >= pd.Timestamp(RECON_START)]

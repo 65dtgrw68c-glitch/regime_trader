@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -1214,3 +1215,195 @@ class TestHMMWarmup:
         decision = started_system.run_once("AAA", bar)
         assert decision["action"] != "waiting_for_stable_regime"
         assert "regime" in decision   # regime context was attached
+
+
+# ---------------------------------------------------------------------------
+# Crash mid-rebalance, then restart — Phase 4 of the 2026-08-24 audit.
+#
+# The audit's Go/No-Go list requires a simulated crash mid-rebalance with a
+# documented recovery before live capital. The mechanism that has to hold is
+# the client_order_id: a process that dies after submitting some of a
+# rebalance leaves those orders live at the broker, and the NEXT process must
+# not re-submit them as new orders on top.
+# ---------------------------------------------------------------------------
+
+class _CoidEnforcingBroker:
+    """Fake broker that rejects a duplicate client_order_id like Alpaca does.
+
+    Also models the part that makes this dangerous: an order that was
+    accepted before the crash is still live, and fills afterwards.
+    """
+
+    def __init__(self):
+        self.submitted = []          # every accepted order
+        self.rejected_duplicates = []
+        self._by_coid = {}
+        self._n = 0
+        self.trading = self
+
+    # --- trading surface used by OrderExecutor ---
+    def get_orders(self):
+        return []
+
+    def cancel_order_by_id(self, oid):
+        pass
+
+    def get_order_by_id(self, oid):
+        return self._by_coid_lookup_by_id(oid)
+
+    def _by_coid_lookup_by_id(self, oid):
+        for o in self.submitted:
+            if o["id"] == oid:
+                return SimpleNamespace(
+                    id=oid, status=o["status"], filled_qty=o["filled_qty"],
+                    symbol=o["symbol"], filled_avg_price=100.0,
+                )
+        return SimpleNamespace(id=oid, status="filled", filled_qty=0.0,
+                               symbol="", filled_avg_price=100.0)
+
+    def get_order_by_client_id(self, coid):
+        o = self._by_coid[coid]
+        return SimpleNamespace(
+            id=o["id"], status=o["status"], filled_qty=o["filled_qty"],
+            symbol=o["symbol"], filled_avg_price=100.0,
+        )
+
+    def submit_order(self, request):
+        coid = getattr(request, "client_order_id", None)
+        if coid is not None and coid in self._by_coid:
+            self.rejected_duplicates.append(coid)
+            raise RuntimeError(
+                '{"code":40010001,"message":"client_order_id must be unique"}'
+            )
+        self._n += 1
+        order = {
+            "id": f"oid-{self._n}",
+            "symbol": request.symbol,
+            "qty": float(request.qty),
+            "coid": coid,
+            "status": "filled",
+            "filled_qty": float(request.qty),
+        }
+        self.submitted.append(order)
+        if coid is not None:
+            self._by_coid[coid] = order
+        return SimpleNamespace(id=order["id"], status="accepted",
+                               symbol=request.symbol)
+
+
+class TestCrashDuringRebalanceRecovery:
+
+    @staticmethod
+    def _executor(broker, tracker):
+        from broker.order_executor import OrderExecutor
+        return OrderExecutor(broker, tracker)
+
+    @staticmethod
+    def _tracker(positions):
+        from broker.position_tracker import Position, PositionTracker
+        t = PositionTracker(client=None)
+        t.set_positions({
+            tk: Position(ticker=tk, qty=q, avg_entry_price=100.0, current_price=100.0)
+            for tk, q in positions.items()
+        })
+        return t
+
+    def test_restart_after_partial_rebalance_does_not_double_the_position(self):
+        """Process A submits AAA then dies. Process B restarts the same day
+        against a position snapshot that has NOT yet caught up. The COID must
+        stop the second submission from doubling AAA."""
+        broker = _CoidEnforcingBroker()
+        run_tag = "2026-08-25"
+
+        # --- process A: submits AAA, then "crashes" before BBB ---
+        tracker_a = self._tracker({})
+        ex_a = self._executor(broker, tracker_a)
+        ex_a.rebalance({"AAA": 25.0}, prices={"AAA": 100.0}, run_tag=run_tag)
+
+        assert len(broker.submitted) == 1
+        assert broker.submitted[0]["symbol"] == "AAA"
+        assert broker.submitted[0]["qty"] == pytest.approx(25.0)
+
+        # --- process B: restarts, still sees the stale (empty) snapshot ---
+        # This is the dangerous case: it recomputes the SAME decision and
+        # would submit AAA a second time without idempotency protection.
+        tracker_b = self._tracker({})
+        ex_b = self._executor(broker, tracker_b)
+        ex_b.rebalance({"AAA": 25.0}, prices={"AAA": 100.0}, run_tag=run_tag)
+
+        aaa_orders = [o for o in broker.submitted if o["symbol"] == "AAA"]
+        assert len(aaa_orders) == 1, "AAA was submitted twice — position doubled"
+        assert broker.rejected_duplicates, "the duplicate COID was never exercised"
+        assert sum(o["qty"] for o in aaa_orders) == pytest.approx(25.0)
+
+    def test_restart_completes_the_unfinished_leg(self):
+        """The flip side: recovery must still finish what process A did not.
+        BBB was never submitted, so process B must submit it."""
+        broker = _CoidEnforcingBroker()
+        run_tag = "2026-08-25"
+
+        tracker_a = self._tracker({})
+        self._executor(broker, tracker_a).rebalance(
+            {"AAA": 25.0}, prices={"AAA": 100.0}, run_tag=run_tag,
+        )
+
+        # Process B sees AAA filled (refresh picked it up) and the full book.
+        tracker_b = self._tracker({"AAA": 25.0})
+        self._executor(broker, tracker_b).rebalance(
+            {"AAA": 25.0, "BBB": 40.0},
+            prices={"AAA": 100.0, "BBB": 50.0}, run_tag=run_tag,
+        )
+
+        symbols = [o["symbol"] for o in broker.submitted]
+        assert symbols.count("AAA") == 1, "AAA re-ordered after it already filled"
+        assert symbols.count("BBB") == 1, "BBB never recovered"
+        bbb = next(o for o in broker.submitted if o["symbol"] == "BBB")
+        assert bbb["qty"] == pytest.approx(40.0)
+
+    def test_partial_fill_remainder_is_reorderable_the_same_day(self):
+        """H2b: the COID carries the TARGET quantity, so 'the rest of this
+        decision' is a different key than 'this decision again' and is not
+        rejected as a duplicate."""
+        broker = _CoidEnforcingBroker()
+        run_tag = "2026-08-25"
+
+        # First attempt targets 25 and (say) only 10 end up held.
+        self._executor(broker, self._tracker({})).rebalance(
+            {"AAA": 25.0}, prices={"AAA": 100.0}, run_tag=run_tag,
+        )
+        first_coid = broker.submitted[0]["coid"]
+
+        # Same day, same target, but 10 are now held: delta is 15, and the
+        # COID still encodes target 25 — so it collides and is refused.
+        self._executor(broker, self._tracker({"AAA": 10.0})).rebalance(
+            {"AAA": 25.0}, prices={"AAA": 100.0}, run_tag=run_tag,
+        )
+        assert first_coid in broker.rejected_duplicates
+
+        # A genuinely NEW decision (different target) gets a new key and goes
+        # through — the book is never stuck unable to trade for the rest of
+        # the day.
+        self._executor(broker, self._tracker({"AAA": 10.0})).rebalance(
+            {"AAA": 30.0}, prices={"AAA": 100.0}, run_tag=run_tag,
+        )
+        coids = [o["coid"] for o in broker.submitted]
+        assert len(set(coids)) == len(coids), "COIDs collided across decisions"
+        assert any(c.endswith("30.0000") for c in coids)
+
+    def test_duplicate_reject_returns_the_live_order_id_not_empty(self):
+        """A crash between submit and response leaves a live order. On retry
+        the broker refuses the duplicate; the executor must hand back the
+        EXISTING order id so the caller can await it, rather than "" (which
+        would leave a live order untracked)."""
+        broker = _CoidEnforcingBroker()
+        tracker = self._tracker({})
+        ex = self._executor(broker, tracker)
+
+        first = ex.submit_order("AAA", 25.0, "buy",
+                                client_order_id="rt-AAA-2026-08-25-buy-25.0000")
+        assert first == "oid-1"
+
+        recovered = ex.submit_order("AAA", 25.0, "buy",
+                                    client_order_id="rt-AAA-2026-08-25-buy-25.0000")
+        assert recovered == "oid-1", "live order was dropped instead of recovered"
+        assert len(broker.submitted) == 1

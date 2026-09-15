@@ -17,7 +17,7 @@ case "$cmd" in
         bash "$APP_DIR/deploy/healthcheck.sh"
         ;;
     reconcile)
-        cd "$APP_DIR" && python3 scripts/reconcile.py
+        cd "$APP_DIR" && "$APP_DIR/.venv/bin/python3" scripts/reconcile.py
         ;;
     gitlog)
         cat "$APP_DIR/DEPLOYED_COMMIT" 2>/dev/null || echo "no DEPLOYED_COMMIT stamp yet — run deploy/update.sh"

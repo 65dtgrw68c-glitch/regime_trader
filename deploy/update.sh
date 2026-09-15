@@ -26,6 +26,11 @@ git -C "$REPO_DIR" pull --ff-only
 echo "==> re-running setup (syncs code + deps, reinstalls units)"
 bash "$REPO_DIR/deploy/setup.sh"
 
+# Stamp which commit is actually deployed. $APP_DIR itself isn't a git repo
+# (rsync excludes .git), so this is the only way anything running there --
+# including the read-only status dispatcher -- can report its own version.
+git -C "$REPO_DIR" log -1 --oneline > "$APP_DIR/DEPLOYED_COMMIT"
+
 # Scheduled model: nothing long-running to restart — setup already did
 # daemon-reload and re-enabled the timer, so the NEXT daily fire runs the new
 # code. Just confirm the schedule is armed.

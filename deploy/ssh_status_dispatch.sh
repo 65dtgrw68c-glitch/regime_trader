@@ -20,7 +20,7 @@ case "$cmd" in
         cd "$APP_DIR" && python3 scripts/reconcile.py
         ;;
     gitlog)
-        cd "$APP_DIR" && git log -1 --oneline
+        cat "$APP_DIR/DEPLOYED_COMMIT" 2>/dev/null || echo "no DEPLOYED_COMMIT stamp yet — run deploy/update.sh"
         ;;
     taillog)
         tail -n 100 "$APP_DIR/logs/app.log" 2>/dev/null || echo "no log file yet"
